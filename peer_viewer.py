@@ -30,8 +30,6 @@ from peer_helpers import (
     evaluate_structure_goal,
     fill_binary_holes_2d,
     get_dvh_method_signature,
-    get_lowest_ptv_rx_gy,
-    get_ptv_dose_levels_gy,
     line_intersections_at_col,
     line_intersections_at_row,
     normalize_structure_name,
@@ -130,13 +128,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.phase_dose_plane_cache: Dict[Tuple[str, int], np.ndarray] = {}
         self.target_curve_cache: Dict[Tuple[str, str], Optional[DVHCurve]] = {}
         self.target_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
-        self.stereotactic_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float]] = {}
+        self.stereotactic_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
         self.max_tissue_dose_gy_cache: Optional[float] = None
         self.max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
         self.target_containment_cache: Dict[str, List[str]] = {}
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
-        self.stereotactic_target_names: set[str] = set()
         self.stereotactic_target_dose_text_by_name: Dict[str, str] = {}
         self.constraint_editor_state: Optional[Dict[str, str]] = None
         self.constraint_editor_widgets: Dict[str, QtWidgets.QWidget] = {}
@@ -660,7 +657,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.current_rtplan_paths = []
         self.constraint_notes = {}
         self.target_notes = {}
-        self.stereotactic_target_names = set()
         self.stereotactic_target_dose_text_by_name = {}
         self.patient_plan_lines = None
         self.image_view_bounds = None
@@ -1443,9 +1439,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     "coverage_text": str(row.get("coverage_text", "")),
                     "minimum_dose_text": str(row.get("minimum_dose_text", "")),
                     "maximum_dose_text": str(row.get("maximum_dose_text", "")),
-                    "stereotactic_dose_text": str(row.get("stereotactic_dose_text", "")),
+                    "notes_text": str(row.get("notes_text", "")),
                     "is_primary_ptv": bool(row.get("is_primary_ptv", False)),
-                    "is_stereotactic_row": bool(row.get("is_stereotactic_row", False)),
                     "color_rgb": [int(value) for value in row.get("color_rgb", [255, 255, 255])],
                 }
             )
@@ -1482,9 +1477,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     "coverage_text": str(row_payload.get("coverage_text", "")),
                     "minimum_dose_text": str(row_payload.get("minimum_dose_text", "")),
                     "maximum_dose_text": str(row_payload.get("maximum_dose_text", "")),
-                    "stereotactic_dose_text": str(row_payload.get("stereotactic_dose_text", "")),
+                    "notes_text": str(row_payload.get("notes_text", "")),
                     "is_primary_ptv": bool(row_payload.get("is_primary_ptv", False)),
-                    "is_stereotactic_row": bool(row_payload.get("is_stereotactic_row", False)),
                     "color_rgb": tuple(int(value) for value in color_values),
                 }
             )
@@ -1494,25 +1488,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if self.ct is None or self.dose is None:
             return False
         for row in rows:
-            if bool(row.get("is_stereotactic_row", False)):
-                stereotactic_dose_text = str(row.get("stereotactic_dose_text", "")).strip()
-                if not stereotactic_dose_text:
-                    continue
-                coverage_text = str(row.get("coverage_text", "")).strip()
-                minimum_dose_text = str(row.get("minimum_dose_text", "")).strip()
-                maximum_dose_text = str(row.get("maximum_dose_text", "")).strip()
-                if not coverage_text or not minimum_dose_text or not maximum_dose_text:
-                    return True
-                continue
             if not bool(row.get("is_primary_ptv", False)):
                 continue
             normalized_name = normalize_structure_name(str(row.get("normalized_name", "")))
             if not normalized_name.startswith("PTV"):
                 continue
+            coverage_text = str(row.get("coverage_text", "")).strip()
             minimum_dose_text = str(row.get("minimum_dose_text", "")).strip()
             maximum_dose_text = str(row.get("maximum_dose_text", "")).strip()
-            if not minimum_dose_text or not maximum_dose_text:
+            if not coverage_text or not minimum_dose_text or not maximum_dose_text:
                 return True
+            if self.stereotactic_summary_enabled():
+                notes_text = str(row.get("notes_text", "")).strip()
+                if not notes_text:
+                    return True
         return False
 
     def get_target_method_signature(self) -> Dict[str, object]:
@@ -1746,7 +1735,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         payload = {
-            "version": 11,
+            "version": 13,
             "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
             "selected_constraint_set": selected_constraint_set,
             "constraints_file": Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
@@ -1765,7 +1754,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "custom_constraints": self.serialize_structure_goals(self.custom_structure_goals_by_name),
             "goal_evaluations": self.serialize_goal_evaluations(),
             "target_table_rows": self.serialize_target_table_rows(target_rows),
-            "stereotactic_target_names": sorted(self.stereotactic_target_names),
             "stereotactic_target_doses": self.stereotactic_target_dose_text_by_name,
             "constraint_notes": self.constraint_notes,
             "target_notes": self.target_notes,
@@ -1897,11 +1885,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         goal_evaluations = self.deserialize_goal_evaluations(payload.get("goal_evaluations"))
         if goal_evaluations is None:
             return False
-        stereotactic_names_payload = payload.get("stereotactic_target_names", [])
-        if stereotactic_names_payload is None:
-            stereotactic_names_payload = []
-        if not isinstance(stereotactic_names_payload, list):
-            return False
         stereotactic_dose_payload = payload.get("stereotactic_target_doses", {})
         if stereotactic_dose_payload is None:
             stereotactic_dose_payload = {}
@@ -1914,11 +1897,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.custom_structure_goals_by_name = custom_constraints
         self.rebuild_structure_goals_by_name()
         self.dvh_curves = curves
-        self.stereotactic_target_names = {
-            normalize_structure_name(str(name))
-            for name in stereotactic_names_payload
-            if normalize_structure_name(str(name))
-        }
         self.stereotactic_target_dose_text_by_name = {
             normalize_structure_name(str(name)): str(value).strip()
             for name, value in stereotactic_dose_payload.items()
@@ -2377,9 +2355,40 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         global_max = max(float(np.nanmax(self.dose.dose_gy)), 1e-6)
         return int(round(np.clip(dose_gy / global_max, 0.0, 1.0) * 1000.0))
 
+    def get_default_colorwash_min_dose_gy(self) -> float:
+        lowest_reference_gy: Optional[float] = None
+        for structure in self.get_sorted_ptv_structures():
+            normalized_name = normalize_structure_name(structure.name)
+            reference_gy = self.get_stereotactic_threshold_gy(normalized_name, structure.name)
+            if reference_gy is None or reference_gy <= 0.0:
+                continue
+            if lowest_reference_gy is None or reference_gy < lowest_reference_gy:
+                lowest_reference_gy = reference_gy
+        if lowest_reference_gy is None:
+            return 0.0
+        return lowest_reference_gy * 0.95
+
+    def get_total_rx_dose_gy(self) -> Optional[float]:
+        available_phase_rx = [
+            float(phase.prescription_dose_gy)
+            for phase in self.plan_phases
+            if phase.prescription_dose_gy > 0.0 and phase.dose_path
+        ]
+        if available_phase_rx:
+            return float(sum(available_phase_rx))
+
+        highest_reference_gy: Optional[float] = None
+        for structure in self.get_sorted_ptv_structures():
+            normalized_name = normalize_structure_name(structure.name)
+            reference_gy = self.get_stereotactic_threshold_gy(normalized_name, structure.name)
+            if reference_gy is None or reference_gy <= 0.0:
+                continue
+            if highest_reference_gy is None or reference_gy > highest_reference_gy:
+                highest_reference_gy = reference_gy
+        return highest_reference_gy
+
     def apply_default_dose_range(self):
-        lower_ptv_rx_gy = get_lowest_ptv_rx_gy(self.rtstruct)
-        min_dose_gy = 0.0 if lower_ptv_rx_gy is None else lower_ptv_rx_gy * 0.95
+        min_dose_gy = self.get_default_colorwash_min_dose_gy()
         blocker = QtCore.QSignalBlocker(self.dose_range_slider)
         self.dose_range_slider.setValues(self.dose_gy_to_slider_value(min_dose_gy), 1000)
         del blocker
@@ -3031,8 +3040,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def format_target_dose_text(self, dose_gy: float, rx_gy: float) -> str:
         if rx_gy > 0.0:
             relative_pct = 100.0 * dose_gy / rx_gy
-            return f"{dose_gy:.2f} Gy\u2002\u2002({relative_pct:.1f}%)"
-        return f"{dose_gy:.2f} Gy"
+            return f"{relative_pct:.1f}%"
+        return ""
 
     def get_default_stereotactic_dose_text(self, structure_name: str) -> str:
         normalized_name = normalize_structure_name(structure_name)
@@ -3042,12 +3051,66 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             if phase_rx_gy > 0.0:
                 return f"{phase_rx_gy:.2f}"
         digits = "".join(ch for ch in normalized_name if ch.isdigit())
-        if not digits:
-            return ""
-        raw_value = int(digits)
-        if raw_value < 100:
-            return ""
-        return f"{raw_value / 100.0:.2f}"
+        if digits:
+            raw_value = int(digits)
+            if raw_value >= 100:
+                return f"{raw_value / 100.0:.2f}"
+
+        if self.stereotactic_summary_enabled():
+            inferred_rx_gy = self.infer_srs_target_rx_gy_from_minimum_dose(normalized_name)
+            if inferred_rx_gy is not None:
+                return f"{inferred_rx_gy:.2f}"
+
+        available_phase_rx = [
+            phase.prescription_dose_gy
+            for phase in self.plan_phases
+            if phase.prescription_dose_gy > 0.0 and phase.dose_path
+        ]
+        if len(available_phase_rx) == 1:
+            return f"{available_phase_rx[0]:.2f}"
+        if available_phase_rx:
+            return f"{sum(available_phase_rx):.2f}"
+        return ""
+
+    def infer_srs_target_rx_gy_from_minimum_dose(self, normalized_name: str) -> Optional[float]:
+        if self.rtstruct is None:
+            return None
+
+        structure = next(
+            (
+                candidate
+                for candidate in self.rtstruct.structures
+                if normalize_structure_name(candidate.name) == normalized_name
+            ),
+            None,
+        )
+        if structure is None:
+            return None
+
+        source_key = "combined"
+        phase_assignment = self.get_phase_target_assignments().get(normalized_name)
+        if phase_assignment is not None:
+            phase, _phase_rx_gy = phase_assignment
+            source_key = phase.dose_path
+        else:
+            available_phases = [
+                phase
+                for phase in self.plan_phases
+                if phase.prescription_dose_gy > 0.0 and phase.dose_path
+            ]
+            if len(available_phases) == 1:
+                source_key = available_phases[0].dose_path
+
+        curve = self.get_target_high_accuracy_curve(structure, source_key)
+        if curve is None or not np.isfinite(curve.min_dose_gy):
+            return None
+
+        minimum_dose_gy = float(curve.min_dose_gy)
+        candidate_rx_gy = [18.0, 21.0]
+        return min(candidate_rx_gy, key=lambda value: abs(minimum_dose_gy - value))
+
+    def stereotactic_summary_enabled(self) -> bool:
+        return normalize_structure_name(self.constraints_sheet_name or "") == "SRS FSRT"
 
     def get_stereotactic_dose_text(self, normalized_name: str, structure_name: str) -> str:
         if normalized_name in self.stereotactic_target_dose_text_by_name:
@@ -3072,21 +3135,21 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         threshold_gy: float,
         coverage_pct: float,
         source_key: str,
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, str]:
         if self.ct is None:
-            return "", ""
+            return "", "", ""
 
         normalized_name = normalize_structure_name(structure.name)
         cache_key = (normalized_name, source_key, round(float(threshold_gy), 3))
         cached = self.stereotactic_metrics_cache.get(cache_key)
         if cached is not None:
-            ci_value, pci_value = cached
-            return f"CI {ci_value:.2f}", f"PCI {pci_value:.2f}"
+            volume_cc, ci_value, pci_value = cached
+            return f"Vol {volume_cc:.3f} cc", f"CI {ci_value:.3f}", f"PCI {pci_value:.3f}"
 
         curve = self.get_target_high_accuracy_curve(structure, source_key)
         dose_volume = self.get_target_dose_volume(source_key)
         if curve is None or dose_volume is None or curve.volume_cc <= 0.0:
-            return "", ""
+            return "", "", ""
         isodose_volume_cc = compute_isodose_volume_within_structure_margin_cc(
             self.ct,
             dose_volume,
@@ -3099,8 +3162,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         ci_value = isodose_volume_cc / ptv_volume_cc
         coverage_decimal = float(np.clip(coverage_pct / 100.0, 0.0, 1.0))
         pci_value = float((coverage_decimal ** 2) / ci_value) if ci_value > 0.0 else 0.0
-        self.stereotactic_metrics_cache[cache_key] = (ci_value, pci_value)
-        return f"CI {ci_value:.2f}", f"PCI {pci_value:.2f}"
+        self.stereotactic_metrics_cache[cache_key] = (ptv_volume_cc, ci_value, pci_value)
+        return f"Vol {ptv_volume_cc:.3f} cc", f"CI {ci_value:.3f}", f"PCI {pci_value:.3f}"
 
     def get_primary_target_context(
         self,
@@ -3154,27 +3217,38 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if not available_phases:
             return {}
 
-        ptv_candidates: List[Tuple[StructureSliceContours, str, float]] = []
+        ptv_candidates: List[Tuple[StructureSliceContours, str, Optional[float]]] = []
         for structure in self.get_sorted_ptv_structures():
             normalized_name = normalize_structure_name(structure.name)
             total_rx_gy = self.parse_ptv_rx_gy_from_name(structure.name)
-            if total_rx_gy is None:
-                continue
             ptv_candidates.append((structure, normalized_name, total_rx_gy))
         if not ptv_candidates:
             return {}
 
         if len(available_phases) == 1:
             phase = available_phases[0]
+            exact_name_match = next(
+                (normalized_name for _structure, normalized_name, _total_rx_gy in ptv_candidates if phase.target_structure_name == normalized_name),
+                None,
+            )
+            if exact_name_match is not None:
+                return {exact_name_match: (phase, phase.prescription_dose_gy)}
+
+            numeric_candidates = [
+                (_structure, normalized_name, total_rx_gy)
+                for _structure, normalized_name, total_rx_gy in ptv_candidates
+                if total_rx_gy is not None
+            ]
+            if not numeric_candidates:
+                return {}
             _best_structure, best_normalized_name, best_rx_gy = min(
-                ptv_candidates,
+                numeric_candidates,
                 key=lambda item: (
-                    0 if phase.target_structure_name == item[1] else 1,
-                    abs(item[2] - phase.prescription_dose_gy),
+                    abs(float(item[2]) - phase.prescription_dose_gy),
                     item[1],
                 ),
             )
-            if phase.target_structure_name == best_normalized_name or abs(best_rx_gy - phase.prescription_dose_gy) <= 0.5:
+            if abs(float(best_rx_gy) - phase.prescription_dose_gy) <= 0.5:
                 return {best_normalized_name: (phase, phase.prescription_dose_gy)}
             return {}
 
@@ -3183,6 +3257,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         used_plan_uids: set[str] = set()
 
         for _structure, normalized_name, total_rx_gy in ptv_candidates:
+            if total_rx_gy is None:
+                continue
             incremental_rx_gy = max(total_rx_gy - cumulative_rx_gy, 0.0)
             if incremental_rx_gy <= 0.0:
                 cumulative_rx_gy = total_rx_gy
@@ -3232,12 +3308,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         for structure in self.get_sorted_ptv_structures():
             normalized_name = normalize_structure_name(structure.name)
             total_rx_gy = self.parse_ptv_rx_gy_from_name(structure.name)
-            if total_rx_gy is None:
-                continue
+            initial_reference_gy = self.get_stereotactic_threshold_gy(normalized_name, structure.name)
 
             minimum_dose_text = ""
             maximum_dose_text = ""
-            coverage_text = f"@ {total_rx_gy:.2f} Gy"
+            coverage_text = f"@ {initial_reference_gy:.2f} Gy" if initial_reference_gy is not None and initial_reference_gy > 0.0 else ""
+            stereotactic_summary_text = ""
             (
                 rx_reference_gy,
                 source_key,
@@ -3263,42 +3339,38 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     "coverage_text": coverage_text,
                     "minimum_dose_text": minimum_dose_text,
                     "maximum_dose_text": maximum_dose_text,
+                    "notes_text": stereotactic_summary_text,
                     "is_primary_ptv": True,
-                    "is_stereotactic_row": False,
                     "color_rgb": structure.color_rgb,
                 }
             )
 
-            if normalized_name in self.stereotactic_target_names:
-                stereotactic_dose_text = self.get_stereotactic_dose_text(normalized_name, structure.name)
+            if self.stereotactic_summary_enabled():
+                stereotactic_volume_text = ""
                 stereotactic_ci_text = ""
                 stereotactic_pci_text = ""
                 stereotactic_hi_text = ""
                 if coverage_pct is not None and rx_reference_gy > 0.0:
-                    stereotactic_ci_text, stereotactic_pci_text = self.compute_stereotactic_indices(
+                    stereotactic_volume_text, stereotactic_ci_text, stereotactic_pci_text = self.compute_stereotactic_indices(
                         structure,
                         rx_reference_gy,
                         coverage_pct,
                         source_key=source_key,
                     )
                 if max_dose_gy is not None and rx_reference_gy > 0.0:
-                    stereotactic_hi_text = f"HI {max_dose_gy / rx_reference_gy:.2f}"
-                rows.append(
-                    {
-                        "structure_name": structure.name,
-                        "normalized_name": normalized_name,
-                        "parent_structure_name": structure.name,
-                        "parent_normalized_name": normalized_name,
-                        "display_name": "    Stereotactic",
-                        "coverage_text": stereotactic_ci_text,
-                        "minimum_dose_text": stereotactic_pci_text,
-                        "maximum_dose_text": stereotactic_hi_text,
-                        "stereotactic_dose_text": stereotactic_dose_text,
-                        "is_primary_ptv": False,
-                        "is_stereotactic_row": True,
-                        "color_rgb": (235, 235, 235),
-                    }
-                )
+                    stereotactic_hi_text = f"HI {max_dose_gy / rx_reference_gy:.3f}"
+                stereotactic_parts = [
+                    text
+                    for text in (
+                        stereotactic_volume_text,
+                        stereotactic_ci_text,
+                        stereotactic_pci_text,
+                        stereotactic_hi_text,
+                    )
+                    if text
+                ]
+                if stereotactic_parts:
+                    rows[-1]["notes_text"] = "    ".join(stereotactic_parts)
 
             for nested_structure in self.get_nested_target_structures(structure):
                 nested_normalized_name = normalize_structure_name(nested_structure.name)
@@ -3321,8 +3393,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         "coverage_text": nested_coverage_text,
                         "minimum_dose_text": nested_minimum_dose_text,
                         "maximum_dose_text": nested_maximum_dose_text,
+                        "notes_text": "",
                         "is_primary_ptv": False,
-                        "is_stereotactic_row": False,
                         "color_rgb": nested_structure.color_rgb,
                     }
                 )
@@ -3339,19 +3411,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
 
         viewport_width = max(self.targets_table.viewport().width(), 1)
-        shared_metric_width = max(1, int(round(viewport_width * 0.15)))
+        ptv_width = max(1, int(round(viewport_width * 0.15)))
+        coverage_width = max(1, int(round(viewport_width * 0.15)))
+        min_dose_width = max(1, int(round(viewport_width * 0.075)))
+        max_dose_width = max(1, int(round(viewport_width * 0.075)))
         note_button_width = max(72, int(round(viewport_width * 0.06)))
-        notes_width = max(1, int(round(viewport_width * 0.40)) - note_button_width)
+        notes_width = max(1, viewport_width - (ptv_width + coverage_width + min_dose_width + max_dose_width + note_button_width))
         column_widths = [
-            shared_metric_width,  # PTV
-            shared_metric_width,  # Coverage
-            shared_metric_width,  # Min dose
-            shared_metric_width,  # Max dose
+            ptv_width,  # PTV
+            coverage_width,  # Coverage
+            min_dose_width,  # Min dose
+            max_dose_width,  # Max dose
             notes_width,  # Notes
             note_button_width,  # Note button
         ]
-        width_delta = viewport_width - sum(column_widths)
-        column_widths[4] += width_delta
 
         for column_index, width in enumerate(column_widths):
             self.targets_table.setColumnWidth(column_index, max(1, width))
@@ -3381,41 +3454,53 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         layout.addWidget(label)
         layout.addStretch(1)
 
-        if is_primary_ptv and normalized_name and structure_name:
-            dose_edit = QtWidgets.QLineEdit()
-            dose_edit.setFixedWidth(62)
-            dose_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-            dose_edit.setPlaceholderText("Dose")
-            dose_edit.setText(self.get_stereotactic_dose_text(normalized_name, structure_name))
-            dose_edit.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-            dose_validator = QtGui.QDoubleValidator(0.0, 999.99, 2, dose_edit)
-            dose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
-            dose_edit.setValidator(dose_validator)
-            dose_edit.editingFinished.connect(
-                lambda name=normalized_name, edit=dose_edit: self.on_stereotactic_dose_editing_finished(name, edit)
-            )
-            layout.addWidget(dose_edit, 0, QtCore.Qt.AlignmentFlag.AlignRight)
-
-            button = QtWidgets.QPushButton("ST")
-            button.setCheckable(True)
-            button.setChecked(normalized_name in self.stereotactic_target_names)
-            button.setFixedWidth(34)
-            button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-            button.toggled.connect(
-                lambda checked, name=normalized_name: self.on_stereotactic_target_toggled(name, checked)
-            )
-            layout.addWidget(button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
-
         return widget
 
-    def on_stereotactic_target_toggled(self, normalized_name: str, checked: bool):
-        if checked:
-            self.stereotactic_target_names.add(normalized_name)
-        else:
-            self.stereotactic_target_names.discard(normalized_name)
-        self.stereotactic_metrics_cache = {}
-        self.cached_target_table_rows = None
-        self.update_targets_table()
+    def create_target_coverage_cell_widget(
+        self,
+        coverage_text: str,
+        background_color: QtGui.QColor,
+        *,
+        structure_name: str,
+        normalized_name: str,
+        is_primary_ptv: bool,
+    ) -> QtWidgets.QWidget:
+        widget = QtWidgets.QWidget()
+        widget.setStyleSheet(f"background-color: {background_color.name()};")
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setSpacing(6)
+
+        if not is_primary_ptv:
+            label = QtWidgets.QLabel(coverage_text)
+            layout.addWidget(label)
+            layout.addStretch(1)
+            return widget
+
+        prefix_text = coverage_text.strip()
+        if "@" in prefix_text:
+            before_at, _sep, _after_at = prefix_text.partition("@")
+            prefix_text = f"{before_at.strip()} @" if before_at.strip() else "@"
+
+        if prefix_text:
+            label = QtWidgets.QLabel(prefix_text)
+            layout.addWidget(label)
+
+        dose_edit = QtWidgets.QLineEdit()
+        dose_edit.setFixedWidth(62)
+        dose_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        dose_edit.setPlaceholderText("Dose")
+        dose_edit.setText(self.get_stereotactic_dose_text(normalized_name, structure_name))
+        dose_edit.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        dose_validator = QtGui.QDoubleValidator(0.0, 999.99, 2, dose_edit)
+        dose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
+        dose_edit.setValidator(dose_validator)
+        dose_edit.editingFinished.connect(
+            lambda name=normalized_name, edit=dose_edit: self.on_stereotactic_dose_editing_finished(name, edit)
+        )
+        layout.addWidget(dose_edit, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        return widget
 
     def on_stereotactic_dose_editing_finished(self, normalized_name: str, edit: QtWidgets.QLineEdit):
         dose_text = edit.text().strip()
@@ -3522,7 +3607,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             minimum_dose_text = str(row.get("minimum_dose_text", ""))
             maximum_dose_text = str(row.get("maximum_dose_text", ""))
             is_primary_ptv = bool(row.get("is_primary_ptv", False))
-            is_stereotactic_row = bool(row.get("is_stereotactic_row", False))
             color_rgb = tuple(int(value) for value in row.get("color_rgb", (255, 255, 255)))
 
             section_key = (
@@ -3540,7 +3624,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             else:
                 note_key = self.get_target_note_key(normalized_name, parent_normalized_name=section_key)
                 note_title = f"{structure_name} within {parent_structure_name} target review"
-            note_text = self.target_notes.get(note_key, "").strip()
+            stored_note_text = self.target_notes.get(note_key, "").strip()
+            computed_note_text = str(row.get("notes_text", "")).strip()
+            if stored_note_text and computed_note_text:
+                note_text = f"{computed_note_text}\n{stored_note_text}"
+            elif computed_note_text:
+                note_text = computed_note_text
+            else:
+                note_text = stored_note_text
 
             self.targets_table.setCellWidget(
                 row_index,
@@ -3555,23 +3646,30 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 ),
             )
 
-            for column_index, text in enumerate((coverage_text, minimum_dose_text, maximum_dose_text, note_text), start=1):
+            self.targets_table.setCellWidget(
+                row_index,
+                1,
+                self.create_target_coverage_cell_widget(
+                    coverage_text,
+                    background_color,
+                    structure_name=structure_name,
+                    normalized_name=normalized_name,
+                    is_primary_ptv=is_primary_ptv,
+                ),
+            )
+
+            for column_index, text in enumerate((minimum_dose_text, maximum_dose_text, note_text), start=2):
                 item = QtWidgets.QTableWidgetItem(text)
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
                 item.setBackground(background_color)
                 if column_index == 4 and note_text:
                     item.setToolTip(note_text)
                 self.targets_table.setItem(row_index, column_index, item)
-            if is_stereotactic_row:
-                blank_note_button = QtWidgets.QWidget()
-                blank_note_button.setStyleSheet(f"background-color: {background_color.name()};")
-                self.targets_table.setCellWidget(row_index, 5, blank_note_button)
-            else:
-                self.targets_table.setCellWidget(
-                    row_index,
-                    5,
-                    self.create_target_note_button(note_key, note_title, background_color),
-                )
+            self.targets_table.setCellWidget(
+                row_index,
+                5,
+                self.create_target_note_button(note_key, note_title, background_color),
+            )
 
         self.targets_table.resizeColumnsToContents()
         QtCore.QTimer.singleShot(0, self.update_targets_table_column_widths)
@@ -3878,11 +3976,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         items.clear()
 
     def populate_isodose_controls(self):
-        default_levels = get_ptv_dose_levels_gy(self.rtstruct)[: len(self.isodose_edit_widgets)]
         for idx, edit in enumerate(self.isodose_edit_widgets):
             blocker = QtCore.QSignalBlocker(edit)
-            if idx < len(default_levels):
-                edit.setText(f"{default_levels[idx]:.1f}")
+            if idx == 0:
+                total_rx_gy = self.get_total_rx_dose_gy()
+                if total_rx_gy is not None and total_rx_gy > 0.0:
+                    edit.setText(f"{total_rx_gy:.1f}")
+                else:
+                    edit.clear()
             else:
                 edit.clear()
             del blocker

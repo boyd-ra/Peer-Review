@@ -341,7 +341,7 @@ def scan_patient_folder(
             ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
             modality = str(safe_get(ds, "Modality", "")).upper()
         except Exception as exc:
-            logger.debug("Skipping unreadable DICOM during folder scan: %s (%s)", path, exc)
+            logger.warning("Skipping unreadable DICOM during folder scan: %s (%s)", path, exc)
             continue
 
         if modality == "CT":
@@ -364,7 +364,7 @@ def load_ct_series_from_paths(ct_paths: List[str]) -> CTVolume:
             if safe_get(ds, "Modality", "") == "CT":
                 files.append(ds)
         except Exception as exc:
-            logger.debug("Skipping CT candidate during CT load: %s (%s)", path, exc)
+            logger.warning("Skipping CT candidate during CT load: %s (%s)", path, exc)
 
     if not files:
         raise ValueError("No CT DICOM slices found in the selected folder.")
@@ -488,7 +488,7 @@ def load_rtplan_phases(paths: List[str], rtdose_paths: Optional[List[str]] = Non
         try:
             ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
         except Exception as exc:
-            logger.debug("Skipping RTDOSE while loading RTPLAN phases: %s (%s)", path, exc)
+            logger.warning("Skipping RTDOSE while loading RTPLAN phases: %s (%s)", path, exc)
             continue
         if str(safe_get(ds, "Modality", "")).upper() != "RTDOSE":
             continue
@@ -502,7 +502,7 @@ def load_rtplan_phases(paths: List[str], rtdose_paths: Optional[List[str]] = Non
         try:
             ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
         except Exception as exc:
-            logger.debug("Skipping RTPLAN while loading phases: %s (%s)", path, exc)
+            logger.warning("Skipping RTPLAN while loading phases: %s (%s)", path, exc)
             continue
         if str(safe_get(ds, "Modality", "")).upper() != "RTPLAN":
             continue
@@ -538,7 +538,7 @@ def summarize_rtplan_files(paths: List[str]) -> Optional[Tuple[str, ...]]:
         try:
             ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
         except Exception as exc:
-            logger.debug("Skipping RTPLAN while summarizing plans: %s (%s)", path, exc)
+            logger.warning("Skipping RTPLAN while summarizing plans: %s (%s)", path, exc)
             continue
         if str(safe_get(ds, "Modality", "")).upper() != "RTPLAN":
             continue
