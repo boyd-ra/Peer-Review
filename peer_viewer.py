@@ -1244,8 +1244,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.plan_phases,
             )
         self.rebuild_structure_goals_by_name()
+        self.cached_target_table_rows = None
 
         if self.rtstruct is None:
+            self.update_targets_table()
             return
 
         self.sort_rtstruct_structures_for_display()
@@ -1270,6 +1272,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             else:
                 self.refresh_visible_structure_goal_evaluations()
                 self.update_structure_list_goal_texts()
+        self.update_targets_table()
 
     def on_constraint_sheet_changed(self, sheet_name: str) -> None:
         normalized_sheet_name = sheet_name.strip()
@@ -1530,6 +1533,71 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return f"TARGET||{parent_normalized_name}||{normalized_name}"
         return f"TARGET||{normalized_name}"
 
+    def get_target_note_key_for_row(self, row: Dict[str, object]) -> str:
+        normalized_name = normalize_structure_name(str(row.get("normalized_name", "")))
+        parent_normalized_name = row.get("parent_normalized_name")
+        is_primary_ptv = bool(row.get("is_primary_ptv", False))
+        section_key = (
+            normalized_name
+            if is_primary_ptv or not parent_normalized_name
+            else normalize_structure_name(str(parent_normalized_name))
+        )
+        if is_primary_ptv:
+            return self.get_target_note_key(normalized_name)
+        return self.get_target_note_key(normalized_name, parent_normalized_name=section_key)
+
+    def compose_target_note_text(self, computed_note_text: str, stored_note_text: str) -> str:
+        computed = computed_note_text.strip()
+        stored = stored_note_text.strip()
+        if computed and stored:
+            if stored == computed or stored.startswith(f"{computed}\n"):
+                return stored
+            return f"{computed}\n{stored}"
+        if computed:
+            return computed
+        return stored
+
+    def build_target_notes_for_save(self, target_rows: List[Dict[str, object]]) -> Dict[str, str]:
+        saved_notes: Dict[str, str] = {}
+        for row in target_rows:
+            note_key = self.get_target_note_key_for_row(row)
+            combined_note_text = self.compose_target_note_text(
+                str(row.get("notes_text", "")),
+                self.target_notes.get(note_key, ""),
+            )
+            if combined_note_text:
+                saved_notes[note_key] = combined_note_text
+
+        for note_key, note_text in self.target_notes.items():
+            cleaned_note = str(note_text).strip()
+            if cleaned_note and note_key not in saved_notes:
+                saved_notes[note_key] = cleaned_note
+        return saved_notes
+
+    def extract_manual_target_notes(
+        self,
+        saved_notes_payload: Dict[str, str],
+        target_rows: List[Dict[str, object]],
+    ) -> Dict[str, str]:
+        row_note_text_by_key = {
+            self.get_target_note_key_for_row(row): str(row.get("notes_text", "")).strip()
+            for row in target_rows
+        }
+        manual_notes: Dict[str, str] = {}
+        for note_key, note_text in saved_notes_payload.items():
+            cleaned_note = str(note_text).strip()
+            if not cleaned_note:
+                continue
+            computed_note_text = row_note_text_by_key.get(note_key, "")
+            if computed_note_text:
+                if cleaned_note == computed_note_text:
+                    continue
+                if cleaned_note.startswith(f"{computed_note_text}\n"):
+                    cleaned_note = cleaned_note[len(computed_note_text) + 1 :].strip()
+            if cleaned_note:
+                manual_notes[str(note_key)] = cleaned_note
+        return manual_notes
+
     def get_listable_structure_names(self) -> List[str]:
         if self.rtstruct is None:
             return []
@@ -1756,7 +1824,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "target_table_rows": self.serialize_target_table_rows(target_rows),
             "stereotactic_target_doses": self.stereotactic_target_dose_text_by_name,
             "constraint_notes": self.constraint_notes,
-            "target_notes": self.target_notes,
+            "target_notes": self.build_target_notes_for_save(target_rows),
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -1903,7 +1971,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             if normalize_structure_name(str(name))
         }
         self.constraint_notes = {str(key): str(value) for key, value in notes_payload.items() if str(value).strip()}
-        self.target_notes = {str(key): str(value) for key, value in target_notes_payload.items() if str(value).strip()}
+        self.target_notes = self.extract_manual_target_notes(
+            {str(key): str(value) for key, value in target_notes_payload.items() if str(value).strip()},
+            target_table_rows,
+        )
         self.structure_mask_cache = None
         self.structure_mask_cache_names = []
         self.dvh_request_structure_names = {}
@@ -2255,6 +2326,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         else:
             self.dvh_status_label.setText("No structures produced DVH data on the current CT grid.")
             self.clear_dvh_curve_selection()
+        self.cached_target_table_rows = None
+        self.update_targets_table()
         self.render_dvh_plot()
         self.update_dvh_cache_button()
         self.update_background_dvh_timing_report(duration_s)
@@ -3119,6 +3192,18 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 return stored_text
         return self.get_default_stereotactic_dose_text(structure_name)
 
+    def normalize_stereotactic_dose_text(self, dose_text: str) -> str:
+        cleaned_text = dose_text.strip()
+        if not cleaned_text:
+            return ""
+        try:
+            dose_value = float(cleaned_text)
+        except (TypeError, ValueError):
+            return ""
+        if dose_value <= 0.0:
+            return ""
+        return f"{dose_value:.2f}"
+
     def get_stereotactic_threshold_gy(self, normalized_name: str, structure_name: str) -> Optional[float]:
         dose_text = self.get_stereotactic_dose_text(normalized_name, structure_name)
         if not dose_text:
@@ -3496,15 +3581,53 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
         dose_edit.setValidator(dose_validator)
         dose_edit.editingFinished.connect(
-            lambda name=normalized_name, edit=dose_edit: self.on_stereotactic_dose_editing_finished(name, edit)
+            lambda name=normalized_name, structure=structure_name, edit=dose_edit: self.on_stereotactic_dose_editing_finished(
+                name,
+                structure,
+                edit,
+            )
         )
         layout.addWidget(dose_edit, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
         return widget
 
-    def on_stereotactic_dose_editing_finished(self, normalized_name: str, edit: QtWidgets.QLineEdit):
-        dose_text = edit.text().strip()
-        self.stereotactic_target_dose_text_by_name[normalized_name] = dose_text
+    def on_stereotactic_dose_editing_finished(
+        self,
+        normalized_name: str,
+        structure_name: str,
+        edit: QtWidgets.QLineEdit,
+    ):
+        dose_text = self.normalize_stereotactic_dose_text(edit.text())
+        default_text = self.normalize_stereotactic_dose_text(self.get_default_stereotactic_dose_text(structure_name))
+        stored_text = self.normalize_stereotactic_dose_text(
+            self.stereotactic_target_dose_text_by_name.get(normalized_name, "")
+        )
+
+        if dose_text == default_text:
+            if stored_text:
+                self.stereotactic_target_dose_text_by_name.pop(normalized_name, None)
+                if stored_text == default_text:
+                    edit.setText(default_text)
+                    return
+            else:
+                edit.setText(default_text)
+                return
+        elif dose_text == stored_text:
+            edit.setText(dose_text)
+            return
+        elif not dose_text:
+            if not stored_text:
+                edit.setText(default_text)
+                return
+            self.stereotactic_target_dose_text_by_name.pop(normalized_name, None)
+            dose_text = default_text
+        else:
+            self.stereotactic_target_dose_text_by_name[normalized_name] = dose_text
+
+        if dose_text:
+            edit.setText(dose_text)
+        else:
+            edit.clear()
         self.stereotactic_metrics_cache = {}
         self.cached_target_table_rows = None
         self.update_targets_table()
@@ -3626,12 +3749,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 note_title = f"{structure_name} within {parent_structure_name} target review"
             stored_note_text = self.target_notes.get(note_key, "").strip()
             computed_note_text = str(row.get("notes_text", "")).strip()
-            if stored_note_text and computed_note_text:
-                note_text = f"{computed_note_text}\n{stored_note_text}"
-            elif computed_note_text:
-                note_text = computed_note_text
-            else:
-                note_text = stored_note_text
+            note_text = self.compose_target_note_text(computed_note_text, stored_note_text)
 
             self.targets_table.setCellWidget(
                 row_index,
