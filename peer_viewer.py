@@ -188,10 +188,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         constraints_tab = QtWidgets.QWidget()
         constraints_layout = QtWidgets.QVBoxLayout(constraints_tab)
         constraints_top_row = QtWidgets.QHBoxLayout()
-        self.save_constraints_button = QtWidgets.QPushButton("Save")
-        self.save_constraints_button.setFixedWidth(72)
-        self.save_constraints_button.setEnabled(False)
-        constraints_top_row.addWidget(self.save_constraints_button)
         self.add_constraint_button = QtWidgets.QPushButton("Add Constraint")
         self.add_constraint_button.setFixedWidth(128)
         self.add_constraint_button.setEnabled(False)
@@ -554,6 +550,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.load_patient_action = QtGui.QAction("Load Patient Folder", self)
         self.reset_view_action = QtGui.QAction("Reset View", self)
         self.clear_patient_action = QtGui.QAction("Clear", self)
+        self.save_cache_action = QtGui.QAction("Save", self)
+        self.save_cache_action.setEnabled(False)
 
     def _create_toolbar(self):
         tb = self.addToolBar("Main")
@@ -561,15 +559,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         tb.addSeparator()
         tb.addAction(self.reset_view_action)
         tb.addAction(self.clear_patient_action)
+        tb.addAction(self.save_cache_action)
 
     def _connect_signals(self):
         self.load_patient_action.triggered.connect(self.on_load_patient_folder)
         self.reset_view_action.triggered.connect(self.on_reset_view)
         self.clear_patient_action.triggered.connect(self.on_clear_patient_session)
+        self.save_cache_action.triggered.connect(self.on_save_dvh_cache)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
         self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
         self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
-        self.save_constraints_button.clicked.connect(self.on_save_dvh_cache)
         self.add_constraint_button.clicked.connect(self.on_add_constraint_clicked)
         self.constraint_sheet_combo.currentTextChanged.connect(self.on_constraint_sheet_changed)
         self.autoscroll_slower_button.clicked.connect(self.on_autoscroll_slower)
@@ -1182,7 +1181,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         return Path(self.current_patient_folder) / "peer_dvh_constraints.json"
 
     def update_dvh_cache_button(self):
-        self.save_constraints_button.setEnabled(
+        self.save_cache_action.setEnabled(
             self.current_patient_folder is not None and bool(self.dvh_curves)
         )
         self.add_constraint_button.setEnabled(self.rtstruct is not None)
@@ -1451,6 +1450,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     "parent_structure_name": row.get("parent_structure_name"),
                     "parent_normalized_name": row.get("parent_normalized_name"),
                     "display_name": str(row.get("display_name", "")),
+                    "reference_dose_text": str(row.get("reference_dose_text", "")),
                     "coverage_text": str(row.get("coverage_text", "")),
                     "minimum_dose_text": str(row.get("minimum_dose_text", "")),
                     "maximum_dose_text": str(row.get("maximum_dose_text", "")),
@@ -1489,6 +1489,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         else normalize_structure_name(str(row_payload.get("parent_normalized_name")))
                     ),
                     "display_name": str(row_payload.get("display_name", "")),
+                    "reference_dose_text": str(row_payload.get("reference_dose_text", "")),
                     "coverage_text": str(row_payload.get("coverage_text", "")),
                     "minimum_dose_text": str(row_payload.get("minimum_dose_text", "")),
                     "maximum_dose_text": str(row_payload.get("maximum_dose_text", "")),
@@ -1498,6 +1499,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 }
             )
         return rows
+
+    def get_target_row_reference_dose_text(self, row: Dict[str, object]) -> str:
+        stored_text = str(row.get("reference_dose_text", "")).strip()
+        if stored_text:
+            return stored_text
+        coverage_text = str(row.get("coverage_text", ""))
+        match = re.search(r"@\s*([0-9]+(?:\.[0-9]+)?)\s*Gy", coverage_text)
+        if match is not None:
+            return self.normalize_stereotactic_dose_text(match.group(1))
+        return ""
 
     def target_table_rows_require_recompute(self, rows: List[Dict[str, object]]) -> bool:
         if self.ct is None or self.dose is None:
@@ -3431,6 +3442,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     "parent_structure_name": None,
                     "parent_normalized_name": None,
                     "display_name": structure.name,
+                    "reference_dose_text": f"{rx_reference_gy:.2f}" if rx_reference_gy > 0.0 else "",
                     "coverage_text": coverage_text,
                     "minimum_dose_text": minimum_dose_text,
                     "maximum_dose_text": maximum_dose_text,
@@ -3485,6 +3497,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         "parent_structure_name": structure.name,
                         "parent_normalized_name": normalized_name,
                         "display_name": f"    {nested_structure.name}",
+                        "reference_dose_text": f"{rx_reference_gy:.2f}" if rx_reference_gy > 0.0 else "",
                         "coverage_text": nested_coverage_text,
                         "minimum_dose_text": nested_minimum_dose_text,
                         "maximum_dose_text": nested_maximum_dose_text,
@@ -3560,6 +3573,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         structure_name: str,
         normalized_name: str,
         is_primary_ptv: bool,
+        resolved_dose_text: Optional[str] = None,
     ) -> QtWidgets.QWidget:
         widget = QtWidgets.QWidget()
         widget.setStyleSheet(f"background-color: {background_color.name()};")
@@ -3586,7 +3600,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dose_edit.setFixedWidth(62)
         dose_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
         dose_edit.setPlaceholderText("Dose")
-        dose_edit.setText(self.get_stereotactic_dose_text(normalized_name, structure_name))
+        dose_edit.setText((resolved_dose_text or self.get_stereotactic_dose_text(normalized_name, structure_name)).strip())
         dose_edit.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         dose_validator = QtGui.QDoubleValidator(0.0, 999.99, 2, dose_edit)
         dose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
@@ -3745,6 +3759,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             coverage_text = str(row.get("coverage_text", ""))
             minimum_dose_text = str(row.get("minimum_dose_text", ""))
             maximum_dose_text = str(row.get("maximum_dose_text", ""))
+            reference_dose_text = self.get_target_row_reference_dose_text(row)
             is_primary_ptv = bool(row.get("is_primary_ptv", False))
             color_rgb = tuple(int(value) for value in row.get("color_rgb", (255, 255, 255)))
 
@@ -3789,6 +3804,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     structure_name=structure_name,
                     normalized_name=normalized_name,
                     is_primary_ptv=is_primary_ptv,
+                    resolved_dose_text=reference_dose_text,
                 ),
             )
 
