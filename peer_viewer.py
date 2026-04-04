@@ -503,7 +503,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dvh_sidebar_widget = QtWidgets.QWidget()
         dvh_sidebar_layout = QtWidgets.QVBoxLayout(dvh_sidebar_widget)
         dvh_sidebar_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
-        dvh_sidebar_layout.addWidget(QtWidgets.QLabel("Structures"))
+        dvh_sidebar_header_widget = QtWidgets.QWidget()
+        dvh_sidebar_header_layout = QtWidgets.QHBoxLayout(dvh_sidebar_header_widget)
+        dvh_sidebar_header_layout.setContentsMargins(0, 0, 0, 0)
+        dvh_sidebar_header_layout.setSpacing(8)
+        dvh_sidebar_header_layout.addWidget(QtWidgets.QLabel("Structures"))
+        dvh_sidebar_header_layout.addStretch(1)
+        self.clear_dvh_structures_button = QtWidgets.QPushButton("Clear")
+        self.clear_dvh_structures_button.setFixedWidth(56)
+        dvh_sidebar_header_layout.addWidget(self.clear_dvh_structures_button)
+        dvh_sidebar_layout.addWidget(dvh_sidebar_header_widget)
         self.dvh_structures_list = QtWidgets.QListWidget()
         self.dvh_structures_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.dvh_structures_list.setSpacing(1)
@@ -558,6 +567,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.load_patient_action.triggered.connect(self.on_load_patient_folder)
         self.reset_view_action.triggered.connect(self.on_reset_view)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
+        self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
         self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
         self.save_constraints_button.clicked.connect(self.on_save_dvh_cache)
         self.add_constraint_button.clicked.connect(self.on_add_constraint_clicked)
@@ -978,6 +988,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_faster_button.setEnabled(True)
         self.axial_structure_list.set_enabled(not locked)
         self.dvh_structure_list.set_enabled(not locked)
+        self.clear_dvh_structures_button.setEnabled(not locked)
         self.slice_prev_button.setEnabled(not locked)
         self.slice_slider.setEnabled(not locked)
         self.slice_next_button.setEnabled(not locked)
@@ -2341,6 +2352,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
 
         self.refresh_dvh()
+
+    def on_clear_dvh_structures_clicked(self):
+        changed = self.dvh_structure_list.set_checked_names([], emit_signal=False)
+        if not changed:
+            return
+        self.on_dvh_structure_visibility_changed()
 
     def get_dose_display_range(self) -> Tuple[float, float]:
         if self.dose is None:
