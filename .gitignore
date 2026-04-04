@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+.pytest_cache/
+.mypy_cache/
+
+peer_dvh_constraints.json
+peer_load_timing.txt
+
+*.log
+*.aux
+*.out
+*.toc
+*.pdf
