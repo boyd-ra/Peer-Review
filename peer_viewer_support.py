@@ -272,6 +272,8 @@ class StructureListItemWidget(QtWidgets.QWidget):
         trailing_button_callback: Optional[Callable[[], None]] = None,
         inline_goals: bool = False,
         inline_goals_compact: bool = False,
+        secondary_text: Optional[str] = None,
+        secondary_text_color: Optional[str] = None,
     ):
         super().__init__()
         self.show_checkbox = show_checkbox
@@ -280,16 +282,21 @@ class StructureListItemWidget(QtWidgets.QWidget):
         self.checkbox: Optional[QtWidgets.QCheckBox] = None
         self.title_label: Optional[QtWidgets.QLabel] = None
         self.inline_goal_label: Optional[QtWidgets.QLabel] = None
+        self.secondary_label: Optional[QtWidgets.QLabel] = None
 
         self.layout = QtWidgets.QVBoxLayout(self)
         self.layout.setContentsMargins(6, 4, 6, 4)
         self.layout.setSpacing(4)
 
         if show_checkbox:
+            title_row = QtWidgets.QWidget()
+            title_row_layout = QtWidgets.QHBoxLayout(title_row)
+            title_row_layout.setContentsMargins(0, 0, 0, 0)
+            title_row_layout.setSpacing(6)
             self.checkbox = QtWidgets.QCheckBox(name)
             self.checkbox.setChecked(checked)
             self.checkbox.setSizePolicy(
-                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Preferred,
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
             self.checkbox.setStyleSheet(
@@ -300,7 +307,21 @@ class StructureListItemWidget(QtWidgets.QWidget):
                 font.setPointSize(name_font_point_size)
                 self.checkbox.setFont(font)
             self.checkbox.stateChanged.connect(self._on_checkbox_state_changed)
-            self.layout.addWidget(self.checkbox, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+            title_row_layout.addWidget(self.checkbox, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+            self.secondary_label = QtWidgets.QLabel("")
+            self.secondary_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            self.secondary_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
+            if goal_font_point_size is not None:
+                font = self.secondary_label.font()
+                font.setPointSize(goal_font_point_size)
+                self.secondary_label.setFont(font)
+            title_row_layout.addSpacing(max(8, self.checkbox.fontMetrics().horizontalAdvance("  ")))
+            title_row_layout.addWidget(self.secondary_label, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+            title_row_layout.addStretch(1)
+            self.layout.addWidget(title_row, 0, QtCore.Qt.AlignmentFlag.AlignTop)
         else:
             title_row = QtWidgets.QWidget()
             title_row_layout = QtWidgets.QHBoxLayout(title_row)
@@ -369,6 +390,7 @@ class StructureListItemWidget(QtWidgets.QWidget):
         self.goal_font_point_size = goal_font_point_size
 
         self.set_goal_lines(goal_lines)
+        self.set_secondary_text(secondary_text, secondary_text_color)
 
     def sizeHint(self) -> QtCore.QSize:
         self.layout.activate()
@@ -423,6 +445,18 @@ class StructureListItemWidget(QtWidgets.QWidget):
             if color_name is not None:
                 label.setStyleSheet(f"color: {color_name};")
             self.goals_layout.addWidget(label, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+        self.updateGeometry()
+
+    def set_secondary_text(self, text: Optional[str], color_name: Optional[str] = None) -> None:
+        if self.secondary_label is None:
+            return
+        display_text = (text or "").strip()
+        self.secondary_label.setText(display_text)
+        self.secondary_label.setVisible(bool(display_text))
+        if color_name:
+            self.secondary_label.setStyleSheet(f"color: {color_name};")
+        else:
+            self.secondary_label.setStyleSheet("")
         self.updateGeometry()
 
     def _on_checkbox_state_changed(self, _state: int) -> None:
@@ -525,6 +559,28 @@ class StructureListManager(QtCore.QObject):
                 if widget is None or item is None:
                     continue
                 widget.set_goal_lines(goal_line_getter(normalized_name))
+                item.setSizeHint(widget.sizeHint())
+        self.schedule_layout_refresh()
+
+    def update_secondary_texts(
+        self,
+        rtstruct: Optional[RTStructData],
+        secondary_text_getter: Callable[[str], Tuple[Optional[str], Optional[str]]],
+    ) -> None:
+        if rtstruct is None:
+            return
+
+        for tag, _list_widget in self._collections:
+            widget_map = self._widget_maps[tag]
+            item_map = self._item_maps[tag]
+            for structure in rtstruct.structures:
+                normalized_name = normalize_structure_name(structure.name)
+                widget = widget_map.get(normalized_name)
+                item = item_map.get(normalized_name)
+                if widget is None or item is None:
+                    continue
+                text, color_name = secondary_text_getter(normalized_name)
+                widget.set_secondary_text(text, color_name)
                 item.setSizeHint(widget.sizeHint())
         self.schedule_layout_refresh()
 

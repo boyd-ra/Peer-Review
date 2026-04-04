@@ -135,6 +135,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_containment_cache: Dict[str, List[str]] = {}
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
         self.stereotactic_target_dose_text_by_name: Dict[str, str] = {}
+        self.targets_table_refresh_pending = False
         self.constraint_editor_state: Optional[Dict[str, str]] = None
         self.constraint_editor_widgets: Dict[str, QtWidgets.QWidget] = {}
         self.current_row: int = 0
@@ -230,8 +231,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraints_table.verticalHeader().setDefaultSectionSize(30)
         constraints_layout.addWidget(self.constraints_table, 1)
 
-        targets_tab = QtWidgets.QWidget()
-        targets_layout = QtWidgets.QVBoxLayout(targets_tab)
+        self.targets_tab = QtWidgets.QWidget()
+        targets_layout = QtWidgets.QVBoxLayout(self.targets_tab)
         self.targets_table = QtWidgets.QTableWidget(0, 6)
         self.targets_table.setHorizontalHeaderLabels(["PTV", "Coverage @ Rx", "Min Dose", "Max Dose", "Notes", "Note"])
         self.targets_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -239,7 +240,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.targets_table.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
         self.targets_table.setShowGrid(False)
         self.targets_table.setAlternatingRowColors(False)
-        self.targets_table.setWordWrap(False)
+        self.targets_table.setWordWrap(True)
         self.targets_table.verticalHeader().hide()
         self.targets_table.horizontalHeader().setStretchLastSection(False)
         self.targets_table.horizontalHeader().setHighlightSections(False)
@@ -527,7 +528,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_plot.setLabel("bottom", "Dose", units="Gy")
         self.dvh_plot.setLabel("left", "Volume", units="%")
         self.dvh_plot.setTitle("Dose-Volume Histogram")
-        self.dvh_plot.addLegend(offset=(10, 10))
         self.dvh_plot.setMouseEnabled(x=True, y=True)
         self.dvh_plot.setMenuEnabled(True)
         self.dvh_crosshair_vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((90, 90, 90), width=1))
@@ -544,7 +544,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         self.tabs.addTab(axial_tab, "Axial View")
         self.tabs.addTab(constraints_tab, "Constraints")
-        self.tabs.addTab(targets_tab, "Targets")
+        self.tabs.addTab(self.targets_tab, "Targets")
         self.tabs.addTab(dvh_tab, "DVH")
         self.tabs.setCurrentWidget(axial_tab)
 
@@ -553,16 +553,19 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def _create_actions(self):
         self.load_patient_action = QtGui.QAction("Load Patient Folder", self)
         self.reset_view_action = QtGui.QAction("Reset View", self)
+        self.clear_patient_action = QtGui.QAction("Clear", self)
 
     def _create_toolbar(self):
         tb = self.addToolBar("Main")
         tb.addAction(self.load_patient_action)
         tb.addSeparator()
         tb.addAction(self.reset_view_action)
+        tb.addAction(self.clear_patient_action)
 
     def _connect_signals(self):
         self.load_patient_action.triggered.connect(self.on_load_patient_folder)
         self.reset_view_action.triggered.connect(self.on_reset_view)
+        self.clear_patient_action.triggered.connect(self.on_clear_patient_session)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
         self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
         self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
@@ -678,6 +681,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
         self.cached_target_table_rows = None
+        self.targets_table_refresh_pending = False
         self.constraint_editor_state = None
         self.constraint_editor_widgets = {}
         self.max_dose_index_zyx = None
@@ -690,6 +694,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.z_label.setText("z: -")
         self.window_label.setText("WL/WW: 40 / 400")
 
+        self.tabs.setCurrentIndex(0)
+        self.refresh_constraint_sheet_combo(preferred_sheet_name=NO_CONSTRAINTS_SHEET_LABEL)
         self.update_patient_plan_label()
         self.populate_structures_list()
         self.populate_isodose_controls()
@@ -698,6 +704,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.clear_dvh_curve_selection()
         self.update_dvh_cache_button()
         self.update_dose_range_controls()
+        self.statusBar().clearMessage()
         self.clear_viewer_image_items()
         gc.collect()
 
@@ -859,12 +866,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.sagittal_view.autoRange()
             self.coronal_view.autoRange()
 
+    def on_clear_patient_session(self):
+        self.clear_patient_session_state()
+
     def on_reset_window_level(self):
         self.window_level_slider.setWindowLevel(400, 40)
 
     def on_tab_changed(self, _index: int):
         self.update_constraints_table_column_widths()
         self.update_targets_table_column_widths()
+        if self.targets_table_refresh_pending and self.tabs.currentWidget() is self.targets_tab:
+            QtCore.QTimer.singleShot(0, self.update_targets_table)
 
     def on_autoscroll_button_pressed(self):
         if self.autoscroll_button.isChecked():
@@ -2056,7 +2068,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if plot_item.legend is not None:
             plot_item.legend.scene().removeItem(plot_item.legend)
             plot_item.legend = None
-        plot_item.addLegend(offset=(10, 10))
         self.dvh_plot_items = {}
         self.dvh_curve_marker.setData([], [])
         self.dvh_crosshair_vline.setVisible(False)
@@ -2237,7 +2248,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 curve.dose_bins_gy,
                 curve.volume_pct,
                 pen=pg.mkPen(color=curve.color_rgb, width=2),
-                name=f"{curve.name} ({curve.volume_cc:.1f} cc)",
             )
             item.setCurveClickable(True, width=16)
             item.sigClicked.connect(self.on_dvh_curve_clicked)
@@ -3513,6 +3523,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         for column_index, width in enumerate(column_widths):
             self.targets_table.setColumnWidth(column_index, max(1, width))
+        self.targets_table.resizeRowsToContents()
 
     def create_target_name_cell_widget(
         self,
@@ -3711,6 +3722,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self.update_constraints_table_column_widths)
 
     def update_targets_table(self):
+        if self.rtstruct is not None and self.ct is not None and self.tabs.currentWidget() is not self.targets_tab:
+            self.targets_table_refresh_pending = True
+            return
+
+        self.targets_table_refresh_pending = False
         self.targets_table.setRowCount(0)
 
         if self.rtstruct is None or self.ct is None:
@@ -3781,6 +3797,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
                 item.setBackground(background_color)
                 if column_index == 4 and note_text:
+                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
                     item.setToolTip(note_text)
                 self.targets_table.setItem(row_index, column_index, item)
             self.targets_table.setCellWidget(
@@ -3790,6 +3807,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             )
 
         self.targets_table.resizeColumnsToContents()
+        self.targets_table.resizeRowsToContents()
         QtCore.QTimer.singleShot(0, self.update_targets_table_column_widths)
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
@@ -3805,6 +3823,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             )
             for evaluation in self.structure_goal_evaluations.get(normalized_name, [])
         ]
+
+    def get_dvh_structure_secondary_text(self, normalized_name: str) -> Tuple[Optional[str], Optional[str]]:
+        curve = self.get_curve_for_name(normalized_name)
+        if curve is None:
+            return None, None
+        return f"Vol {curve.volume_cc:.2f} cc", "#d0d0d0"
 
     def get_structure_by_normalized_name(self, normalized_name: str) -> Optional[StructureSliceContours]:
         if self.rtstruct is None:
@@ -3925,6 +3949,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def update_structure_list_goal_texts(self):
         self.axial_structure_list.update_goal_lines(self.build_axial_list_rtstruct(), self.get_axial_structure_goal_lines)
         self.dvh_structure_list.update_goal_lines(self.rtstruct, self.get_structure_goal_lines)
+        self.dvh_structure_list.update_secondary_texts(self.rtstruct, self.get_dvh_structure_secondary_text)
         self.update_constraints_table()
         self.update_targets_table()
 
@@ -4005,6 +4030,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 normalized_name.startswith("PTV")
                 or normalized_name in self.structure_goals_by_name
             ),
+            item_options_getter=lambda normalized_name: {
+                "secondary_text": self.get_dvh_structure_secondary_text(normalized_name)[0],
+                "secondary_text_color": self.get_dvh_structure_secondary_text(normalized_name)[1],
+            },
         )
         self.update_constraints_table()
         self.update_targets_table()
