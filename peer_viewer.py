@@ -86,6 +86,23 @@ def _callable_signature_hash(func) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
 
 
+class RectZoomViewBox(pg.ViewBox):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("enableMenu", False)
+        super().__init__(*args, **kwargs)
+        self.setMouseMode(self.RectMode)
+
+    def mouseDragEvent(self, event, axis=None):
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            event.ignore()
+            return
+        self.setMouseMode(self.RectMode)
+        super().mouseDragEvent(event, axis=axis)
+
+    def wheelEvent(self, event, axis=None):
+        event.ignore()
+
+
 class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -119,6 +136,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_plot_items: Dict[str, pg.PlotDataItem] = {}
         self.selected_dvh_curve_name: Optional[str] = None
         self.dvh_request_structure_names: Dict[int, List[str]] = {}
+        self.dvh_structure_volume_cache: Dict[str, float] = {}
+        self.dvh_ptv_coverage_cache: Dict[str, str] = {}
+        self.dvh_structure_goal_evaluation_cache: Dict[str, List[StructureGoalEvaluation]] = {}
         self.latest_timing_entries: List[Tuple[str, Optional[float]]] = []
         self.latest_timing_folder: Optional[str] = None
         self.latest_timing_csv_path: Optional[str] = None
@@ -520,14 +540,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dvh_content_layout = QtWidgets.QVBoxLayout(dvh_content_widget)
         self.dvh_status_label = QtWidgets.QLabel("Load a patient folder to generate the axial view and filtered DVHs.")
         self.dvh_readout_label = QtWidgets.QLabel("Click a DVH curve to inspect dose and volume.")
-        self.dvh_plot = pg.PlotWidget()
+        self.dvh_plot = pg.PlotWidget(viewBox=RectZoomViewBox())
         self.dvh_plot.setBackground("w")
         self.dvh_plot.showGrid(x=True, y=True, alpha=0.25)
         self.dvh_plot.setLabel("bottom", "Dose", units="Gy")
         self.dvh_plot.setLabel("left", "Volume", units="%")
         self.dvh_plot.setTitle("Dose-Volume Histogram")
         self.dvh_plot.setMouseEnabled(x=True, y=True)
-        self.dvh_plot.setMenuEnabled(True)
+        self.dvh_plot.setMenuEnabled(False)
         self.dvh_crosshair_vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((90, 90, 90), width=1))
         self.dvh_crosshair_hline = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen((90, 90, 90), width=1))
         self.dvh_curve_marker = pg.ScatterPlotItem(size=9)
@@ -580,6 +600,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self)
         self.autoscroll_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
         self.autoscroll_shortcut.activated.connect(self.toggle_autoscroll_shortcut)
+        self.clear_dvh_curve_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Escape), self)
+        self.clear_dvh_curve_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        self.clear_dvh_curve_shortcut.activated.connect(self.on_clear_dvh_curve_shortcut)
         self.slice_prev_button.clicked.connect(self.on_previous_slice)
         self.slice_next_button.clicked.connect(self.on_next_slice)
         self.slice_slider.valueChanged.connect(self.update_display)
@@ -673,6 +696,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_plot_items = {}
         self.selected_dvh_curve_name = None
         self.dvh_request_structure_names = {}
+        self.dvh_structure_volume_cache = {}
+        self.dvh_ptv_coverage_cache = {}
+        self.dvh_structure_goal_evaluation_cache = {}
         self.phase_dose_volumes_by_path = {}
         self.phase_dose_plane_cache = {}
         self.target_curve_cache = {}
@@ -881,6 +907,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.axial_view.autoRange()
             self.sagittal_view.autoRange()
             self.coronal_view.autoRange()
+        self.fit_dvh_view_to_visible_curves()
 
     def on_clear_patient_session(self):
         self.clear_patient_session_state()
@@ -1307,6 +1334,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.refresh_dvh()
             else:
                 self.refresh_visible_structure_goal_evaluations()
+                self.update_dvh_goal_evaluation_cache()
                 self.update_structure_list_goal_texts()
         self.update_targets_table()
 
@@ -1464,6 +1492,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     continue
                 merged.setdefault(structure_name, []).extend(goals)
         self.structure_goals_by_name = merged
+        self.dvh_structure_goal_evaluation_cache = {}
 
     def serialize_target_table_rows(self, rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
         serialized_rows: List[Dict[str, object]] = []
@@ -1840,6 +1869,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         selected_changed = self.ensure_dvh_structure_selected(normalized_name)
         current_curve_names = set(self.current_dvh_curve_names())
         self.refresh_visible_structure_goal_evaluations()
+        self.update_dvh_goal_evaluation_cache()
         self.update_structure_list_goal_texts()
         self.update_dvh_cache_button()
 
@@ -2075,9 +2105,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             target_table_rows
         )
         self.cached_target_table_rows = target_table_rows if use_cached_target_rows else None
+        self.update_dvh_secondary_metric_caches()
         if saved_selected_names:
             self.dvh_structure_list.set_checked_names(saved_selected_names)
         self.refresh_visible_structure_goal_evaluations(precomputed=goal_evaluations or None)
+        self.update_dvh_goal_evaluation_cache(goal_evaluations or None)
         self.update_structure_list_goal_texts()
         self.render_dvh_plot()
         if self.dvh_curves:
@@ -2154,6 +2186,69 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         plot_item.addItem(self.dvh_crosshair_hline, ignoreBounds=True)
         plot_item.addItem(self.dvh_curve_marker)
 
+    def get_current_dvh_view_range(
+        self,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        if not self.dvh_plot_items:
+            return None
+        x_range, y_range = self.dvh_plot.getPlotItem().vb.viewRange()
+        return (
+            (float(x_range[0]), float(x_range[1])),
+            (float(y_range[0]), float(y_range[1])),
+        )
+
+    def get_visible_dvh_curves(self) -> List[DVHCurve]:
+        return [
+            curve
+            for curve in self.dvh_curves
+            if self.dvh_structure_is_visible(normalize_structure_name(curve.name))
+        ]
+
+    def fit_dvh_view_to_visible_curves(self) -> None:
+        visible_curves = [
+            curve for curve in self.get_visible_dvh_curves() if curve.dose_bins_gy.size
+        ]
+        if not visible_curves:
+            return
+        max_dose = max(float(curve.dose_bins_gy[-1]) for curve in visible_curves)
+        self.dvh_plot.setXRange(0.0, max(max_dose, 1.0), padding=0.02)
+        self.dvh_plot.setYRange(0.0, 100.0, padding=0.02)
+
+    def get_cached_ptv_coverage_text(self, normalized_name: str) -> Optional[str]:
+        cached_target_rows = self.cached_target_table_rows or []
+        for row in cached_target_rows:
+            if (
+                bool(row.get("is_primary_ptv", False))
+                and str(row.get("normalized_name", "")) == normalized_name
+            ):
+                coverage_text = str(row.get("coverage_text", "")).strip()
+                if coverage_text:
+                    return coverage_text
+        return self.dvh_ptv_coverage_cache.get(normalized_name)
+
+    def update_dvh_secondary_metric_caches(self) -> None:
+        for curve in self.dvh_curves:
+            normalized_name = normalize_structure_name(curve.name)
+            self.dvh_structure_volume_cache[normalized_name] = float(curve.volume_cc)
+
+        cached_target_rows = self.cached_target_table_rows or []
+        for row in cached_target_rows:
+            if not bool(row.get("is_primary_ptv", False)):
+                continue
+            normalized_name = str(row.get("normalized_name", ""))
+            coverage_text = str(row.get("coverage_text", "")).strip()
+            if normalized_name and coverage_text:
+                self.dvh_ptv_coverage_cache[normalized_name] = coverage_text
+
+    def update_dvh_goal_evaluation_cache(
+        self,
+        evaluations_by_name: Optional[Dict[str, List[StructureGoalEvaluation]]] = None,
+    ) -> None:
+        source = evaluations_by_name if evaluations_by_name is not None else self.structure_goal_evaluations
+        for normalized_name, evaluations in source.items():
+            if evaluations:
+                self.dvh_structure_goal_evaluation_cache[normalized_name] = list(evaluations)
+
     def clear_dvh_curve_selection(self):
         self.selected_dvh_curve_name = None
         self.dvh_curve_marker.setData([], [])
@@ -2162,6 +2257,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_readout_label.setText("Click a DVH curve to inspect dose and volume.")
         self.update_dvh_curve_highlighting()
         self.update_dvh_cache_button()
+
+    def on_clear_dvh_curve_shortcut(self):
+        if self.selected_dvh_curve_name is None:
+            return
+        self.clear_dvh_curve_selection()
 
     def get_curve_for_name(self, normalized_name: str) -> Optional[DVHCurve]:
         for curve in self.dvh_curves:
@@ -2303,7 +2403,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def get_dvh_mode_label(self) -> str:
         return "High accuracy"
 
-    def render_dvh_plot(self):
+    def render_dvh_plot(self, *, reset_view: bool = False):
+        previous_view_range = None if reset_view else self.get_current_dvh_view_range()
         self.reset_dvh_plot()
         if not self.dvh_curves:
             self.clear_dvh_curve_selection()
@@ -2332,12 +2433,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.dvh_plot_items[normalized_name] = item
 
         if self.dvh_plot_items:
-            visible_curves = [
-                curve for curve in self.dvh_curves if self.dvh_structure_is_visible(normalize_structure_name(curve.name))
-            ]
-            max_dose = max(float(curve.dose_bins_gy[-1]) for curve in visible_curves if curve.dose_bins_gy.size)
-            self.dvh_plot.setXRange(0.0, max(max_dose, 1.0), padding=0.02)
-            self.dvh_plot.setYRange(0.0, 100.0, padding=0.02)
+            if previous_view_range is not None:
+                x_range, y_range = previous_view_range
+                self.dvh_plot.getPlotItem().vb.setRange(
+                    xRange=x_range,
+                    yRange=y_range,
+                    padding=0.0,
+                )
+            else:
+                self.fit_dvh_view_to_visible_curves()
         self.update_dvh_curve_highlighting()
         if self.selected_dvh_curve_name is None:
             self.dvh_readout_label.setText("Click a DVH curve to inspect dose and volume.")
@@ -2406,6 +2510,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_mask_cache_names = list(request_structure_names)
         self.dvh_curves = list(curves)
         self.refresh_visible_structure_goal_evaluations()
+        self.update_dvh_goal_evaluation_cache()
+        self.update_dvh_secondary_metric_caches()
         self.update_structure_list_goal_texts()
         if self.selected_dvh_curve_name is not None and self.get_curve_for_name(self.selected_dvh_curve_name) is None:
             self.selected_dvh_curve_name = None
@@ -2485,6 +2591,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.dvh_job_manager.invalidate()
             self.dvh_request_structure_names = {}
             self.refresh_visible_structure_goal_evaluations()
+            self.update_dvh_goal_evaluation_cache()
             self.update_structure_list_goal_texts()
             self.render_dvh_plot()
             self.dvh_status_label.clear()
@@ -3891,6 +3998,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         self.targets_table.resizeColumnsToContents()
         self.targets_table.resizeRowsToContents()
+        self.update_dvh_secondary_metric_caches()
+        self.dvh_structure_list.update_secondary_texts(self.rtstruct, self.get_dvh_structure_secondary_text)
         QtCore.QTimer.singleShot(0, self.update_targets_table_column_widths)
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
@@ -3907,11 +4016,35 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             for evaluation in self.structure_goal_evaluations.get(normalized_name, [])
         ]
 
+    def get_dvh_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
+        lines: List[Tuple[str, Optional[str]]] = []
+        if normalized_name.startswith("PTV"):
+            coverage_text = self.get_cached_ptv_coverage_text(normalized_name)
+            if coverage_text:
+                lines.append((coverage_text, None))
+        lines.extend(
+            (
+                self.format_structure_goal_line(evaluation),
+                self.structure_goal_line_color(evaluation),
+            )
+            for evaluation in self.dvh_structure_goal_evaluation_cache.get(normalized_name, [])
+        )
+        return lines
+
     def get_dvh_structure_secondary_text(self, normalized_name: str) -> Tuple[Optional[str], Optional[str]]:
         curve = self.get_curve_for_name(normalized_name)
-        if curve is None:
+        parts: List[str] = []
+
+        if curve is not None:
+            volume_cc = float(curve.volume_cc)
+        else:
+            volume_cc = self.dvh_structure_volume_cache.get(normalized_name)
+        if volume_cc is not None:
+            parts.append(f"Vol {volume_cc:.2f} cc")
+
+        if not parts:
             return None, None
-        return f"Vol {curve.volume_cc:.2f} cc", "#d0d0d0"
+        return "   ".join(parts), "#d0d0d0"
 
     def get_structure_by_normalized_name(self, normalized_name: str) -> Optional[StructureSliceContours]:
         if self.rtstruct is None:
@@ -3925,15 +4058,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if self.ct is None:
             return []
 
-        cached_target_rows = self.cached_target_table_rows or []
-        for row in cached_target_rows:
-            if (
-                bool(row.get("is_primary_ptv", False))
-                and str(row.get("normalized_name", "")) == normalized_name
-            ):
-                coverage_text = str(row.get("coverage_text", "")).strip()
-                if coverage_text:
-                    return [(f"Coverage {coverage_text}", None)]
+        cached_coverage_text = self.get_cached_ptv_coverage_text(normalized_name)
+        if cached_coverage_text:
+            return [(f"Coverage {cached_coverage_text}", None)]
 
         if self.defer_sidebar_summary_metrics:
             return []
@@ -4037,7 +4164,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def update_structure_list_goal_texts(self):
         self.axial_structure_list.update_goal_lines(self.build_axial_list_rtstruct(), self.get_axial_structure_goal_lines)
-        self.dvh_structure_list.update_goal_lines(self.rtstruct, self.get_structure_goal_lines)
+        self.dvh_structure_list.update_goal_lines(self.rtstruct, self.get_dvh_structure_goal_lines)
         self.dvh_structure_list.update_secondary_texts(self.rtstruct, self.get_dvh_structure_secondary_text)
         self.update_constraints_table()
         self.update_targets_table()
@@ -4114,7 +4241,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         self.dvh_structure_list.set_structures(
             listable_rtstruct,
-            self.get_structure_goal_lines,
+            self.get_dvh_structure_goal_lines,
             default_visibility_resolver=lambda normalized_name: (
                 normalized_name.startswith("PTV")
                 or normalized_name in self.structure_goals_by_name
