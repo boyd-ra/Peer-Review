@@ -412,6 +412,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.coronal_view.addItem(self.coronal_max_marker)
 
         axial_widget = pg.GraphicsLayoutWidget()
+        self.axial_graphics_widget = axial_widget
         self.axial_view = axial_widget.addViewBox(lockAspect=True, invertY=True)
         self.axial_view.setMenuEnabled(False)
         self.axial_view.enableAutoRange()
@@ -426,9 +427,19 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.axial_view.addItem(self.dose_item)
         self.axial_view.addItem(self.axial_max_marker)
 
-        self.crosshair_text = pg.TextItem(anchor=(0, 1))
+        self.crosshair_text = pg.TextItem(anchor=(1, 0))
         self.axial_view.addItem(self.crosshair_text)
         self.crosshair_text.hide()
+        self.axial_readout_label = QtWidgets.QLabel(axial_widget)
+        self.axial_readout_label.setStyleSheet(
+            "QLabel { background-color: rgba(0, 0, 0, 210); color: white; "
+            "padding: 3px 7px; border-radius: 4px; font-size: 11px; }"
+        )
+        self.axial_readout_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignTop
+        )
+        self.axial_readout_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.axial_readout_label.hide()
 
         right_splitter.addWidget(sagittal_widget)
         right_splitter.addWidget(coronal_widget)
@@ -656,6 +667,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.sagittal_max_marker.setData([], [])
         self.coronal_max_marker.setData([], [])
         self.crosshair_text.hide()
+        self.axial_readout_label.hide()
 
     def clear_patient_session_state(self):
         self.cancel_autoscroll()
@@ -4416,6 +4428,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         super().resizeEvent(event)
         self.update_constraints_table_column_widths()
         self.update_targets_table_column_widths()
+        self.update_axial_readout_overlay_position()
 
     def get_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
         return [
@@ -4982,6 +4995,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def update_display(self):
         if self.ct is None:
             self.displayed_dose_plane = None
+            self.axial_readout_label.hide()
             return
 
         k = int(self.slice_slider.value())
@@ -5036,26 +5050,39 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.window_label.setText(f"WL/WW: {int(wl)} / {int(ww)}")
         self.update_dose_range_controls()
         self.update_max_dose_markers()
+        self.update_axial_readout_overlay_position()
+
+    def update_axial_readout_overlay_position(self):
+        if self.ct is None or not hasattr(self, "axial_readout_label"):
+            self.axial_readout_label.hide()
+            return
+        self.axial_readout_label.adjustSize()
+        margin = 10
+        x = max(margin, self.axial_graphics_widget.width() - self.axial_readout_label.width() - margin)
+        y = margin
+        self.axial_readout_label.move(x, y)
 
     def on_mouse_moved(self, pos):
         if self.ct is None or self.autoscroll_button.isChecked():
-            self.statusBar().clearMessage()
+            self.axial_readout_label.hide()
             return
 
         mouse_point = self.axial_view.mapSceneToView(pos)
         c = int(round(mouse_point.x()))
         r = int(round(mouse_point.y()))
         if not (0 <= r < self.ct.rows and 0 <= c < self.ct.cols):
-            self.statusBar().clearMessage()
+            self.axial_readout_label.hide()
             return
 
         k = int(self.slice_slider.value())
         hu = float(self.ct.volume_hu[k, r, c])
-        msg = f"HU={hu:.1f}"
+        msg = f"HU {hu:.1f}"
         if self.displayed_dose_plane is not None:
             dose_gy = float(self.displayed_dose_plane[r, c])
-            msg += f", Dose={dose_gy:.3f} Gy"
-        self.statusBar().showMessage(msg)
+            msg += f"\nDose {dose_gy:.2f} Gy"
+        self.axial_readout_label.setText(msg)
+        self.update_axial_readout_overlay_position()
+        self.axial_readout_label.show()
 
 
 def main():
