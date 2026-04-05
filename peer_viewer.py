@@ -23,7 +23,6 @@ except Exception:  # pragma: no cover - optional runtime dependency
 from peer_helpers import (
     build_structure_slice_mask,
     build_outline_series,
-    compute_isodose_volume_within_structure_margin_cc,
     compute_image_view_bounds,
     compute_single_structure_high_accuracy_curve,
     dose_at_volume_cc,
@@ -149,7 +148,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.phase_dose_plane_cache: Dict[Tuple[str, int], np.ndarray] = {}
         self.target_curve_cache: Dict[Tuple[str, str], Optional[DVHCurve]] = {}
         self.target_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
-        self.stereotactic_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float, float]] = {}
+        self.stereotactic_metrics_cache: Dict[Tuple[str, str, float, int], Tuple[float, float, float, float, float]] = {}
         self.max_tissue_dose_gy_cache: Optional[float] = None
         self.max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
@@ -3113,6 +3112,44 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_slice_mask_cache[normalized_name] = structure_masks
         return structure_masks
 
+    def get_local_structure_mask(
+        self,
+        structure: StructureSliceContours,
+        z_start: int,
+        z_end: int,
+        row_start: int,
+        row_end: int,
+        col_start: int,
+        col_end: int,
+    ) -> np.ndarray:
+        local_shape = (
+            z_end - z_start + 1,
+            row_end - row_start + 1,
+            col_end - col_start + 1,
+        )
+        local_mask = np.zeros(local_shape, dtype=bool)
+        for slice_index, slice_mask in self.get_target_structure_slice_masks(structure).items():
+            if slice_index < z_start or slice_index > z_end:
+                continue
+            local_z = slice_index - z_start
+            local_mask[local_z] = slice_mask[row_start: row_end + 1, col_start: col_end + 1]
+        return local_mask
+
+    def get_brain_structure(self) -> Optional[StructureSliceContours]:
+        if self.rtstruct is None:
+            return None
+
+        preferred_match: Optional[StructureSliceContours] = None
+        fallback_match: Optional[StructureSliceContours] = None
+        for structure in self.rtstruct.structures:
+            normalized_name = normalize_structure_name(structure.name)
+            if normalized_name == "BRAIN":
+                preferred_match = structure
+                break
+            if normalized_name.startswith("BRAIN") and "BRAINSTEM" not in normalized_name:
+                fallback_match = structure
+        return preferred_match or fallback_match
+
     def structure_is_fully_encompassed(
         self,
         parent_structure: StructureSliceContours,
@@ -3449,14 +3486,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return None
         return np.stack(dose_planes, axis=0)
 
-    def compute_gradient_index_value(
+    def build_partitioned_stereotactic_context(
         self,
         structure: StructureSliceContours,
-        threshold_gy: float,
         source_key: str,
-        ptv_volume_cc: float,
-    ) -> Optional[float]:
-        if self.ct is None or self.rtstruct is None or threshold_gy <= 0.0 or ptv_volume_cc <= 0.0:
+    ) -> Optional[Dict[str, object]]:
+        if self.ct is None or self.rtstruct is None:
             return None
 
         try:
@@ -3474,9 +3509,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         sz = float(self.ct.spacing_xyz_mm[2])
         voxel_volume_cc = sx * sy * sz / 1000.0
         margin_mm = 20.0
-        threshold_half_gy = float(threshold_gy) * 0.5
-        if threshold_half_gy <= 0.0:
-            return None
 
         def expanded_bbox_from_masks(mask_map: Dict[int, np.ndarray]) -> Optional[Tuple[int, int, int, int, int, int]]:
             if not mask_map:
@@ -3623,16 +3655,61 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             1.0 / np.maximum(tie_count, 1),
             0.0,
         ).astype(np.float32, copy=False)
+        return {
+            "target_weight": target_weight,
+            "dose_block": dose_block,
+            "voxel_volume_cc": voxel_volume_cc,
+            "z_start": z_start,
+            "z_end": z_end,
+            "row_start": row_start,
+            "row_end": row_end,
+            "col_start": col_start,
+            "col_end": col_end,
+        }
 
-        isodose_mask = np.asarray(dose_block >= threshold_half_gy, dtype=bool)
+    def compute_partitioned_stereotactic_volume_cc(
+        self,
+        context: Dict[str, object],
+        threshold_gy: float,
+        extra_mask: Optional[np.ndarray] = None,
+    ) -> float:
+        if threshold_gy <= 0.0:
+            return 0.0
+
+        target_weight = np.asarray(context["target_weight"], dtype=np.float32)
+        dose_block = np.asarray(context["dose_block"], dtype=np.float32)
+        voxel_volume_cc = float(context["voxel_volume_cc"])
+
+        isodose_mask = np.asarray(dose_block >= float(threshold_gy), dtype=bool)
         for z_index in range(isodose_mask.shape[0]):
             if np.any(isodose_mask[z_index]):
                 isodose_mask[z_index] = fill_binary_holes_2d(isodose_mask[z_index])
 
-        gradient_volume_cc = float(np.sum(target_weight[isodose_mask]) * voxel_volume_cc)
-        if gradient_volume_cc <= 0.0:
-            return 0.0
-        return gradient_volume_cc / ptv_volume_cc
+        if extra_mask is not None:
+            isodose_mask &= np.asarray(extra_mask, dtype=bool)
+
+        return float(np.sum(target_weight[isodose_mask]) * voxel_volume_cc)
+
+    def get_target_fraction_count(
+        self,
+        normalized_name: str,
+        source_key: str,
+        phase_assignments: Dict[str, Tuple[RTPlanPhase, float]],
+        single_phase: Optional[RTPlanPhase],
+    ) -> int:
+        phase_assignment = phase_assignments.get(normalized_name)
+        if phase_assignment is not None:
+            return int(max(phase_assignment[0].fractions_planned, 0))
+        if single_phase is not None and source_key == single_phase.dose_path:
+            return int(max(single_phase.fractions_planned, 0))
+        available_fraction_counts = [
+            int(max(phase.fractions_planned, 0))
+            for phase in self.plan_phases
+            if phase.fractions_planned > 0 and phase.dose_path
+        ]
+        if len(set(available_fraction_counts)) == 1 and available_fraction_counts:
+            return available_fraction_counts[0]
+        return 0
 
     def compute_stereotactic_indices(
         self,
@@ -3640,51 +3717,107 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         threshold_gy: float,
         coverage_pct: float,
         source_key: str,
-    ) -> Tuple[str, str, str, str]:
+        fractions_planned: int,
+    ) -> Tuple[str, str, str, str, str]:
         if self.ct is None:
-            return "", "", "", ""
+            return "", "", "", "", ""
 
         normalized_name = normalize_structure_name(structure.name)
-        cache_key = (normalized_name, source_key, round(float(threshold_gy), 3))
+        cache_key = (normalized_name, source_key, round(float(threshold_gy), 3), int(fractions_planned))
         cached = self.stereotactic_metrics_cache.get(cache_key)
         if cached is not None:
-            volume_cc, ci_value, pci_value, gi_value = cached
+            volume_cc, ci_value, pci_value, gi_value, brain_metric_cc = cached
+            brain_metric_text = ""
+            if fractions_planned == 1:
+                brain_metric_text = f"V12 {brain_metric_cc:.3f} cc"
+            elif fractions_planned == 5:
+                brain_metric_text = f"V24 {brain_metric_cc:.3f} cc"
             return (
                 f"Vol {volume_cc:.3f} cc",
                 f"CI {ci_value:.3f}",
                 f"PCI {pci_value:.3f}",
                 f"GI {gi_value:.3f}",
+                brain_metric_text,
             )
 
         curve = self.get_target_high_accuracy_curve(structure, source_key)
-        dose_volume = self.get_target_dose_volume(source_key)
-        if curve is None or dose_volume is None or curve.volume_cc <= 0.0:
-            return "", "", "", ""
-        isodose_volume_cc = compute_isodose_volume_within_structure_margin_cc(
-            self.ct,
-            dose_volume,
-            structure,
-            threshold_gy,
-            proximity_mm=5.0,
-            structure_mask_cache=self.get_target_structure_slice_masks(structure),
-        )
+        if curve is None or curve.volume_cc <= 0.0:
+            return "", "", "", "", ""
+        context = self.build_partitioned_stereotactic_context(structure, source_key)
         ptv_volume_cc = float(curve.volume_cc)
+        if context is None:
+            return "", "", "", "", ""
+        isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(context, threshold_gy)
+        gradient_isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(context, threshold_gy * 0.5)
         ci_value = isodose_volume_cc / ptv_volume_cc
         coverage_decimal = float(np.clip(coverage_pct / 100.0, 0.0, 1.0))
         pci_value = float((coverage_decimal ** 2) / ci_value) if ci_value > 0.0 else 0.0
-        gi_value = self.compute_gradient_index_value(
-            structure,
-            threshold_gy,
-            source_key,
+        gi_value = gradient_isodose_volume_cc / ptv_volume_cc if ptv_volume_cc > 0.0 else 0.0
+        brain_metric_cc = 0.0
+        brain_metric_text = ""
+        brain_structure = self.get_brain_structure()
+        if brain_structure is not None and fractions_planned in {1, 5}:
+            z_start = int(context["z_start"])
+            z_end = int(context["z_end"])
+            row_start = int(context["row_start"])
+            row_end = int(context["row_end"])
+            col_start = int(context["col_start"])
+            col_end = int(context["col_end"])
+            brain_local_mask = self.get_local_structure_mask(
+                brain_structure,
+                z_start,
+                z_end,
+                row_start,
+                row_end,
+                col_start,
+                col_end,
+            )
+            extra_mask = brain_local_mask
+            if fractions_planned == 1:
+                nested_gtv_structures = [
+                    nested_structure
+                    for nested_structure in self.get_nested_target_structures(structure)
+                    if normalize_structure_name(nested_structure.name).startswith("GTV")
+                ]
+                if nested_gtv_structures:
+                    gtv_union_mask = np.zeros_like(brain_local_mask, dtype=bool)
+                    for nested_gtv_structure in nested_gtv_structures:
+                        gtv_union_mask |= self.get_local_structure_mask(
+                            nested_gtv_structure,
+                            z_start,
+                            z_end,
+                            row_start,
+                            row_end,
+                            col_start,
+                            col_end,
+                        )
+                    extra_mask = brain_local_mask & ~gtv_union_mask
+                brain_metric_cc = self.compute_partitioned_stereotactic_volume_cc(
+                    context,
+                    12.0,
+                    extra_mask=extra_mask,
+                )
+                brain_metric_text = f"V12 {brain_metric_cc:.3f} cc"
+            elif fractions_planned == 5:
+                brain_metric_cc = self.compute_partitioned_stereotactic_volume_cc(
+                    context,
+                    24.0,
+                    extra_mask=extra_mask,
+                )
+                brain_metric_text = f"V24 {brain_metric_cc:.3f} cc"
+        self.stereotactic_metrics_cache[cache_key] = (
             ptv_volume_cc,
+            ci_value,
+            pci_value,
+            gi_value,
+            brain_metric_cc,
         )
-        gi_value = float(gi_value) if gi_value is not None else 0.0
-        self.stereotactic_metrics_cache[cache_key] = (ptv_volume_cc, ci_value, pci_value, gi_value)
         return (
             f"Vol {ptv_volume_cc:.3f} cc",
             f"CI {ci_value:.3f}",
             f"PCI {pci_value:.3f}",
             f"GI {gi_value:.3f}",
+            brain_metric_text,
         )
 
     def get_primary_target_context(
@@ -3845,6 +3978,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 phase_assignments,
                 single_phase,
             )
+            fractions_planned = self.get_target_fraction_count(
+                normalized_name,
+                source_key,
+                phase_assignments,
+                single_phase,
+            )
             min_dose_gy, max_dose_gy, coverage_pct = primary_metric_values
             if min_dose_gy is not None and max_dose_gy is not None and coverage_pct is not None:
                 minimum_dose_text = self.format_target_dose_text(min_dose_gy, rx_reference_gy)
@@ -3873,6 +4012,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 stereotactic_ci_text = ""
                 stereotactic_pci_text = ""
                 stereotactic_gi_text = ""
+                stereotactic_brain_metric_text = ""
                 stereotactic_hi_text = ""
                 if coverage_pct is not None and rx_reference_gy > 0.0:
                     (
@@ -3880,11 +4020,13 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         stereotactic_ci_text,
                         stereotactic_pci_text,
                         stereotactic_gi_text,
+                        stereotactic_brain_metric_text,
                     ) = self.compute_stereotactic_indices(
                         structure,
                         rx_reference_gy,
                         coverage_pct,
                         source_key=source_key,
+                        fractions_planned=fractions_planned,
                     )
                 if max_dose_gy is not None and rx_reference_gy > 0.0:
                     stereotactic_hi_text = f"HI {max_dose_gy / rx_reference_gy:.3f}"
@@ -3895,6 +4037,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         stereotactic_ci_text,
                         stereotactic_pci_text,
                         stereotactic_gi_text,
+                        stereotactic_brain_metric_text,
                         stereotactic_hi_text,
                     )
                     if text
