@@ -152,6 +152,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stereotactic_metrics_cache: Dict[Tuple[str, str, float, int], Tuple[float, float, float, float, float]] = {}
         self.max_tissue_dose_gy_cache: Optional[float] = None
         self.max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
+        self.ptv_union_slice_mask_cache: Optional[Dict[int, np.ndarray]] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
         self.target_containment_cache: Dict[str, List[str]] = {}
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
@@ -744,6 +745,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stereotactic_metrics_cache = {}
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
+        self.ptv_union_slice_mask_cache = None
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
         self.cached_target_table_rows = None
@@ -875,8 +877,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.max_tissue_index_zyx = None
                 self.cached_target_table_rows = None
                 self.apply_default_dose_range()
-                self.populate_structures_list()
-                self.update_targets_table()
             else:
                 timing_entries.append(("Load/merge RTDOSE", None))
                 timing_entries.append(("Resample dose to CT grid", None))
@@ -901,20 +901,27 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 if cache_found:
                     self.show_progress_status("Found saved JSON cache", pump_events=True)
                 stage_start = perf_counter()
-                cache_loaded = self.try_load_saved_dvh_cache()
+                cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
                 cache_load_duration = perf_counter() - stage_start if cache_loaded else None
             self.defer_sidebar_summary_metrics = False
             if self.rtstruct is not None and self.ct is not None:
-                self.populate_structures_list()
+                if cache_loaded:
+                    self.populate_structures_list()
+                    self.render_dvh_plot()
+                    if self.dvh_curves:
+                        self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
+                    else:
+                        self.dvh_status_label.setText("Saved DVH cache contained no curves.")
+                    self.update_dvh_cache_button()
+                else:
+                    if cache_found:
+                        self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
+                    self.show_progress_status("Computing metrics", pump_events=True)
+                    self.populate_structures_list()
             if cache_loaded:
                 self.show_progress_status("Loaded saved JSON cache")
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
             if not cache_loaded:
-                if cache_found:
-                    self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
-                if self.rtstruct is not None and self.ct is not None:
-                    self.show_progress_status("Computing metrics", pump_events=True)
-                    self.update_structure_list_goal_texts()
                 timing_entries.append(("Compute DVH (background)" if dvh_can_start else "Compute DVH", None))
             timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
 
@@ -1208,6 +1215,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stereotactic_metrics_cache = {}
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
+        self.ptv_union_slice_mask_cache = None
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
         self.cached_target_table_rows = None
@@ -1989,7 +1997,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             payload["index_zyx"] = [int(value) for value in self.max_tissue_index_zyx]
         return payload
 
-    def load_saved_dvh_cache(self, path: Path) -> bool:
+    def load_saved_dvh_cache(self, path: Path, *, refresh_ui: bool = True) -> bool:
         if self.rtstruct is None:
             return False
         try:
@@ -2043,12 +2051,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if saved_constraints_sheet is not None and saved_constraints_sheet not in self.available_constraint_sheet_names:
             return False
 
-        if saved_constraints_sheet != self.constraints_sheet_name:
-            self.refresh_constraint_sheet_combo(
-                preferred_sheet_name=saved_constraints_sheet or NO_CONSTRAINTS_SHEET_LABEL
-            )
-            self.apply_constraint_sheet(saved_constraints_sheet, refresh_lists=True, refresh_dvh=False)
-
         saved_csv_fingerprint = payload.get("constraints_fingerprint", payload.get("csv_fingerprint"))
         if saved_csv_fingerprint is not None:
             if not file_fingerprint_matches(saved_csv_fingerprint, self.structure_filter_csv_path):
@@ -2087,19 +2089,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if saved_dvh_mode not in {None, self.get_dvh_mode()}:
             return False
 
-        saved_dvh_signature = payload.get("dvh_method_signature")
-        if saved_dvh_signature is not None and saved_dvh_signature != get_dvh_method_signature():
-            return False
-
-        saved_target_signature = payload.get("target_method_signature")
-        if saved_target_signature is not None and saved_target_signature != self.get_target_method_signature():
-            return False
-
-        try:
-            curves = [self.deserialize_dvh_curve(curve_payload) for curve_payload in payload.get("curves", [])]
-        except (TypeError, ValueError):
-            return False
-
         notes_payload = payload.get("constraint_notes", {})
         if not isinstance(notes_payload, dict):
             return False
@@ -2111,34 +2100,68 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         custom_constraints = self.deserialize_structure_goals(payload.get("custom_constraints"))
         if custom_constraints is None:
             return False
-        goal_evaluations = self.deserialize_goal_evaluations(payload.get("goal_evaluations"))
-        if goal_evaluations is None:
-            return False
         stereotactic_dose_payload = payload.get("stereotactic_target_doses", {})
         if stereotactic_dose_payload is None:
             stereotactic_dose_payload = {}
         if not isinstance(stereotactic_dose_payload, dict):
             return False
         target_table_rows = self.deserialize_target_table_rows(payload.get("target_table_rows"))
-        if target_table_rows is None:
-            return False
         max_tissue_payload = payload.get("max_tissue")
         if max_tissue_payload is not None and not isinstance(max_tissue_payload, dict):
             return False
 
+        if saved_constraints_sheet != self.constraints_sheet_name:
+            self.refresh_constraint_sheet_combo(
+                preferred_sheet_name=saved_constraints_sheet or NO_CONSTRAINTS_SHEET_LABEL
+            )
+            self.apply_constraint_sheet(
+                saved_constraints_sheet,
+                refresh_lists=refresh_ui,
+                refresh_dvh=False,
+            )
+
         self.custom_structure_goals_by_name = custom_constraints
         self.rebuild_structure_goals_by_name()
-        self.dvh_curves = curves
         self.stereotactic_target_dose_text_by_name = {
             normalize_structure_name(str(name)): str(value).strip()
             for name, value in stereotactic_dose_payload.items()
             if normalize_structure_name(str(name))
         }
         self.constraint_notes = {str(key): str(value) for key, value in notes_payload.items() if str(value).strip()}
-        self.target_notes = self.extract_manual_target_notes(
-            {str(key): str(value) for key, value in target_notes_payload.items() if str(value).strip()},
-            target_table_rows,
-        )
+        cleaned_target_notes = {
+            str(key): str(value)
+            for key, value in target_notes_payload.items()
+            if str(value).strip()
+        }
+        if target_table_rows is None:
+            self.target_notes = cleaned_target_notes
+        else:
+            self.target_notes = self.extract_manual_target_notes(
+                cleaned_target_notes,
+                target_table_rows,
+            )
+
+        saved_dvh_signature = payload.get("dvh_method_signature")
+        if saved_dvh_signature is not None and saved_dvh_signature != get_dvh_method_signature():
+            return False
+
+        saved_target_signature = payload.get("target_method_signature")
+        if saved_target_signature is not None and saved_target_signature != self.get_target_method_signature():
+            return False
+
+        if target_table_rows is None:
+            return False
+
+        goal_evaluations = self.deserialize_goal_evaluations(payload.get("goal_evaluations"))
+        if goal_evaluations is None:
+            return False
+
+        try:
+            curves = [self.deserialize_dvh_curve(curve_payload) for curve_payload in payload.get("curves", [])]
+        except (TypeError, ValueError):
+            return False
+
+        self.dvh_curves = curves
         if isinstance(max_tissue_payload, dict):
             dose_value = max_tissue_payload.get("dose_gy")
             try:
@@ -2169,20 +2192,21 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.dvh_structure_list.set_checked_names(saved_selected_names)
         self.refresh_visible_structure_goal_evaluations(precomputed=goal_evaluations or None)
         self.update_dvh_goal_evaluation_cache(goal_evaluations or None)
-        self.update_structure_list_goal_texts()
-        self.render_dvh_plot()
-        if self.dvh_curves:
-            self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
-        else:
-            self.dvh_status_label.setText("Saved DVH cache contained no curves.")
-        self.update_dvh_cache_button()
+        if refresh_ui:
+            self.update_structure_list_goal_texts()
+            self.render_dvh_plot()
+            if self.dvh_curves:
+                self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
+            else:
+                self.dvh_status_label.setText("Saved DVH cache contained no curves.")
+            self.update_dvh_cache_button()
         return True
 
-    def try_load_saved_dvh_cache(self) -> bool:
+    def try_load_saved_dvh_cache(self, *, refresh_ui: bool = True) -> bool:
         cache_path = self.get_dvh_cache_path()
         if cache_path is None or not cache_path.exists():
             return False
-        return self.load_saved_dvh_cache(cache_path)
+        return self.load_saved_dvh_cache(cache_path, refresh_ui=refresh_ui)
 
     def on_save_dvh_cache(self):
         cache_path = self.get_dvh_cache_path()
@@ -3231,6 +3255,39 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 structure_masks[slice_index] = mask
         self.target_slice_mask_cache[normalized_name] = structure_masks
         return structure_masks
+
+    def get_ptv_union_slice_masks(self) -> Dict[int, np.ndarray]:
+        if self.ptv_union_slice_mask_cache is not None:
+            return self.ptv_union_slice_mask_cache
+        if self.rtstruct is None or self.ct is None:
+            self.ptv_union_slice_mask_cache = {}
+            return self.ptv_union_slice_mask_cache
+
+        union_masks: Dict[int, np.ndarray] = {}
+        for structure in self.rtstruct.structures:
+            if not normalize_structure_name(structure.name).startswith("PTV"):
+                continue
+            for slice_index, mask in self.get_target_structure_slice_masks(structure).items():
+                existing_mask = union_masks.get(slice_index)
+                if existing_mask is None:
+                    union_masks[slice_index] = np.asarray(mask, dtype=bool).copy()
+                else:
+                    existing_mask |= mask
+
+        for slice_index, mask in list(union_masks.items()):
+            if not np.any(mask):
+                union_masks.pop(slice_index, None)
+                continue
+            normalized_mask = fill_binary_holes_2d(mask)
+            if binary_dilation is not None:
+                normalized_mask = np.asarray(
+                    binary_dilation(normalized_mask, structure=np.ones((3, 3), dtype=bool)),
+                    dtype=bool,
+                )
+            union_masks[slice_index] = np.asarray(normalized_mask, dtype=bool)
+
+        self.ptv_union_slice_mask_cache = union_masks
+        return union_masks
 
     def get_local_structure_mask(
         self,
@@ -4631,51 +4688,38 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return []
 
         if self.max_tissue_dose_gy_cache is None:
-            ptv_structures = [
-                structure
+            ptv_union_masks = self.get_ptv_union_slice_masks()
+            if not ptv_union_masks and not any(
+                normalize_structure_name(structure.name).startswith("PTV")
                 for structure in self.rtstruct.structures
-                if normalize_structure_name(structure.name).startswith("PTV")
-            ]
-            if not ptv_structures:
+            ):
                 return []
 
             max_tissue_dose_gy: Optional[float] = None
             max_tissue_index: Optional[Tuple[int, int, int]] = None
             total_slices = self.sampled_dose_volume_ct.shape[0]
             for slice_index in range(total_slices):
-                ptv_union_mask = np.zeros((self.ct.rows, self.ct.cols), dtype=bool)
-                for structure in ptv_structures:
-                    slice_masks = self.get_target_structure_slice_masks(structure)
-                    mask = slice_masks.get(slice_index)
-                    if mask is not None:
-                        ptv_union_mask |= mask
-
-                if np.any(ptv_union_mask):
-                    ptv_union_mask = fill_binary_holes_2d(ptv_union_mask)
-                    if binary_dilation is not None:
-                        ptv_union_mask = np.asarray(
-                            binary_dilation(ptv_union_mask, structure=np.ones((3, 3), dtype=bool)),
-                            dtype=bool,
-                        )
-
                 dose_plane = self.sampled_dose_volume_ct[slice_index]
-                if ptv_union_mask.shape != dose_plane.shape:
+                ptv_union_mask = ptv_union_masks.get(slice_index)
+                if ptv_union_mask is not None and ptv_union_mask.shape != dose_plane.shape:
                     continue
-                tissue_values = dose_plane[~ptv_union_mask]
-                if tissue_values.size == 0:
+
+                if ptv_union_mask is None:
+                    tissue_mask = np.isfinite(dose_plane)
+                else:
+                    tissue_mask = np.isfinite(dose_plane) & ~ptv_union_mask
+                if not np.any(tissue_mask):
                     continue
-                finite_values = tissue_values[np.isfinite(tissue_values)]
-                if finite_values.size == 0:
+
+                tissue_dose_plane = np.where(tissue_mask, dose_plane, -np.inf)
+                slice_max = float(np.max(tissue_dose_plane))
+                if not np.isfinite(slice_max):
                     continue
-                slice_max = float(np.max(finite_values))
                 if max_tissue_dose_gy is None or slice_max > max_tissue_dose_gy:
                     max_tissue_dose_gy = slice_max
-                    outside_coords = np.argwhere(~ptv_union_mask)
-                    finite_outside_coords = outside_coords[np.isfinite(tissue_values)]
-                    if finite_outside_coords.size:
-                        local_max_index = int(np.nanargmax(tissue_values))
-                        max_row, max_col = finite_outside_coords[local_max_index]
-                        max_tissue_index = (slice_index, int(max_row), int(max_col))
+                    flat_index = int(np.argmax(tissue_dose_plane))
+                    max_row, max_col = np.unravel_index(flat_index, tissue_dose_plane.shape)
+                    max_tissue_index = (slice_index, int(max_row), int(max_col))
 
             self.max_tissue_dose_gy_cache = max_tissue_dose_gy
             self.max_tissue_index_zyx = max_tissue_index

@@ -513,12 +513,6 @@ def load_ct_series_from_paths(ct_paths: List[str]) -> CTVolume:
         cols=cols,
     )
 
-
-def load_ct_series(folder: str) -> CTVolume:
-    discovery = scan_patient_folder(folder)
-    return load_ct_series_from_paths(discovery.ct_paths)
-
-
 def load_ct_series_and_discover_patient_files(
     folder: str,
 ) -> Tuple[CTVolume, PatientFileDiscovery]:
@@ -571,101 +565,6 @@ def _extract_rtplan_target_structure_name(ds: pydicom.dataset.Dataset) -> str:
         if ptv_index >= 0:
             return normalized_description[ptv_index:]
     return ""
-
-
-def load_rtplan_phases(paths: List[str], rtdose_paths: Optional[List[str]] = None) -> List[RTPlanPhase]:
-    rtdose_paths = rtdose_paths or []
-    dose_path_by_plan_uid: Dict[str, str] = {}
-
-    for path in sorted(rtdose_paths):
-        try:
-            ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
-        except Exception as exc:
-            logger.warning("Skipping RTDOSE while loading RTPLAN phases: %s (%s)", path, exc)
-            continue
-        if str(safe_get(ds, "Modality", "")).upper() != "RTDOSE":
-            continue
-        for item in safe_get(ds, "ReferencedRTPlanSequence", []):
-            referenced_uid = str(safe_get(item, "ReferencedSOPInstanceUID", "")).strip()
-            if referenced_uid and referenced_uid not in dose_path_by_plan_uid:
-                dose_path_by_plan_uid[referenced_uid] = path
-
-    phases: List[RTPlanPhase] = []
-    for path in sorted(paths):
-        try:
-            ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
-        except Exception as exc:
-            logger.warning("Skipping RTPLAN while loading phases: %s (%s)", path, exc)
-            continue
-        if str(safe_get(ds, "Modality", "")).upper() != "RTPLAN":
-            continue
-
-        sop_instance_uid = str(safe_get(ds, "SOPInstanceUID", "")).strip()
-        prescription_doses_gy = _extract_rtplan_prescription_doses_gy(ds)
-        phases.append(
-            RTPlanPhase(
-                sop_instance_uid=sop_instance_uid,
-                prescription_dose_gy=max(prescription_doses_gy) if prescription_doses_gy else 0.0,
-                fractions_planned=_extract_rtplan_number_of_fractions(ds),
-                dose_path=dose_path_by_plan_uid.get(sop_instance_uid, ""),
-                target_structure_name=_extract_rtplan_target_structure_name(ds),
-                plan_label=str(safe_get(ds, "RTPlanLabel", "")).strip(),
-                plan_name=str(safe_get(ds, "RTPlanName", "")).strip(),
-            )
-        )
-
-    return phases
-
-
-def summarize_rtplan_files(paths: List[str]) -> Optional[Tuple[str, ...]]:
-    if not paths:
-        return None
-
-    patient_name = ""
-    patient_id = ""
-    total_prescription_dose_gy = 0.0
-    total_fractions = 0
-    plan_count = 0
-
-    for path in sorted(paths):
-        try:
-            ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
-        except Exception as exc:
-            logger.warning("Skipping RTPLAN while summarizing plans: %s (%s)", path, exc)
-            continue
-        if str(safe_get(ds, "Modality", "")).upper() != "RTPLAN":
-            continue
-
-        plan_count += 1
-        if not patient_name:
-            patient_name = _format_patient_name(safe_get(ds, "PatientName", ""))
-        if not patient_id:
-            patient_id = str(safe_get(ds, "PatientID", "")).strip()
-
-        plan_prescription_doses_gy = _extract_rtplan_prescription_doses_gy(ds)
-        if plan_prescription_doses_gy:
-            total_prescription_dose_gy += max(plan_prescription_doses_gy)
-        total_fractions += _extract_rtplan_number_of_fractions(ds)
-
-    if not patient_name and not patient_id and total_prescription_dose_gy <= 0.0 and total_fractions <= 0 and plan_count <= 0:
-        return None
-
-    line_1 = patient_name or "Patient name unavailable"
-    line_2 = f"ID: {patient_id}" if patient_id else "ID unavailable"
-    if total_fractions > 0:
-        dose_per_fraction_gy = total_prescription_dose_gy / float(total_fractions)
-        line_3 = f"{total_prescription_dose_gy:.2f} Gy | {total_fractions} fx | {dose_per_fraction_gy:.2f} Gy/fx"
-    elif total_prescription_dose_gy > 0.0:
-        line_3 = f"{total_prescription_dose_gy:.2f} Gy | Fractions unavailable"
-    else:
-        line_3 = "Prescription unavailable"
-
-    if plan_count > 0:
-        phase_label = "phase" if plan_count == 1 else "phases"
-        return line_1, line_2, line_3, f"{plan_count} {phase_label}"
-
-    return line_1, line_2, line_3
-
 
 def load_rtdose(path: str) -> DoseVolume:
     ds = pydicom.dcmread(path, stop_before_pixels=False)
