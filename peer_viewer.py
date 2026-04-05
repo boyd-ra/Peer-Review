@@ -203,6 +203,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
         root = QtWidgets.QVBoxLayout(central)
+        self.progress_status_label = QtWidgets.QLabel("")
+        self.progress_status_label.setStyleSheet("color: #d0d0d0; padding-left: 4px;")
+        self.statusBar().addWidget(self.progress_status_label, 1)
 
         self.tabs = QtWidgets.QTabWidget()
         root.addWidget(self.tabs)
@@ -384,6 +387,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         right_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
 
         sagittal_widget = pg.GraphicsLayoutWidget()
+        self.sagittal_graphics_widget = sagittal_widget
         self.sagittal_view = sagittal_widget.addViewBox(lockAspect=True, invertY=True)
         self.sagittal_view.setMenuEnabled(False)
         self.sagittal_view.enableAutoRange()
@@ -398,6 +402,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.sagittal_view.addItem(self.sagittal_max_marker)
 
         coronal_widget = pg.GraphicsLayoutWidget()
+        self.coronal_graphics_widget = coronal_widget
         self.coronal_view = coronal_widget.addViewBox(lockAspect=True, invertY=True)
         self.coronal_view.setMenuEnabled(False)
         self.coronal_view.enableAutoRange()
@@ -672,6 +677,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def clear_patient_session_state(self):
         self.cancel_autoscroll()
         self.dvh_job_manager.cancel_all()
+        self.clear_progress_status()
 
         self.current_patient_folder = None
         self.latest_timing_entries = []
@@ -760,8 +766,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         rtstruct_path: Optional[str] = None
         rtdose_paths: List[str] = []
 
+        self.set_heavy_view_updates_enabled(False)
         try:
-            self.show_progress_status("Scanning patient folder...")
+            self.show_progress_status("Scanning patient folder...", pump_events=True)
             self.clear_patient_session_state()
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
@@ -814,7 +821,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
             self.rtstruct_path = rtstruct_path
             if self.rtstruct_path:
-                self.show_progress_status("Loading structures")
+                self.show_progress_status("Loading structures", pump_events=True)
                 stage_start = perf_counter()
                 self.reload_rtstruct_from_current_selection(refresh_dvh=False, refresh_views=False)
                 timing_entries.append(("Load RTSTRUCT", perf_counter() - stage_start))
@@ -832,7 +839,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.dose = load_combined_rtdose(rtdose_paths)
                 timing_entries.append(("Load/merge RTDOSE", perf_counter() - stage_start))
 
-                self.show_progress_status("Resampling dose")
+                self.show_progress_status("Resampling dose", pump_events=True)
                 stage_start = perf_counter()
                 self.sampled_dose_volume_ct = np.stack(
                     [sample_dose_to_ct_slice(self.ct, self.dose, k) for k in range(self.ct.volume_hu.shape[0])],
@@ -876,7 +883,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
             if not cache_loaded:
                 if self.rtstruct is not None and self.ct is not None:
-                    self.show_progress_status("Computing metrics")
+                    self.show_progress_status("Computing metrics", pump_events=True)
                     self.update_structure_list_goal_texts()
                 timing_entries.append(("Compute DVH (background)" if dvh_can_start else "Compute DVH", None))
             timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
@@ -898,6 +905,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         for label, duration_s in self.latest_timing_entries
                     ]
                     report_path = self.write_latest_timing_report()
+            if cache_loaded or not dvh_started:
+                self.clear_progress_status()
 
             if self.constraint_workbook_error:
                 self.statusBar().showMessage(
@@ -918,6 +927,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 error_message=str(e),
             )
             QtWidgets.QMessageBox.critical(self, "Patient load failed", str(e))
+        finally:
+            self.set_heavy_view_updates_enabled(True)
 
     def on_reset_view(self):
         if not self.apply_image_based_view_ranges():
@@ -2157,15 +2168,38 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
         self.statusBar().showMessage(f"Saved DVH cache to {cache_path.name}", 4000)
 
-    def show_progress_status(self, message: str) -> None:
-        self.statusBar().showMessage(message)
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+    def set_heavy_view_updates_enabled(self, enabled: bool) -> None:
+        for widget in (
+            getattr(self, "axial_graphics_widget", None),
+            getattr(self, "sagittal_graphics_widget", None),
+            getattr(self, "coronal_graphics_widget", None),
+            getattr(self, "dvh_plot", None),
+        ):
+            if widget is not None:
+                widget.setUpdatesEnabled(enabled)
+
+    def show_progress_status(self, message: str, *, pump_events: bool = False) -> None:
+        self.progress_status_label.setText(message)
+        self.statusBar().layout().activate()
+        self.progress_status_label.updateGeometry()
+        self.statusBar().updateGeometry()
+        self.progress_status_label.repaint()
+        self.statusBar().repaint()
+        QtCore.QCoreApplication.sendPostedEvents(self.progress_status_label, int(QtCore.QEvent.Type.Paint))
+        QtCore.QCoreApplication.sendPostedEvents(self.statusBar(), int(QtCore.QEvent.Type.Paint))
+        if pump_events:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
 
     def clear_progress_status(self, expected_message: Optional[str] = None) -> None:
-        if expected_message is None or self.statusBar().currentMessage() == expected_message:
-            self.statusBar().clearMessage()
+        if expected_message is None or self.progress_status_label.text() == expected_message:
+            self.progress_status_label.clear()
+            self.statusBar().layout().activate()
+            self.progress_status_label.repaint()
+            self.statusBar().repaint()
+            QtCore.QCoreApplication.sendPostedEvents(self.progress_status_label, int(QtCore.QEvent.Type.Paint))
+            QtCore.QCoreApplication.sendPostedEvents(self.statusBar(), int(QtCore.QEvent.Type.Paint))
 
     def write_latest_timing_report(self, error_message: Optional[str] = None) -> Optional[Path]:
         if not self.latest_timing_entries or self.latest_timing_folder is None:
