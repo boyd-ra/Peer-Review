@@ -1192,7 +1192,7 @@ def compute_isodose_volume_within_structure_margin_cc(
                 linear_interpolation=options.use_linear_dose_interpolation,
                 dose_context=dose_context,
             ).reshape(row_coords_rc.shape)
-        isodose_mask = dose_stack >= float(threshold_gy)
+        binary_isodose_mask = dose_stack >= float(threshold_gy)
 
         try:
             from scipy.ndimage import binary_fill_holes, distance_transform_edt  # type: ignore
@@ -1201,11 +1201,36 @@ def compute_isodose_volume_within_structure_margin_cc(
             distance_transform_edt = None
 
         if binary_fill_holes is not None:
-            isodose_mask = np.asarray(binary_fill_holes(isodose_mask), dtype=bool)
+            filled_isodose_mask = np.asarray(binary_fill_holes(binary_isodose_mask), dtype=bool)
         else:
-            for z_index in range(isodose_mask.shape[0]):
-                if np.any(isodose_mask[z_index]):
-                    isodose_mask[z_index] = fill_binary_holes_2d(isodose_mask[z_index])
+            filled_isodose_mask = np.asarray(binary_isodose_mask, dtype=bool)
+            for z_index in range(filled_isodose_mask.shape[0]):
+                if np.any(filled_isodose_mask[z_index]):
+                    filled_isodose_mask[z_index] = fill_binary_holes_2d(filled_isodose_mask[z_index])
+
+        gradient_z, gradient_row, gradient_col = np.gradient(
+            dose_stack.astype(np.float32, copy=False),
+            z_step_mm,
+            row_spacing_mm,
+            col_spacing_mm,
+            edge_order=1,
+        )
+        gradient_magnitude = np.sqrt(
+            gradient_z * gradient_z
+            + gradient_row * gradient_row
+            + gradient_col * gradient_col
+        )
+        voxel_diagonal_mm = float(np.sqrt(z_step_mm * z_step_mm + row_spacing_mm * row_spacing_mm + col_spacing_mm * col_spacing_mm))
+        signed_distance_mm = (dose_stack - float(threshold_gy)) / np.maximum(gradient_magnitude, 1e-3)
+        fractional_isodose = np.clip(
+            0.5 + signed_distance_mm / max(voxel_diagonal_mm, 1e-6),
+            0.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        fractional_isodose = np.maximum(
+            fractional_isodose,
+            filled_isodose_mask.astype(np.float32, copy=False),
+        )
 
         if distance_transform_edt is not None:
             proximity_mask = distance_transform_edt(
@@ -1225,9 +1250,9 @@ def compute_isodose_volume_within_structure_margin_cc(
                     max(0, col_index - col_radius): min(ptv_mask.shape[2], col_index + col_radius + 1),
                 ] = True
 
-        limited_isodose_mask = isodose_mask & proximity_mask
+        limited_fractional_isodose = fractional_isodose * proximity_mask.astype(np.float32, copy=False)
         return (
-            float(np.count_nonzero(limited_isodose_mask))
+            float(np.sum(limited_fractional_isodose))
             * cell_area_mm2
             * z_step_mm
             / 1000.0

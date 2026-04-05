@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 from peer_helpers import (
     build_structure_slice_mask,
     build_outline_series,
+    compute_isodose_volume_within_structure_margin_cc,
     compute_image_view_bounds,
     compute_single_structure_high_accuracy_curve,
     dose_at_volume_cc,
@@ -3660,6 +3661,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "target_weight": target_weight,
             "dose_block": dose_block,
             "voxel_volume_cc": voxel_volume_cc,
+            "relevant_ptv_count": len(relevant_ptv_entries),
             "z_start": z_start,
             "z_end": z_end,
             "row_start": row_start,
@@ -3757,7 +3759,18 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         if ci_context is None or gi_context is None:
             return "", "", "", "", ""
-        ci_isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(ci_context, threshold_gy)
+        dose_volume = self.get_target_dose_volume(source_key)
+        if dose_volume is not None and int(ci_context.get("relevant_ptv_count", 1)) <= 1:
+            ci_isodose_volume_cc = compute_isodose_volume_within_structure_margin_cc(
+                self.ct,
+                dose_volume,
+                structure,
+                threshold_gy,
+                proximity_mm=5.0,
+                structure_mask_cache=self.get_target_structure_slice_masks(structure),
+            )
+        else:
+            ci_isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(ci_context, threshold_gy)
         gi_reference_volume_cc = self.compute_partitioned_stereotactic_volume_cc(gi_context, threshold_gy)
         gradient_isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(gi_context, threshold_gy * 0.5)
         ci_value = ci_isodose_volume_cc / ptv_volume_cc
