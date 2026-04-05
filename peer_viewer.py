@@ -149,7 +149,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.phase_dose_plane_cache: Dict[Tuple[str, int], np.ndarray] = {}
         self.target_curve_cache: Dict[Tuple[str, str], Optional[DVHCurve]] = {}
         self.target_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
-        self.stereotactic_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
+        self.stereotactic_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float, float]] = {}
         self.max_tissue_dose_gy_cache: Optional[float] = None
         self.max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
@@ -3409,27 +3409,257 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return None
         return threshold_gy if threshold_gy > 0.0 else None
 
+    def get_local_target_dose_block(
+        self,
+        source_key: str,
+        z_start: int,
+        z_end: int,
+        row_start: int,
+        row_end: int,
+        col_start: int,
+        col_end: int,
+    ) -> Optional[np.ndarray]:
+        if self.ct is None:
+            return None
+
+        if source_key == "combined":
+            if self.sampled_dose_volume_ct is None:
+                return None
+            return np.asarray(
+                self.sampled_dose_volume_ct[
+                    z_start: z_end + 1,
+                    row_start: row_end + 1,
+                    col_start: col_end + 1,
+                ],
+                dtype=np.float32,
+            )
+
+        dose_planes: List[np.ndarray] = []
+        for slice_index in range(z_start, z_end + 1):
+            dose_plane = self.get_phase_dose_plane(source_key, slice_index)
+            if dose_plane is None:
+                return None
+            dose_planes.append(
+                np.asarray(
+                    dose_plane[row_start: row_end + 1, col_start: col_end + 1],
+                    dtype=np.float32,
+                )
+            )
+        if not dose_planes:
+            return None
+        return np.stack(dose_planes, axis=0)
+
+    def compute_gradient_index_value(
+        self,
+        structure: StructureSliceContours,
+        threshold_gy: float,
+        source_key: str,
+        ptv_volume_cc: float,
+    ) -> Optional[float]:
+        if self.ct is None or self.rtstruct is None or threshold_gy <= 0.0 or ptv_volume_cc <= 0.0:
+            return None
+
+        try:
+            from scipy.ndimage import distance_transform_edt  # type: ignore
+        except Exception:  # pragma: no cover - optional runtime dependency
+            return None
+
+        normalized_name = normalize_structure_name(structure.name)
+        target_masks = self.get_target_structure_slice_masks(structure)
+        if not target_masks:
+            return None
+
+        sx = float(self.ct.spacing_xyz_mm[0])
+        sy = float(self.ct.spacing_xyz_mm[1])
+        sz = float(self.ct.spacing_xyz_mm[2])
+        voxel_volume_cc = sx * sy * sz / 1000.0
+        margin_mm = 20.0
+        threshold_half_gy = float(threshold_gy) * 0.5
+        if threshold_half_gy <= 0.0:
+            return None
+
+        def expanded_bbox_from_masks(mask_map: Dict[int, np.ndarray]) -> Optional[Tuple[int, int, int, int, int, int]]:
+            if not mask_map:
+                return None
+            slice_indices = sorted(mask_map)
+            row_min: Optional[int] = None
+            row_max: Optional[int] = None
+            col_min: Optional[int] = None
+            col_max: Optional[int] = None
+            for slice_index, mask in mask_map.items():
+                coords = np.argwhere(mask)
+                if coords.size == 0:
+                    continue
+                local_row_min = int(np.min(coords[:, 0]))
+                local_row_max = int(np.max(coords[:, 0]))
+                local_col_min = int(np.min(coords[:, 1]))
+                local_col_max = int(np.max(coords[:, 1]))
+                row_min = local_row_min if row_min is None else min(row_min, local_row_min)
+                row_max = local_row_max if row_max is None else max(row_max, local_row_max)
+                col_min = local_col_min if col_min is None else min(col_min, local_col_min)
+                col_max = local_col_max if col_max is None else max(col_max, local_col_max)
+            if row_min is None or row_max is None or col_min is None or col_max is None:
+                return None
+            margin_rows = int(np.ceil(margin_mm / max(sy, 1e-6)))
+            margin_cols = int(np.ceil(margin_mm / max(sx, 1e-6)))
+            margin_slices = int(np.ceil(margin_mm / max(sz, 1e-6)))
+            z_start = max(0, slice_indices[0] - margin_slices)
+            z_end = min(self.ct.volume_hu.shape[0] - 1, slice_indices[-1] + margin_slices)
+            return (
+                z_start,
+                z_end,
+                max(0, row_min - margin_rows),
+                min(self.ct.rows - 1, row_max + margin_rows),
+                max(0, col_min - margin_cols),
+                min(self.ct.cols - 1, col_max + margin_cols),
+            )
+
+        target_bbox = expanded_bbox_from_masks(target_masks)
+        if target_bbox is None:
+            return None
+
+        def boxes_intersect(
+            box_a: Tuple[int, int, int, int, int, int],
+            box_b: Tuple[int, int, int, int, int, int],
+        ) -> bool:
+            return not (
+                box_a[1] < box_b[0]
+                or box_b[1] < box_a[0]
+                or box_a[3] < box_b[2]
+                or box_b[3] < box_a[2]
+                or box_a[5] < box_b[4]
+                or box_b[5] < box_a[4]
+            )
+
+        relevant_ptv_entries: List[Tuple[str, Dict[int, np.ndarray], Tuple[int, int, int, int, int, int]]] = []
+        for ptv_structure in self.get_sorted_ptv_structures():
+            ptv_normalized_name = normalize_structure_name(ptv_structure.name)
+            ptv_masks = self.get_target_structure_slice_masks(ptv_structure)
+            ptv_bbox = expanded_bbox_from_masks(ptv_masks)
+            if ptv_bbox is None:
+                continue
+            if not boxes_intersect(target_bbox, ptv_bbox):
+                continue
+            relevant_ptv_entries.append((ptv_normalized_name, ptv_masks, ptv_bbox))
+
+        if not relevant_ptv_entries:
+            return None
+
+        z_start = min(entry[2][0] for entry in relevant_ptv_entries)
+        z_end = max(entry[2][1] for entry in relevant_ptv_entries)
+        row_start = min(entry[2][2] for entry in relevant_ptv_entries)
+        row_end = max(entry[2][3] for entry in relevant_ptv_entries)
+        col_start = min(entry[2][4] for entry in relevant_ptv_entries)
+        col_end = max(entry[2][5] for entry in relevant_ptv_entries)
+
+        local_shape = (
+            z_end - z_start + 1,
+            row_end - row_start + 1,
+            col_end - col_start + 1,
+        )
+        local_ptv_masks: List[np.ndarray] = []
+        target_index: Optional[int] = None
+        for index, (ptv_normalized_name, ptv_masks, _ptv_bbox) in enumerate(relevant_ptv_entries):
+            local_mask = np.zeros(local_shape, dtype=bool)
+            for slice_index, slice_mask in ptv_masks.items():
+                if slice_index < z_start or slice_index > z_end:
+                    continue
+                local_z = slice_index - z_start
+                local_mask[local_z] = slice_mask[row_start: row_end + 1, col_start: col_end + 1]
+            local_ptv_masks.append(local_mask)
+            if ptv_normalized_name == normalized_name:
+                target_index = index
+
+        if target_index is None:
+            return None
+
+        dose_block = self.get_local_target_dose_block(
+            source_key,
+            z_start,
+            z_end,
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+        )
+        if dose_block is None or dose_block.shape != local_shape:
+            return None
+
+        sampling = (sz, sy, sx)
+        outside_distance_maps: List[np.ndarray] = []
+        surface_distance_maps: List[np.ndarray] = []
+        for local_mask in local_ptv_masks:
+            outside_distance = distance_transform_edt(~local_mask, sampling=sampling).astype(np.float32, copy=False)
+            inside_distance = distance_transform_edt(local_mask, sampling=sampling).astype(np.float32, copy=False)
+            surface_distance = np.where(local_mask, inside_distance, outside_distance).astype(np.float32, copy=False)
+            outside_distance_maps.append(outside_distance)
+            surface_distance_maps.append(surface_distance)
+
+        target_outside_distance = outside_distance_maps[target_index]
+        target_expanded_mask = target_outside_distance <= margin_mm
+        if not np.any(target_expanded_mask):
+            return None
+
+        eligible_distance_stack = np.stack(
+            [
+                np.where(outside_distance <= margin_mm, surface_distance, np.inf)
+                for outside_distance, surface_distance in zip(outside_distance_maps, surface_distance_maps)
+            ],
+            axis=0,
+        )
+        min_distance = np.min(eligible_distance_stack, axis=0)
+        finite_mask = np.isfinite(min_distance) & target_expanded_mask
+        if not np.any(finite_mask):
+            return None
+
+        tie_mask = np.isclose(
+            eligible_distance_stack,
+            min_distance[None, ...],
+            atol=1e-6,
+        ) & np.isfinite(eligible_distance_stack)
+        tie_count = np.sum(tie_mask, axis=0)
+        target_weight = np.where(
+            finite_mask & tie_mask[target_index],
+            1.0 / np.maximum(tie_count, 1),
+            0.0,
+        ).astype(np.float32, copy=False)
+
+        isodose_mask = np.asarray(dose_block >= threshold_half_gy, dtype=bool)
+        for z_index in range(isodose_mask.shape[0]):
+            if np.any(isodose_mask[z_index]):
+                isodose_mask[z_index] = fill_binary_holes_2d(isodose_mask[z_index])
+
+        gradient_volume_cc = float(np.sum(target_weight[isodose_mask]) * voxel_volume_cc)
+        if gradient_volume_cc <= 0.0:
+            return 0.0
+        return gradient_volume_cc / ptv_volume_cc
+
     def compute_stereotactic_indices(
         self,
         structure: StructureSliceContours,
         threshold_gy: float,
         coverage_pct: float,
         source_key: str,
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[str, str, str, str]:
         if self.ct is None:
-            return "", "", ""
+            return "", "", "", ""
 
         normalized_name = normalize_structure_name(structure.name)
         cache_key = (normalized_name, source_key, round(float(threshold_gy), 3))
         cached = self.stereotactic_metrics_cache.get(cache_key)
         if cached is not None:
-            volume_cc, ci_value, pci_value = cached
-            return f"Vol {volume_cc:.3f} cc", f"CI {ci_value:.3f}", f"PCI {pci_value:.3f}"
+            volume_cc, ci_value, pci_value, gi_value = cached
+            return (
+                f"Vol {volume_cc:.3f} cc",
+                f"CI {ci_value:.3f}",
+                f"PCI {pci_value:.3f}",
+                f"GI {gi_value:.3f}",
+            )
 
         curve = self.get_target_high_accuracy_curve(structure, source_key)
         dose_volume = self.get_target_dose_volume(source_key)
         if curve is None or dose_volume is None or curve.volume_cc <= 0.0:
-            return "", "", ""
+            return "", "", "", ""
         isodose_volume_cc = compute_isodose_volume_within_structure_margin_cc(
             self.ct,
             dose_volume,
@@ -3442,8 +3672,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         ci_value = isodose_volume_cc / ptv_volume_cc
         coverage_decimal = float(np.clip(coverage_pct / 100.0, 0.0, 1.0))
         pci_value = float((coverage_decimal ** 2) / ci_value) if ci_value > 0.0 else 0.0
-        self.stereotactic_metrics_cache[cache_key] = (ptv_volume_cc, ci_value, pci_value)
-        return f"Vol {ptv_volume_cc:.3f} cc", f"CI {ci_value:.3f}", f"PCI {pci_value:.3f}"
+        gi_value = self.compute_gradient_index_value(
+            structure,
+            threshold_gy,
+            source_key,
+            ptv_volume_cc,
+        )
+        gi_value = float(gi_value) if gi_value is not None else 0.0
+        self.stereotactic_metrics_cache[cache_key] = (ptv_volume_cc, ci_value, pci_value, gi_value)
+        return (
+            f"Vol {ptv_volume_cc:.3f} cc",
+            f"CI {ci_value:.3f}",
+            f"PCI {pci_value:.3f}",
+            f"GI {gi_value:.3f}",
+        )
 
     def get_primary_target_context(
         self,
@@ -3630,9 +3872,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 stereotactic_volume_text = ""
                 stereotactic_ci_text = ""
                 stereotactic_pci_text = ""
+                stereotactic_gi_text = ""
                 stereotactic_hi_text = ""
                 if coverage_pct is not None and rx_reference_gy > 0.0:
-                    stereotactic_volume_text, stereotactic_ci_text, stereotactic_pci_text = self.compute_stereotactic_indices(
+                    (
+                        stereotactic_volume_text,
+                        stereotactic_ci_text,
+                        stereotactic_pci_text,
+                        stereotactic_gi_text,
+                    ) = self.compute_stereotactic_indices(
                         structure,
                         rx_reference_gy,
                         coverage_pct,
@@ -3646,6 +3894,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         stereotactic_volume_text,
                         stereotactic_ci_text,
                         stereotactic_pci_text,
+                        stereotactic_gi_text,
                         stereotactic_hi_text,
                     )
                     if text
