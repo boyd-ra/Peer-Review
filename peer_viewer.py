@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import html
 import inspect
 import json
 import logging
 import math
 import re
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -15,7 +17,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6 import QtCore, QtGui, QtWidgets
+from pyqtgraph.exporters import ImageExporter
+from PySide6 import QtCore, QtGui, QtPrintSupport, QtWidgets
 try:
     from scipy.ndimage import binary_dilation
 except Exception:  # pragma: no cover - optional runtime dependency
@@ -612,7 +615,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.reset_view_action = QtGui.QAction("Reset View", self)
         self.clear_patient_action = QtGui.QAction("Clear", self)
         self.save_cache_action = QtGui.QAction("Save", self)
+        self.print_report_action = QtGui.QAction("Print", self)
         self.save_cache_action.setEnabled(False)
+        self.print_report_action.setEnabled(False)
 
     def _create_toolbar(self):
         tb = self.addToolBar("Main")
@@ -621,12 +626,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         tb.addAction(self.reset_view_action)
         tb.addAction(self.clear_patient_action)
         tb.addAction(self.save_cache_action)
+        tb.addAction(self.print_report_action)
 
     def _connect_signals(self):
         self.load_patient_action.triggered.connect(self.on_load_patient_folder)
         self.reset_view_action.triggered.connect(self.on_reset_view)
         self.clear_patient_action.triggered.connect(self.on_clear_patient_session)
         self.save_cache_action.triggered.connect(self.on_save_dvh_cache)
+        self.print_report_action.triggered.connect(self.on_print_report)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
         self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
         self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
@@ -1297,6 +1304,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def update_dvh_cache_button(self):
         self.save_cache_action.setEnabled(
             self.current_patient_folder is not None and bool(self.dvh_curves)
+        )
+        self.print_report_action.setEnabled(
+            self.current_patient_folder is not None and self.rtstruct is not None
         )
         self.add_constraint_button.setEnabled(self.rtstruct is not None)
 
@@ -2225,6 +2235,371 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
             return
         self.statusBar().showMessage(f"Saved DVH cache to {cache_path.name}", 4000)
+
+    def get_default_report_path(self) -> Path:
+        base_dir = Path(self.current_patient_folder) if self.current_patient_folder else Path.home()
+        patient_name = ""
+        if self.patient_plan_lines:
+            patient_name = str(self.patient_plan_lines[0]).strip()
+        cleaned_name = re.sub(r"[^A-Za-z0-9._-]+", "_", patient_name).strip("._")
+        stem = f"{cleaned_name}_peer_review_report" if cleaned_name else "peer_review_report"
+        return base_dir / f"{stem}.pdf"
+
+    def build_constraints_report_rows(self) -> List[Dict[str, object]]:
+        if self.rtstruct is None:
+            return []
+
+        rows: List[Dict[str, object]] = []
+        for structure in self.rtstruct.structures:
+            normalized_name = normalize_structure_name(structure.name)
+            goals = self.structure_goals_by_name.get(normalized_name, [])
+            evaluations = self.structure_goal_evaluations.get(normalized_name, [])
+            if not goals:
+                continue
+
+            for goal_index, goal in enumerate(goals):
+                evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
+                note_key = self.get_constraint_note_key(normalized_name, goal)
+                note_text = self.compose_constraint_note_text(
+                    self.get_computed_constraint_note_text(normalized_name, goals, goal_index),
+                    self.constraint_notes.get(note_key, ""),
+                )
+                rows.append(
+                    {
+                        "structure": structure.name if goal_index == 0 else "",
+                        "metric": goal.metric,
+                        "goal": f"{goal.comparator.strip()} {goal.value_text.strip()}".strip(),
+                        "result": evaluation.actual_text if evaluation is not None else "",
+                        "notes": note_text,
+                        "result_class": (
+                            "result-pass"
+                            if evaluation is not None and evaluation.passed is True
+                            else "result-fail"
+                            if evaluation is not None and evaluation.passed is False
+                            else ""
+                        ),
+                    }
+                )
+        return rows
+
+    def build_targets_report_rows(self) -> List[Dict[str, object]]:
+        if self.rtstruct is None or self.ct is None:
+            return []
+
+        rows: List[Dict[str, object]] = []
+        for row in self.get_target_table_rows():
+            note_key = self.get_target_note_key_for_row(row)
+            rows.append(
+                {
+                    "ptv": str(row.get("display_name", row.get("structure_name", ""))),
+                    "coverage": str(row.get("coverage_text", "")),
+                    "minimum_dose": str(row.get("minimum_dose_text", "")),
+                    "maximum_dose": str(row.get("maximum_dose_text", "")),
+                    "notes": self.compose_target_note_text(
+                        str(row.get("notes_text", "")),
+                        self.target_notes.get(note_key, ""),
+                    ),
+                    "is_primary_ptv": bool(row.get("is_primary_ptv", False)),
+                }
+            )
+        return rows
+
+    def _report_html_text(self, text: object) -> str:
+        return html.escape(str(text or "")).replace("\n", "<br>")
+
+    def _build_report_table_html(
+        self,
+        headers: List[Tuple[str, str]],
+        rows: List[Dict[str, object]],
+        *,
+        column_widths: Optional[List[str]] = None,
+        cell_class_keys: Optional[Dict[str, str]] = None,
+    ) -> str:
+        if not rows:
+            return '<p class="empty-note">No data available.</p>'
+
+        parts = [
+            '<table width="100%" cellspacing="0" cellpadding="0" '
+            'style="width:100%; border-collapse:collapse; margin:0 0 10pt 0; table-layout:fixed;">'
+        ]
+        parts.append("<thead><tr>")
+        for index, (_key, label) in enumerate(headers):
+            width_attr = ""
+            if column_widths and index < len(column_widths):
+                width_attr = f' width="{html.escape(column_widths[index])}"'
+            parts.append(
+                f'<th{width_attr} style="text-align:left; background-color:#e6e6e6; '
+                'border:1px solid #cfcfcf; padding:5pt 6pt;">'
+                f"{self._report_html_text(label)}</th>"
+            )
+        parts.append("</tr></thead><tbody>")
+
+        for row_index, row in enumerate(rows):
+            row_background = "#ffffff" if row_index % 2 == 0 else "#f7f7f7"
+            parts.append("<tr>")
+            for col_index, (key, _label) in enumerate(headers):
+                cell_text = self._report_html_text(row.get(key, ""))
+                cell_styles = [
+                    f"background-color:{row_background}",
+                    "border:1px solid #d9d9d9",
+                    "padding:4pt 6pt",
+                    "vertical-align:top",
+                ]
+                if key == "ptv" and not bool(row.get("is_primary_ptv", False)):
+                    cell_styles.append("padding-left:18pt")
+                if key == "ptv" and bool(row.get("is_primary_ptv", False)):
+                    cell_styles.append("font-weight:700")
+                if cell_class_keys and key in cell_class_keys:
+                    class_name = str(row.get(cell_class_keys[key], "")).strip()
+                    if class_name == "result-pass":
+                        cell_styles[0] = "background-color:#e5f5e8"
+                        cell_styles.append("font-weight:600")
+                    elif class_name == "result-fail":
+                        cell_styles[0] = "background-color:#fde7e7"
+                        cell_styles.append("font-weight:600")
+                width_attr = ""
+                if column_widths and col_index < len(column_widths):
+                    width_attr = f' width="{html.escape(column_widths[col_index])}"'
+                parts.append(
+                    f'<td{width_attr} style="{"; ".join(cell_styles)}">{cell_text or "&nbsp;"}</td>'
+                )
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        return "".join(parts)
+
+    def build_dvh_legend_html(self) -> str:
+        curves = self.get_visible_dvh_curves() if self.dvh_plot_items else list(self.dvh_curves)
+        if not curves:
+            return ""
+
+        parts = [
+            '<table width="100%" cellspacing="0" cellpadding="0" '
+            'style="width:100%; border-collapse:collapse; margin-top:8pt;">'
+        ]
+        column_count = 3
+        row_count = int(math.ceil(len(curves) / float(column_count)))
+        for row_index in range(row_count):
+            parts.append("<tr>")
+            for column_index in range(column_count):
+                curve_index = row_index + column_index * row_count
+                if curve_index >= len(curves):
+                    parts.append('<td width="33%" style="padding:2pt 10pt 2pt 0;">&nbsp;</td>')
+                    continue
+                curve = curves[curve_index]
+                r, g, b = (int(value) for value in curve.color_rgb)
+                swatch = (
+                    f'<span style="color: rgb({r}, {g}, {b}); font-size: 14pt; font-weight: 700;">'
+                    "&#9472;&#9472;&#9472;&#9472;"
+                    "</span>"
+                )
+                parts.append(
+                    f'<td width="33%" style="padding:2pt 10pt 2pt 0; vertical-align:middle;">'
+                    f'{swatch}<span style="padding-left:6pt;">{self._report_html_text(curve.name)}</span></td>'
+                )
+            parts.append("</tr>")
+        parts.append("</table>")
+        return "".join(parts)
+
+    def export_dvh_report_image(self) -> Optional[Path]:
+        if not self.dvh_curves:
+            return None
+
+        temp_file = tempfile.NamedTemporaryFile(prefix="peer_dvh_report_", suffix=".png", delete=False)
+        temp_path = Path(temp_file.name)
+        temp_file.close()
+
+        exporter = ImageExporter(self.dvh_plot.plotItem)
+        try:
+            params = exporter.parameters()
+            if "width" in params:
+                params["width"] = max(int(self.dvh_plot.width() * 2), 1400)
+            if "height" in params:
+                params["height"] = max(int(self.dvh_plot.height() * 2), 900)
+        except Exception:
+            pass
+
+        marker_visible = self.dvh_curve_marker.isVisible()
+        vline_visible = self.dvh_crosshair_vline.isVisible()
+        hline_visible = self.dvh_crosshair_hline.isVisible()
+        self.dvh_curve_marker.setVisible(False)
+        self.dvh_crosshair_vline.setVisible(False)
+        self.dvh_crosshair_hline.setVisible(False)
+        try:
+            image = exporter.export(toBytes=True)
+            if image is None or image.isNull():
+                return None
+            image.save(str(temp_path))
+            return temp_path
+        finally:
+            self.dvh_curve_marker.setVisible(marker_visible)
+            self.dvh_crosshair_vline.setVisible(vline_visible)
+            self.dvh_crosshair_hline.setVisible(hline_visible)
+
+    def build_report_html(self, dvh_image_path: Optional[Path]) -> str:
+        patient_lines = list(self.patient_plan_lines or ())
+        patient_name = patient_lines[0] if patient_lines else "Patient name unavailable"
+        patient_id = patient_lines[1] if len(patient_lines) > 1 else "ID unavailable"
+        prescription = patient_lines[2] if len(patient_lines) > 2 else "Prescription unavailable"
+        extra_header_lines = patient_lines[3:]
+        generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        constraints_html = self._build_report_table_html(
+            [
+                ("structure", "OAR"),
+                ("metric", "Metric"),
+                ("goal", "Goal"),
+                ("result", "Result"),
+                ("notes", "Notes"),
+            ],
+            self.build_constraints_report_rows(),
+            column_widths=["18%", "14%", "14%", "14%", "40%"],
+            cell_class_keys={"result": "result_class"},
+        )
+        targets_html = self._build_report_table_html(
+            [
+                ("ptv", "PTV"),
+                ("coverage", "Coverage @ Rx"),
+                ("minimum_dose", "Min Dose"),
+                ("maximum_dose", "Max Dose"),
+                ("notes", "Notes"),
+            ],
+            self.build_targets_report_rows(),
+            column_widths=["18%", "18%", "8%", "8%", "48%"],
+        )
+        extra_lines_html = "".join(
+            f"<div>{self._report_html_text(line)}</div>" for line in extra_header_lines if str(line).strip()
+        )
+        constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
+        dvh_legend_html = self.build_dvh_legend_html()
+        if dvh_image_path is not None:
+            dvh_section_html = (
+                '<div class="page-break"></div><h2>DVH</h2>'
+                f'<img class="dvh-image" src="{QtCore.QUrl.fromLocalFile(str(dvh_image_path)).toString()}" />'
+                f"{dvh_legend_html}"
+            )
+        else:
+            dvh_section_html = (
+                '<div class="page-break"></div><h2>DVH</h2>'
+                '<p class="empty-note">No DVH curves are available for this report.</p>'
+            )
+
+        return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body {{
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-size: 9pt;
+  color: #111;
+  margin: 0;
+  padding: 0;
+}}
+h1 {{
+  font-size: 18pt;
+  margin: 0 0 8pt 0;
+}}
+h2 {{
+  font-size: 13pt;
+  margin: 14pt 0 6pt 0;
+}}
+.report-meta {{
+  margin-bottom: 8pt;
+  line-height: 1.35;
+  width: 100%;
+}}
+.patient-name {{
+  font-size: 14pt;
+  font-weight: 700;
+}}
+.constraint-set {{
+  margin-top: 4pt;
+}}
+.empty-note {{
+  color: #555;
+  font-style: italic;
+}}
+.page-break {{
+  page-break-before: always;
+}}
+.dvh-image {{
+  width: 100%;
+  max-width: 100%;
+}}
+</style>
+</head>
+<body>
+  <h1>Peer Review Report</h1>
+  <div class="report-meta">
+    <div class="patient-name">{self._report_html_text(patient_name)}</div>
+    <div>{self._report_html_text(patient_id)}</div>
+    <div>{self._report_html_text(prescription)}</div>
+    {extra_lines_html}
+    <div class="constraint-set"><strong>Constraint set:</strong> {self._report_html_text(constraint_set)}</div>
+    <div><strong>Generated:</strong> {self._report_html_text(generated_at)}</div>
+  </div>
+
+  <h2>Constraints</h2>
+  {constraints_html}
+
+  <h2>Target Metrics</h2>
+  {targets_html}
+
+  {dvh_section_html}
+</body>
+</html>
+"""
+
+    def on_print_report(self):
+        if self.current_patient_folder is None or self.rtstruct is None:
+            QtWidgets.QMessageBox.information(self, "No patient folder", "Load a patient folder before printing a report.")
+            return
+
+        default_path = self.get_default_report_path()
+        selected_path, _selected_filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save PDF Report",
+            str(default_path),
+            "PDF Files (*.pdf)",
+        )
+        if not selected_path:
+            return
+
+        output_path = Path(selected_path)
+        if output_path.suffix.lower() != ".pdf":
+            output_path = output_path.with_suffix(".pdf")
+
+        self.show_progress_status("Generating PDF report", pump_events=True)
+        dvh_image_path: Optional[Path] = None
+        try:
+            dvh_image_path = self.export_dvh_report_image()
+            document = QtGui.QTextDocument(self)
+            document.setDocumentMargin(0.0)
+            document.setHtml(self.build_report_html(dvh_image_path))
+
+            printer = QtPrintSupport.QPrinter(QtPrintSupport.QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QtPrintSupport.QPrinter.OutputFormat.PdfFormat)
+            printer.setOutputFileName(str(output_path))
+            printer.setPageSize(QtGui.QPageSize(QtGui.QPageSize.PageSizeId.Letter))
+            printer.setPageMargins(
+                QtCore.QMarginsF(8.0, 8.0, 8.0, 8.0),
+                QtGui.QPageLayout.Unit.Millimeter,
+            )
+            document.setPageSize(printer.pageRect(QtPrintSupport.QPrinter.Unit.Point).size())
+            document.print_(printer)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Print failed", str(exc))
+            return
+        finally:
+            self.clear_progress_status("Generating PDF report")
+            if dvh_image_path is not None:
+                try:
+                    dvh_image_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        self.statusBar().showMessage(f"Saved PDF report to {output_path.name}", 4000)
 
     def set_heavy_view_updates_enabled(self, enabled: bool) -> None:
         for widget in (
