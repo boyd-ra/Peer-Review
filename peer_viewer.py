@@ -5,6 +5,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import re
 import sys
 from datetime import datetime
@@ -35,6 +36,8 @@ from peer_helpers import (
     line_intersections_at_row,
     normalize_structure_name,
     orthogonal_row_scale,
+    parse_goal_value,
+    parse_v_metric_threshold_gy,
     resample_orthogonal_plane,
     sample_dose_to_ct_slice,
     volume_cc_at_dose_gy,
@@ -4447,7 +4450,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
                 note_key = self.get_constraint_note_key(normalized_name, goal)
                 note_title = f"{structure.name} | {goal.metric} {goal.comparator} {goal.value_text}"
-                note_text = self.constraint_notes.get(note_key, "").strip()
+                computed_note_text = self.get_computed_constraint_note_text(
+                    normalized_name,
+                    goals,
+                    goal_index,
+                )
+                note_text = self.compose_constraint_note_text(
+                    computed_note_text,
+                    self.constraint_notes.get(note_key, ""),
+                )
                 rows.append(
                     (
                         structure.color_rgb,
@@ -4503,6 +4514,68 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         self.constraints_table.resizeColumnsToContents()
         QtCore.QTimer.singleShot(0, self.update_constraints_table_column_widths)
+
+    def compose_constraint_note_text(self, computed_note_text: str, stored_note_text: str) -> str:
+        computed = computed_note_text.strip()
+        stored = stored_note_text.strip()
+        if computed and stored:
+            if stored == computed or stored.startswith(f"{computed}    "):
+                return stored
+            return f"{computed}    {stored}"
+        if computed:
+            return computed
+        return stored
+
+    def prostate_constraint_summary_enabled(self) -> bool:
+        return "PROSTATE" in normalize_structure_name(self.constraints_sheet_name or "")
+
+    def get_min_bladder_volume_note_text(self) -> str:
+        if not self.prostate_constraint_summary_enabled():
+            return ""
+
+        normalized_name = "BLADDER"
+        curve = self.get_curve_for_name(normalized_name)
+        if curve is None or curve.volume_cc <= 0.0:
+            return ""
+
+        goals = self.structure_goals_by_name.get(normalized_name, [])
+        required_volume_cc = 0.0
+        found_percent_volume_constraint = False
+        for goal in goals:
+            metric_key = goal.metric.strip().upper().replace(" ", "")
+            dose_threshold_gy = parse_v_metric_threshold_gy(metric_key)
+            if dose_threshold_gy is None:
+                continue
+            comparator = goal.comparator.strip()
+            if comparator not in {"<", "<=", "=", "=="}:
+                continue
+            goal_value, goal_unit = parse_goal_value(goal.value_text)
+            if goal_value is None:
+                continue
+            actual_volume_cc = float(volume_cc_at_dose_gy(curve, dose_threshold_gy))
+            if goal_unit == "%":
+                goal_fraction = goal_value / 100.0
+                if goal_fraction <= 0.0:
+                    continue
+                required_volume_cc = max(required_volume_cc, actual_volume_cc / goal_fraction)
+                found_percent_volume_constraint = True
+            elif goal_unit == "CC":
+                if actual_volume_cc > goal_value + 1e-6:
+                    return "Min volume n/a"
+
+        if not found_percent_volume_constraint or required_volume_cc <= 0.0:
+            return ""
+        return f"Min volume {int(math.ceil(required_volume_cc - 1e-9))} cc"
+
+    def get_computed_constraint_note_text(
+        self,
+        normalized_name: str,
+        goals: List[StructureGoal],
+        goal_index: int,
+    ) -> str:
+        if normalized_name != "BLADDER" or goal_index != 0 or not goals:
+            return ""
+        return self.get_min_bladder_volume_note_text()
 
     def update_targets_table(self):
         if self.rtstruct is not None and self.ct is not None and self.tabs.currentWidget() is not self.targets_tab:
