@@ -4336,10 +4336,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if self.rtstruct is None or self.ct is None:
             return
 
-        row_backgrounds = [QtGui.QColor(8, 8, 8), QtGui.QColor(34, 34, 34)]
         rows = self.get_target_table_rows()
         self.targets_table.setRowCount(len(rows))
-        section_indices: Dict[str, int] = {}
+        primary_background = QtGui.QColor(8, 8, 8)
+        nested_background = QtGui.QColor(34, 34, 34)
         for row_index, row in enumerate(rows):
             normalized_name = str(row.get("normalized_name", ""))
             parent_normalized_name = row.get("parent_normalized_name")
@@ -4353,20 +4353,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             is_primary_ptv = bool(row.get("is_primary_ptv", False))
             color_rgb = tuple(int(value) for value in row.get("color_rgb", (255, 255, 255)))
 
-            section_key = (
-                normalized_name
-                if is_primary_ptv or not parent_normalized_name
-                else str(parent_normalized_name)
-            )
-            if section_key not in section_indices:
-                section_indices[section_key] = len(section_indices)
-            background_color = row_backgrounds[section_indices[section_key] % len(row_backgrounds)]
+            background_color = primary_background if is_primary_ptv else nested_background
 
+            note_key = self.get_target_note_key_for_row(row)
             if is_primary_ptv:
-                note_key = self.get_target_note_key(normalized_name)
                 note_title = f"{structure_name} target review"
             else:
-                note_key = self.get_target_note_key(normalized_name, parent_normalized_name=section_key)
                 note_title = f"{structure_name} within {parent_structure_name} target review"
             stored_note_text = self.target_notes.get(note_key, "").strip()
             computed_note_text = str(row.get("notes_text", "")).strip()
