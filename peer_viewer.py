@@ -342,16 +342,28 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dose_range_layout.addWidget(self.dose_range_slider, 1)
         dose_range_layout.addWidget(self.dose_max_edit)
 
-        self.autoscroll_button = QtWidgets.QPushButton("Start Auto Scroll")
+        self.autoscroll_button = QtWidgets.QPushButton("Autoscroll")
         self.autoscroll_button.setCheckable(True)
         self.autoscroll_slower_button = QtWidgets.QPushButton("-")
         self.autoscroll_faster_button = QtWidgets.QPushButton("+")
+        self.autoscroll_button.setFixedWidth(88)
+        self.autoscroll_button.setFixedHeight(24)
+        autoscroll_button_style = (
+            "QPushButton { background-color: rgba(120, 120, 120, 235); color: white; "
+            "border: 1px solid rgba(210, 210, 210, 120); border-radius: 4px; "
+            "padding: 1px 6px; font-size: 11px; }"
+            "QPushButton:pressed { background-color: rgba(145, 145, 145, 235); }"
+            "QPushButton:checked { background-color: rgba(165, 165, 165, 235); color: black; }"
+        )
+        self.autoscroll_button.setStyleSheet(autoscroll_button_style)
         for button, tooltip in (
             (self.autoscroll_slower_button, "Slow down auto scroll"),
             (self.autoscroll_faster_button, "Speed up auto scroll"),
         ):
-            button.setFixedWidth(32)
+            button.setFixedWidth(24)
+            button.setFixedHeight(24)
             button.setToolTip(tooltip)
+            button.setStyleSheet(autoscroll_button_style)
 
         self.structures_list = QtWidgets.QListWidget()
         self.structures_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -361,18 +373,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.patient_plan_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
         self.patient_plan_label.setVisible(False)
 
-        autoscroll_controls_widget = QtWidgets.QWidget()
-        autoscroll_controls_layout = QtWidgets.QHBoxLayout(autoscroll_controls_widget)
-        autoscroll_controls_layout.setContentsMargins(0, 0, 0, 0)
-        autoscroll_controls_layout.setSpacing(6)
-        autoscroll_controls_layout.addWidget(self.autoscroll_button, 1)
-        autoscroll_controls_layout.addWidget(self.autoscroll_slower_button)
-        autoscroll_controls_layout.addWidget(self.autoscroll_faster_button)
-
         sidebar_layout.addWidget(self.patient_plan_label)
         sidebar_layout.addSpacing(10)
-        sidebar_layout.addWidget(autoscroll_controls_widget)
-        sidebar_layout.addSpacing(12)
         sidebar_layout.addWidget(QtWidgets.QLabel("Structures"))
         sidebar_layout.addWidget(self.structures_list, 1)
         sidebar_widget.setMinimumWidth(280)
@@ -445,6 +447,23 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         self.axial_readout_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.axial_readout_label.hide()
+        self.axial_autoscroll_overlay = QtWidgets.QWidget(axial_widget)
+        self.axial_autoscroll_overlay.setStyleSheet(
+            "QWidget { background-color: rgba(0, 0, 0, 210); border-radius: 4px; }"
+        )
+        self.axial_autoscroll_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        autoscroll_overlay_layout = QtWidgets.QHBoxLayout(self.axial_autoscroll_overlay)
+        autoscroll_overlay_layout.setContentsMargins(5, 3, 5, 3)
+        autoscroll_overlay_layout.setSpacing(4)
+        autoscroll_overlay_layout.addWidget(self.autoscroll_button)
+        autoscroll_overlay_layout.addWidget(self.autoscroll_slower_button)
+        autoscroll_overlay_layout.addWidget(self.autoscroll_faster_button)
+        self.autoscroll_speed_label = QtWidgets.QLabel("-- mm/s")
+        self.autoscroll_speed_label.setStyleSheet("color: white; font-size: 11px;")
+        self.autoscroll_speed_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        autoscroll_overlay_layout.addWidget(self.autoscroll_speed_label)
 
         right_splitter.addWidget(sagittal_widget)
         right_splitter.addWidget(coronal_widget)
@@ -673,6 +692,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.coronal_max_marker.setData([], [])
         self.crosshair_text.hide()
         self.axial_readout_label.hide()
+        self.update_axial_overlay_positions()
 
     def clear_patient_session_state(self):
         self.cancel_autoscroll()
@@ -744,6 +764,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.tabs.setCurrentIndex(0)
         self.refresh_constraint_sheet_combo(preferred_sheet_name=NO_CONSTRAINTS_SHEET_LABEL)
         self.update_patient_plan_label()
+        self.update_autoscroll_speed_label()
         self.populate_structures_list()
         self.populate_isodose_controls()
         self.render_dvh_plot()
@@ -797,6 +818,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.current_col = self.ct.cols // 2
             self.slice_slider.setRange(0, self.ct.volume_hu.shape[0] - 1)
             self.slice_slider.setValue(self.ct.volume_hu.shape[0] // 2)
+            self.update_autoscroll_speed_label()
 
             self.refresh_constraint_sheet_combo(preferred_sheet_name=None)
             constraints_path = self.structure_filter_csv_path
@@ -993,6 +1015,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             )
         )
         self.autoscroll_timer.setInterval(new_interval)
+        self.update_autoscroll_speed_label()
         if self.autoscroll_button.isChecked():
             self.autoscroll_timer.start()
 
@@ -1100,7 +1123,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.autoscroll_button.setChecked(False)
             del blocker
         self.set_autoscroll_ui_locked(False)
-        self.autoscroll_button.setText("Start Auto Scroll")
+        self.autoscroll_button.setText("Autoscroll")
 
     def reset_autoscroll_ui(self):
         self.finish_autoscroll_ui(clear_checked_state=False)
@@ -2283,6 +2306,30 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_plot.setXRange(0.0, max(max_dose, 1.0), padding=0.02)
         self.dvh_plot.setYRange(0.0, 100.0, padding=0.02)
 
+    def get_autoscroll_speed_mm_per_s(self) -> Optional[float]:
+        if self.ct is None:
+            return None
+        z_positions = np.asarray(self.ct.z_positions_mm, dtype=float)
+        if z_positions.size < 2:
+            return None
+        slice_steps_mm = np.abs(np.diff(z_positions))
+        slice_steps_mm = slice_steps_mm[np.isfinite(slice_steps_mm) & (slice_steps_mm > 0.0)]
+        if slice_steps_mm.size == 0:
+            return None
+        interval_s = max(float(self.autoscroll_timer.interval()), 1.0) / 1000.0
+        return float(np.median(slice_steps_mm)) / interval_s
+
+    def update_autoscroll_speed_label(self) -> None:
+        if not hasattr(self, "autoscroll_speed_label"):
+            return
+        speed_mm_per_s = self.get_autoscroll_speed_mm_per_s()
+        if speed_mm_per_s is None:
+            self.autoscroll_speed_label.setText("-- mm/s")
+        else:
+            self.autoscroll_speed_label.setText(f"{speed_mm_per_s:.1f} mm/s")
+        self.autoscroll_speed_label.adjustSize()
+        self.update_axial_overlay_positions()
+
     def get_cached_ptv_coverage_text(self, normalized_name: str) -> Optional[str]:
         cached_target_rows = self.cached_target_table_rows or []
         for row in cached_target_rows:
@@ -2818,7 +2865,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.autoscroll_direction = 1
             self.set_autoscroll_ui_locked(True)
             self.slice_slider.setValue(start_idx)
-            self.autoscroll_button.setText("Stop Auto Scroll")
             self.autoscroll_timer.start()
         else:
             self.statusBar().clearMessage()
@@ -4490,7 +4536,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         super().resizeEvent(event)
         self.update_constraints_table_column_widths()
         self.update_targets_table_column_widths()
-        self.update_axial_readout_overlay_position()
+        self.update_axial_overlay_positions()
 
     def get_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
         return [
@@ -5112,14 +5158,19 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.window_label.setText(f"WL/WW: {int(wl)} / {int(ww)}")
         self.update_dose_range_controls()
         self.update_max_dose_markers()
-        self.update_axial_readout_overlay_position()
+        self.update_axial_overlay_positions()
 
-    def update_axial_readout_overlay_position(self):
-        if self.ct is None or not hasattr(self, "axial_readout_label"):
+    def update_axial_overlay_positions(self):
+        margin = 10
+        if hasattr(self, "axial_autoscroll_overlay"):
+            self.axial_autoscroll_overlay.adjustSize()
+            self.axial_autoscroll_overlay.move(margin, margin)
+        if not hasattr(self, "axial_readout_label"):
+            return
+        if self.ct is None:
             self.axial_readout_label.hide()
             return
         self.axial_readout_label.adjustSize()
-        margin = 10
         x = max(margin, self.axial_graphics_widget.width() - self.axial_readout_label.width() - margin)
         y = margin
         self.axial_readout_label.move(x, y)
@@ -5143,7 +5194,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             dose_gy = float(self.displayed_dose_plane[r, c])
             msg += f"\nDose {dose_gy:.2f} Gy"
         self.axial_readout_label.setText(msg)
-        self.update_axial_readout_overlay_position()
+        self.update_axial_overlay_positions()
         self.axial_readout_label.show()
 
 
