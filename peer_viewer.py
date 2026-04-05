@@ -167,6 +167,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.targets_table_refresh_pending = False
         self.constraint_editor_state: Optional[Dict[str, str]] = None
         self.constraint_editor_widgets: Dict[str, QtWidgets.QWidget] = {}
+        self.hidden_structure_names: set[str] = set()
+        self.structure_filter_dialog: Optional[QtWidgets.QDialog] = None
+        self.structure_filter_list_widget: Optional[QtWidgets.QListWidget] = None
         self.current_row: int = 0
         self.current_col: int = 0
         self.max_dose_index_zyx: Optional[Tuple[int, int, int]] = None
@@ -616,17 +619,27 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.clear_patient_action = QtGui.QAction("Clear", self)
         self.save_cache_action = QtGui.QAction("Save", self)
         self.print_report_action = QtGui.QAction("Print", self)
+        self.structure_filter_action = QtGui.QAction("Structures", self)
         self.save_cache_action.setEnabled(False)
         self.print_report_action.setEnabled(False)
+        self.structure_filter_action.setEnabled(False)
 
     def _create_toolbar(self):
         tb = self.addToolBar("Main")
+        self.main_toolbar = tb
         tb.addAction(self.load_patient_action)
         tb.addSeparator()
         tb.addAction(self.reset_view_action)
         tb.addAction(self.clear_patient_action)
         tb.addAction(self.save_cache_action)
         tb.addAction(self.print_report_action)
+        spacer = QtWidgets.QWidget(tb)
+        spacer.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
+        tb.addWidget(spacer)
+        tb.addAction(self.structure_filter_action)
 
     def _connect_signals(self):
         self.load_patient_action.triggered.connect(self.on_load_patient_folder)
@@ -634,6 +647,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.clear_patient_action.triggered.connect(self.on_clear_patient_session)
         self.save_cache_action.triggered.connect(self.on_save_dvh_cache)
         self.print_report_action.triggered.connect(self.on_print_report)
+        self.structure_filter_action.triggered.connect(self.on_show_structure_filter_popup)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
         self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
         self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
@@ -763,6 +777,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.targets_table_refresh_pending = False
         self.constraint_editor_state = None
         self.constraint_editor_widgets = {}
+        self.hidden_structure_names = set()
+        if self.structure_filter_list_widget is not None:
+            self.structure_filter_list_widget.clear()
+        if self.structure_filter_dialog is not None:
+            self.structure_filter_dialog.hide()
         self.max_dose_index_zyx = None
         self.current_row = 0
         self.current_col = 0
@@ -986,6 +1005,90 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def on_clear_patient_session(self):
         self.clear_patient_session_state()
+
+    def ensure_structure_filter_dialog(self) -> QtWidgets.QDialog:
+        if self.structure_filter_dialog is not None and self.structure_filter_list_widget is not None:
+            return self.structure_filter_dialog
+
+        dialog = QtWidgets.QDialog(self, QtCore.Qt.WindowType.Popup)
+        dialog.setWindowTitle("Structures")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        hint_label = QtWidgets.QLabel("Check structures to hide them from the Axial and DVH lists.")
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        list_widget = QtWidgets.QListWidget()
+        list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        list_widget.setMinimumWidth(280)
+        list_widget.setMinimumHeight(320)
+        list_widget.itemChanged.connect(self.on_structure_filter_item_changed)
+        layout.addWidget(list_widget)
+
+        self.structure_filter_dialog = dialog
+        self.structure_filter_list_widget = list_widget
+        return dialog
+
+    def populate_structure_filter_dialog(self) -> None:
+        if self.structure_filter_list_widget is None:
+            return
+
+        entries = self.get_filterable_structure_entries()
+        blocker = QtCore.QSignalBlocker(self.structure_filter_list_widget)
+        self.structure_filter_list_widget.clear()
+        for normalized_name, structure_name in entries:
+            item = QtWidgets.QListWidgetItem(structure_name)
+            item.setFlags(
+                item.flags()
+                | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                | QtCore.Qt.ItemFlag.ItemIsEnabled
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, normalized_name)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if normalized_name in self.hidden_structure_names
+                else QtCore.Qt.CheckState.Unchecked
+            )
+            self.structure_filter_list_widget.addItem(item)
+        del blocker
+
+    def apply_hidden_structure_filter(self) -> None:
+        if self.rtstruct is None:
+            return
+        self.populate_structures_list()
+        self.on_structure_visibility_changed()
+        self.on_dvh_structure_visibility_changed()
+        self.update_dvh_cache_button()
+
+    def on_structure_filter_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
+        normalized_name = normalize_structure_name(str(item.data(QtCore.Qt.ItemDataRole.UserRole) or ""))
+        if not normalized_name:
+            return
+        if item.checkState() == QtCore.Qt.CheckState.Checked:
+            self.hidden_structure_names.add(normalized_name)
+        else:
+            self.hidden_structure_names.discard(normalized_name)
+        self.apply_hidden_structure_filter()
+
+    def on_show_structure_filter_popup(self) -> None:
+        if self.rtstruct is None:
+            return
+        dialog = self.ensure_structure_filter_dialog()
+        self.populate_structure_filter_dialog()
+        anchor_widget = None
+        if hasattr(self, "main_toolbar"):
+            anchor_widget = self.main_toolbar.widgetForAction(self.structure_filter_action)
+        if anchor_widget is not None:
+            popup_origin = anchor_widget.mapToGlobal(
+                QtCore.QPoint(0, anchor_widget.height())
+            )
+        else:
+            popup_origin = self.mapToGlobal(QtCore.QPoint(0, 0))
+        dialog.move(popup_origin)
+        dialog.show()
+        dialog.raise_()
 
     def on_reset_window_level(self):
         self.window_level_slider.setWindowLevel(400, 40)
@@ -1308,6 +1411,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.print_report_action.setEnabled(
             self.current_patient_folder is not None and self.rtstruct is not None
         )
+        self.structure_filter_action.setEnabled(self.rtstruct is not None and bool(self.get_filterable_structure_entries()))
         self.add_constraint_button.setEnabled(self.rtstruct is not None)
 
     def update_patient_plan_label(self):
@@ -1762,8 +1866,19 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         return [
             structure.name
             for structure in self.rtstruct.structures
-            if self.is_listable_structure_name(normalize_structure_name(structure.name))
+            if self.is_base_listable_structure_name(normalize_structure_name(structure.name))
         ]
+
+    def get_filterable_structure_entries(self) -> List[Tuple[str, str]]:
+        if self.rtstruct is None:
+            return []
+        entries: List[Tuple[str, str]] = []
+        for structure in self.rtstruct.structures:
+            normalized_name = normalize_structure_name(structure.name)
+            if not self.is_base_listable_structure_name(normalized_name):
+                continue
+            entries.append((normalized_name, structure.name))
+        return entries
 
     def parse_constraint_goal_input(self, goal_text: str) -> Optional[Tuple[str, str]]:
         match = re.match(r"^\s*(<=|>=|<|>|==|=)\s*(.+?)\s*$", goal_text)
@@ -5192,11 +5307,14 @@ h2 {{
         self.update_constraints_table()
         self.update_targets_table()
 
-    def is_listable_structure_name(self, normalized_name: str) -> bool:
+    def is_base_listable_structure_name(self, normalized_name: str) -> bool:
         excluded_fragments = ("COUCH", "RAIL", "BB")
         return not normalized_name.startswith("Z") and not any(
             fragment in normalized_name for fragment in excluded_fragments
         )
+
+    def is_listable_structure_name(self, normalized_name: str) -> bool:
+        return self.is_base_listable_structure_name(normalized_name) and normalized_name not in self.hidden_structure_names
 
     def build_listable_rtstruct(self) -> Optional[RTStructData]:
         if self.rtstruct is None:
