@@ -132,7 +132,10 @@ class DVHComputationTask(QtCore.QRunnable):
             if self._cancelled:
                 self._release_references()
                 return
-            self.signals.failed.emit(self.request_id, str(exc), perf_counter() - start)
+            try:
+                self.signals.failed.emit(self.request_id, str(exc), perf_counter() - start)
+            except RuntimeError:
+                pass
             self._release_references()
             return
         finally:
@@ -141,7 +144,10 @@ class DVHComputationTask(QtCore.QRunnable):
 
         if self._cancelled:
             return
-        self.signals.finished.emit(self.request_id, curves, mask_cache, perf_counter() - start)
+        try:
+            self.signals.finished.emit(self.request_id, curves, mask_cache, perf_counter() - start)
+        except RuntimeError:
+            pass
         self._release_references()
 
 
@@ -175,7 +181,6 @@ class DVHComputationManager(QtCore.QObject):
         self.pending_request = None
         for task in self.active_jobs.values():
             task.cancel()
-        self.active_jobs.clear()
 
     def start(
         self,

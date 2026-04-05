@@ -4,6 +4,7 @@ import gc
 import hashlib
 import inspect
 import json
+import logging
 import re
 import sys
 from datetime import datetime
@@ -45,10 +46,8 @@ from peer_io import (
     load_combined_rtdose,
     load_ct_series_and_discover_patient_files,
     load_rtdose,
-    load_rtplan_phases,
     load_rtstruct,
     load_structure_constraints_sheet,
-    summarize_rtplan_files,
 )
 from peer_models import (
     CTVolume,
@@ -76,6 +75,7 @@ from peer_viewer_support import (
 NO_CONSTRAINTS_SHEET_LABEL = "------"
 MAX_TISSUE_ROW_LABEL = "Max Tissue"
 MAX_TISSUE_ROW_NAME = normalize_structure_name(MAX_TISSUE_ROW_LABEL)
+logger = logging.getLogger(__name__)
 
 
 def _callable_signature_hash(func) -> str:
@@ -124,6 +124,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.latest_timing_csv_path: Optional[str] = None
         self.latest_timing_rtstruct_path: Optional[str] = None
         self.latest_timing_rtdose_paths: List[str] = []
+        self.constraint_workbook_error: Optional[str] = None
         self.phase_dose_volumes_by_path: Dict[str, DoseVolume] = {}
         self.phase_dose_plane_cache: Dict[Tuple[str, int], np.ndarray] = {}
         self.target_curve_cache: Dict[Tuple[str, str], Optional[DVHCurve]] = {}
@@ -643,6 +644,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.latest_timing_csv_path = None
         self.latest_timing_rtstruct_path = None
         self.latest_timing_rtdose_paths = []
+        self.constraint_workbook_error = None
 
         self.ct = None
         self.dose = None
@@ -727,12 +729,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.defer_sidebar_summary_metrics = True
 
             stage_start = perf_counter()
-            self.ct, rtstruct_path, rtdose_paths, rtplan_paths = load_ct_series_and_discover_patient_files(folder)
+            self.ct, patient_discovery = load_ct_series_and_discover_patient_files(folder)
+            rtstruct_path = patient_discovery.rtstruct_path
+            rtdose_paths = list(patient_discovery.rtdose_paths)
+            rtplan_paths = list(patient_discovery.rtplan_paths)
             timing_entries.append(("CT scan/load + file discovery", perf_counter() - stage_start))
 
-            self.plan_phases = load_rtplan_phases(rtplan_paths, rtdose_paths)
+            self.plan_phases = list(patient_discovery.plan_phases)
             self.current_rtplan_paths = list(rtplan_paths)
-            self.patient_plan_lines = summarize_rtplan_files(rtplan_paths)
+            self.patient_plan_lines = patient_discovery.patient_plan_lines
             self.update_patient_plan_label()
 
             stage_start = perf_counter()
@@ -851,7 +856,13 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     ]
                     report_path = self.write_latest_timing_report()
 
-            self.statusBar().clearMessage()
+            if self.constraint_workbook_error:
+                self.statusBar().showMessage(
+                    f"Could not read constraints workbook: {self.constraint_workbook_error}",
+                    8000,
+                )
+            else:
+                self.statusBar().clearMessage()
         except Exception as e:
             self.clear_patient_session_state()
             timing_entries.append(("Total patient load to interactive review (failed)", perf_counter() - overall_start))
@@ -1204,6 +1215,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def refresh_constraint_sheet_combo(self, preferred_sheet_name: Optional[str] = None) -> None:
         workbook_path = get_constraints_workbook_path()
         self.structure_filter_csv_path = workbook_path
+        self.constraint_workbook_error = None
         if workbook_path is None:
             self.available_constraint_sheet_names = []
             self.constraints_sheet_name = None
@@ -1215,7 +1227,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         try:
             sheet_names = list_constraints_workbook_sheets(workbook_path)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to read constraints workbook: %s (%s)", workbook_path, exc)
+            self.constraint_workbook_error = str(exc)
             sheet_names = []
 
         self.available_constraint_sheet_names = sheet_names
@@ -1239,6 +1253,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.constraint_sheet_combo.setCurrentText(NO_CONSTRAINTS_SHEET_LABEL)
         self.constraint_sheet_combo.setEnabled(bool(sheet_names))
         del blocker
+        if self.constraint_workbook_error:
+            self.statusBar().showMessage(
+                f"Could not read constraints workbook: {self.constraint_workbook_error}",
+                8000,
+            )
 
     def apply_constraint_sheet(
         self,
@@ -1542,6 +1561,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "get_primary_target_context": _callable_signature_hash(type(self).get_primary_target_context),
             "build_target_table_rows": _callable_signature_hash(type(self).build_target_table_rows),
             "compute_stereotactic_indices": _callable_signature_hash(type(self).compute_stereotactic_indices),
+            "get_max_tissue_dose_goal_lines": _callable_signature_hash(type(self).get_max_tissue_dose_goal_lines),
             "get_default_stereotactic_dose_text": _callable_signature_hash(
                 type(self).get_default_stereotactic_dose_text
             ),
@@ -2059,8 +2079,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.dvh_structure_list.set_checked_names(saved_selected_names)
         self.refresh_visible_structure_goal_evaluations(precomputed=goal_evaluations or None)
         self.update_structure_list_goal_texts()
-        self.update_constraints_table()
-        self.update_targets_table()
         self.render_dvh_plot()
         if self.dvh_curves:
             self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")

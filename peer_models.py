@@ -60,6 +60,16 @@ class RTPlanPhase:
 
 
 @dataclass
+class PatientFileDiscovery:
+    ct_paths: List[str]
+    rtstruct_path: Optional[str]
+    rtdose_paths: List[str]
+    rtplan_paths: List[str]
+    plan_phases: List[RTPlanPhase] = field(default_factory=list)
+    patient_plan_lines: Optional[Tuple[str, ...]] = None
+
+
+@dataclass
 class StructureGoal:
     structure_name: str
     metric: str

@@ -15,7 +15,15 @@ from peer_helpers import (
     normalize_structure_name,
     safe_get,
 )
-from peer_models import CTVolume, DoseVolume, RTPlanPhase, RTStructData, StructureGoal, StructureSliceContours
+from peer_models import (
+    CTVolume,
+    DoseVolume,
+    PatientFileDiscovery,
+    RTPlanPhase,
+    RTStructData,
+    StructureGoal,
+    StructureSliceContours,
+)
 
 try:
     from pydicom.pixels import apply_rescale
@@ -325,13 +333,60 @@ def load_structure_constraints_sheet(
         workbook.close()
 
 
+def _summarize_rtplan_phase_records(
+    phase_records: List[Dict[str, object]],
+) -> Optional[Tuple[str, ...]]:
+    if not phase_records:
+        return None
+
+    patient_name = ""
+    patient_id = ""
+    total_prescription_dose_gy = 0.0
+    total_fractions = 0
+
+    for record in phase_records:
+        if not patient_name:
+            patient_name = str(record.get("patient_name", "")).strip()
+        if not patient_id:
+            patient_id = str(record.get("patient_id", "")).strip()
+        prescription_dose_gy = float(record.get("prescription_dose_gy", 0.0) or 0.0)
+        fractions_planned = int(record.get("fractions_planned", 0) or 0)
+        if prescription_dose_gy > 0.0:
+            total_prescription_dose_gy += prescription_dose_gy
+        if fractions_planned > 0:
+            total_fractions += fractions_planned
+
+    if not patient_name and not patient_id and total_prescription_dose_gy <= 0.0 and total_fractions <= 0:
+        return None
+
+    line_1 = patient_name or "Patient name unavailable"
+    line_2 = f"ID: {patient_id}" if patient_id else "ID unavailable"
+    if total_prescription_dose_gy > 0.0 and total_fractions > 0:
+        dose_per_fraction_gy = total_prescription_dose_gy / float(total_fractions)
+        line_3 = f"{total_prescription_dose_gy:.2f} Gy | {total_fractions} fx | {dose_per_fraction_gy:.2f} Gy/fx"
+    elif total_prescription_dose_gy > 0.0:
+        line_3 = f"{total_prescription_dose_gy:.2f} Gy"
+    elif total_fractions > 0:
+        line_3 = f"{total_fractions} fx"
+    else:
+        line_3 = "Prescription unavailable"
+
+    plan_count = len(phase_records)
+    if plan_count > 1:
+        line_4 = f"{plan_count} phases"
+        return (line_1, line_2, line_3, line_4)
+    return (line_1, line_2, line_3)
+
+
 def scan_patient_folder(
     folder: str,
-) -> Tuple[List[str], Optional[str], List[str], List[str]]:
+) -> PatientFileDiscovery:
     rtstruct_paths: List[str] = []
     rtdose_paths: List[str] = []
     rtplan_paths: List[str] = []
     ct_paths: List[str] = []
+    dose_path_by_plan_uid: Dict[str, str] = {}
+    rtplan_phase_records: List[Dict[str, object]] = []
 
     for path in sorted(Path(folder).rglob("*")):
         if not path.is_file():
@@ -350,11 +405,49 @@ def scan_patient_folder(
             rtstruct_paths.append(str(path))
         elif modality == "RTDOSE":
             rtdose_paths.append(str(path))
+            for item in safe_get(ds, "ReferencedRTPlanSequence", []):
+                referenced_uid = str(safe_get(item, "ReferencedSOPInstanceUID", "")).strip()
+                if referenced_uid and referenced_uid not in dose_path_by_plan_uid:
+                    dose_path_by_plan_uid[referenced_uid] = str(path)
         elif modality == "RTPLAN":
             rtplan_paths.append(str(path))
+            sop_instance_uid = str(safe_get(ds, "SOPInstanceUID", "")).strip()
+            prescription_doses_gy = _extract_rtplan_prescription_doses_gy(ds)
+            rtplan_phase_records.append(
+                {
+                    "path": str(path),
+                    "sop_instance_uid": sop_instance_uid,
+                    "prescription_dose_gy": max(prescription_doses_gy) if prescription_doses_gy else 0.0,
+                    "fractions_planned": _extract_rtplan_number_of_fractions(ds),
+                    "target_structure_name": _extract_rtplan_target_structure_name(ds),
+                    "plan_label": str(safe_get(ds, "RTPlanLabel", "")).strip(),
+                    "plan_name": str(safe_get(ds, "RTPlanName", "")).strip(),
+                    "patient_name": _format_patient_name(safe_get(ds, "PatientName", "")),
+                    "patient_id": str(safe_get(ds, "PatientID", "")).strip(),
+                }
+            )
 
     rtstruct_path = rtstruct_paths[0] if rtstruct_paths else None
-    return ct_paths, rtstruct_path, rtdose_paths, rtplan_paths
+    plan_phases = [
+        RTPlanPhase(
+            sop_instance_uid=str(record.get("sop_instance_uid", "")),
+            prescription_dose_gy=float(record.get("prescription_dose_gy", 0.0) or 0.0),
+            fractions_planned=int(record.get("fractions_planned", 0) or 0),
+            dose_path=dose_path_by_plan_uid.get(str(record.get("sop_instance_uid", "")), ""),
+            target_structure_name=str(record.get("target_structure_name", "")),
+            plan_label=str(record.get("plan_label", "")),
+            plan_name=str(record.get("plan_name", "")),
+        )
+        for record in rtplan_phase_records
+    ]
+    return PatientFileDiscovery(
+        ct_paths=ct_paths,
+        rtstruct_path=rtstruct_path,
+        rtdose_paths=rtdose_paths,
+        rtplan_paths=rtplan_paths,
+        plan_phases=plan_phases,
+        patient_plan_lines=_summarize_rtplan_phase_records(rtplan_phase_records),
+    )
 
 def load_ct_series_from_paths(ct_paths: List[str]) -> CTVolume:
     files = []
@@ -422,15 +515,15 @@ def load_ct_series_from_paths(ct_paths: List[str]) -> CTVolume:
 
 
 def load_ct_series(folder: str) -> CTVolume:
-    ct_paths, _, _, _ = scan_patient_folder(folder)
-    return load_ct_series_from_paths(ct_paths)
+    discovery = scan_patient_folder(folder)
+    return load_ct_series_from_paths(discovery.ct_paths)
 
 
 def load_ct_series_and_discover_patient_files(
     folder: str,
-) -> Tuple[CTVolume, Optional[str], List[str], List[str]]:
-    ct_paths, rtstruct_path, rtdose_paths, rtplan_paths = scan_patient_folder(folder)
-    return load_ct_series_from_paths(ct_paths), rtstruct_path, rtdose_paths, rtplan_paths
+) -> Tuple[CTVolume, PatientFileDiscovery]:
+    discovery = scan_patient_folder(folder)
+    return load_ct_series_from_paths(discovery.ct_paths), discovery
 
 
 def _format_patient_name(name_value: object) -> str:
