@@ -873,15 +873,23 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             dvh_can_start = self.ct is not None and self.dose is not None and self.rtstruct is not None
             cache_loaded = False
             cache_load_duration: Optional[float] = None
+            cache_path = self.get_dvh_cache_path()
+            cache_found = cache_path is not None and cache_path.exists()
             if dvh_can_start:
+                if cache_found:
+                    self.show_progress_status("Found saved JSON cache", pump_events=True)
                 stage_start = perf_counter()
                 cache_loaded = self.try_load_saved_dvh_cache()
                 cache_load_duration = perf_counter() - stage_start if cache_loaded else None
             self.defer_sidebar_summary_metrics = False
             if self.rtstruct is not None and self.ct is not None:
                 self.populate_structures_list()
+            if cache_loaded:
+                self.show_progress_status("Loaded saved JSON cache")
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
             if not cache_loaded:
+                if cache_found:
+                    self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
                 if self.rtstruct is not None and self.ct is not None:
                     self.show_progress_status("Computing metrics", pump_events=True)
                     self.update_structure_list_goal_texts()
