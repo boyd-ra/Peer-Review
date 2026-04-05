@@ -761,7 +761,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         rtdose_paths: List[str] = []
 
         try:
-            self.statusBar().showMessage("Scanning patient folder...")
+            self.show_progress_status("Scanning patient folder...")
             self.clear_patient_session_state()
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
@@ -814,6 +814,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
             self.rtstruct_path = rtstruct_path
             if self.rtstruct_path:
+                self.show_progress_status("Loading structures")
                 stage_start = perf_counter()
                 self.reload_rtstruct_from_current_selection(refresh_dvh=False, refresh_views=False)
                 timing_entries.append(("Load RTSTRUCT", perf_counter() - stage_start))
@@ -831,6 +832,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.dose = load_combined_rtdose(rtdose_paths)
                 timing_entries.append(("Load/merge RTDOSE", perf_counter() - stage_start))
 
+                self.show_progress_status("Resampling dose")
                 stage_start = perf_counter()
                 self.sampled_dose_volume_ct = np.stack(
                     [sample_dose_to_ct_slice(self.ct, self.dose, k) for k in range(self.ct.volume_hu.shape[0])],
@@ -874,6 +876,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
             if not cache_loaded:
                 if self.rtstruct is not None and self.ct is not None:
+                    self.show_progress_status("Computing metrics")
                     self.update_structure_list_goal_texts()
                 timing_entries.append(("Compute DVH (background)" if dvh_can_start else "Compute DVH", None))
             timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
@@ -2154,6 +2157,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
         self.statusBar().showMessage(f"Saved DVH cache to {cache_path.name}", 4000)
 
+    def show_progress_status(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def clear_progress_status(self, expected_message: Optional[str] = None) -> None:
+        if expected_message is None or self.statusBar().currentMessage() == expected_message:
+            self.statusBar().clearMessage()
+
     def write_latest_timing_report(self, error_message: Optional[str] = None) -> Optional[Path]:
         if not self.latest_timing_entries or self.latest_timing_folder is None:
             return None
@@ -2475,6 +2488,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.render_dvh_plot()
             return False
 
+        self.show_progress_status("Computing DVHs")
         selected_names = self.get_selected_dvh_structure_names()
         selected_rtstruct = self.build_selected_dvh_rtstruct(selected_names)
         if selected_rtstruct is None or not selected_rtstruct.structures:
@@ -2489,10 +2503,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.dvh_status_label.setText("Select structures in the DVH tab to generate DVHs.")
             self.clear_dvh_curve_selection()
             self.render_dvh_plot()
+            self.clear_progress_status("Computing DVHs")
             return False
 
         self.render_dvh_plot()
-        self.dvh_status_label.setText(f"Computing {self.get_dvh_mode_label().lower()} DVHs in background...")
 
         mask_cache = self.structure_mask_cache
         if mask_cache is not None and self.structure_mask_cache_names != selected_names:
@@ -2523,6 +2537,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_mask_cache = mask_cache
         self.structure_mask_cache_names = list(request_structure_names)
         self.dvh_curves = list(curves)
+        self.show_progress_status("Computing metrics")
         self.refresh_visible_structure_goal_evaluations()
         self.update_dvh_goal_evaluation_cache()
         self.update_dvh_secondary_metric_caches()
@@ -2539,6 +2554,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.render_dvh_plot()
         self.update_dvh_cache_button()
         self.update_background_dvh_timing_report(duration_s)
+        self.clear_progress_status("Computing metrics")
 
     def on_dvh_task_failed(self, request_id: int, error_message: str, duration_s: float):
         self.dvh_request_structure_names.pop(request_id, None)
@@ -2549,6 +2565,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.render_dvh_plot()
         self.update_dvh_cache_button()
         self.update_background_dvh_timing_report(duration_s, error_message=error_message)
+        self.clear_progress_status()
 
     def current_dvh_curve_names(self) -> List[str]:
         return [normalize_structure_name(curve.name) for curve in self.dvh_curves]
@@ -4115,7 +4132,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def get_target_table_rows(self) -> List[Dict[str, object]]:
         if self.cached_target_table_rows is None:
+            progress_message = "Computing SRS metrics" if self.stereotactic_summary_enabled() else "Computing metrics"
+            self.show_progress_status(progress_message)
             self.cached_target_table_rows = self.build_target_table_rows()
+            self.clear_progress_status(progress_message)
         return self.cached_target_table_rows
 
     def update_targets_table_column_widths(self):
