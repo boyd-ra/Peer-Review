@@ -134,6 +134,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
         self.target_containment_cache: Dict[str, List[str]] = {}
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
+        self.defer_sidebar_summary_metrics: bool = False
         self.stereotactic_target_dose_text_by_name: Dict[str, str] = {}
         self.targets_table_refresh_pending = False
         self.constraint_editor_state: Optional[Dict[str, str]] = None
@@ -680,6 +681,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
         self.cached_target_table_rows = None
+        self.defer_sidebar_summary_metrics = False
         self.targets_table_refresh_pending = False
         self.constraint_editor_state = None
         self.constraint_editor_widgets = {}
@@ -722,6 +724,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Scanning patient folder...")
             self.clear_patient_session_state()
             self.current_patient_folder = folder
+            self.defer_sidebar_summary_metrics = True
 
             stage_start = perf_counter()
             self.ct, rtstruct_path, rtdose_paths, rtplan_paths = load_ct_series_and_discover_patient_files(folder)
@@ -822,8 +825,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 stage_start = perf_counter()
                 cache_loaded = self.try_load_saved_dvh_cache()
                 cache_load_duration = perf_counter() - stage_start if cache_loaded else None
+            self.defer_sidebar_summary_metrics = False
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
             if not cache_loaded:
+                if self.rtstruct is not None and self.ct is not None:
+                    self.update_structure_list_goal_texts()
                 timing_entries.append(("Compute DVH (background)" if dvh_can_start else "Compute DVH", None))
             timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
 
@@ -1845,11 +1851,34 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "custom_constraints": self.serialize_structure_goals(self.custom_structure_goals_by_name),
             "goal_evaluations": self.serialize_goal_evaluations(),
             "target_table_rows": self.serialize_target_table_rows(target_rows),
+            "max_tissue": self.build_max_tissue_payload(),
             "stereotactic_target_doses": self.stereotactic_target_dose_text_by_name,
             "constraint_notes": self.constraint_notes,
             "target_notes": self.build_target_notes_for_save(target_rows),
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def build_max_tissue_payload(self) -> Optional[Dict[str, object]]:
+        if self.ct is None or self.rtstruct is None or self.sampled_dose_volume_ct is None:
+            return None
+
+        if self.max_tissue_dose_gy_cache is None:
+            previous_defer = self.defer_sidebar_summary_metrics
+            self.defer_sidebar_summary_metrics = False
+            try:
+                self.get_max_tissue_dose_goal_lines()
+            finally:
+                self.defer_sidebar_summary_metrics = previous_defer
+
+        if self.max_tissue_dose_gy_cache is None:
+            return None
+
+        payload: Dict[str, object] = {
+            "dose_gy": float(self.max_tissue_dose_gy_cache),
+        }
+        if self.max_tissue_index_zyx is not None:
+            payload["index_zyx"] = [int(value) for value in self.max_tissue_index_zyx]
+        return payload
 
     def load_saved_dvh_cache(self, path: Path) -> bool:
         if self.rtstruct is None:
@@ -1984,6 +2013,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         target_table_rows = self.deserialize_target_table_rows(payload.get("target_table_rows"))
         if target_table_rows is None:
             return False
+        max_tissue_payload = payload.get("max_tissue")
+        if max_tissue_payload is not None and not isinstance(max_tissue_payload, dict):
+            return False
 
         self.custom_structure_goals_by_name = custom_constraints
         self.rebuild_structure_goals_by_name()
@@ -1998,6 +2030,23 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             {str(key): str(value) for key, value in target_notes_payload.items() if str(value).strip()},
             target_table_rows,
         )
+        if isinstance(max_tissue_payload, dict):
+            dose_value = max_tissue_payload.get("dose_gy")
+            try:
+                self.max_tissue_dose_gy_cache = float(dose_value) if dose_value is not None else None
+            except (TypeError, ValueError):
+                self.max_tissue_dose_gy_cache = None
+            index_payload = max_tissue_payload.get("index_zyx")
+            if isinstance(index_payload, list) and len(index_payload) == 3:
+                try:
+                    self.max_tissue_index_zyx = tuple(int(value) for value in index_payload)
+                except (TypeError, ValueError):
+                    self.max_tissue_index_zyx = None
+            else:
+                self.max_tissue_index_zyx = None
+        else:
+            self.max_tissue_dose_gy_cache = None
+            self.max_tissue_index_zyx = None
         self.structure_mask_cache = None
         self.structure_mask_cache_names = []
         self.dvh_request_structure_names = {}
@@ -3868,6 +3917,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 if coverage_text:
                     return [(f"Coverage {coverage_text}", None)]
 
+        if self.defer_sidebar_summary_metrics:
+            return []
+
         structure = self.get_structure_by_normalized_name(normalized_name)
         if structure is None:
             return []
@@ -3897,6 +3949,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def get_max_tissue_dose_goal_lines(self) -> List[Tuple[str, Optional[str]]]:
         if self.ct is None or self.rtstruct is None or self.sampled_dose_volume_ct is None:
+            return []
+
+        if self.max_tissue_dose_gy_cache is None and self.defer_sidebar_summary_metrics:
             return []
 
         if self.max_tissue_dose_gy_cache is None:
