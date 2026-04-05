@@ -857,6 +857,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 cache_loaded = self.try_load_saved_dvh_cache()
                 cache_load_duration = perf_counter() - stage_start if cache_loaded else None
             self.defer_sidebar_summary_metrics = False
+            if self.rtstruct is not None and self.ct is not None:
+                self.populate_structures_list()
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
             if not cache_loaded:
                 if self.rtstruct is not None and self.ct is not None:
