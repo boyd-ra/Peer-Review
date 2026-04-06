@@ -324,8 +324,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraint_editor_state: Optional[Dict[str, str]] = None
         self.constraint_editor_widgets: Dict[str, QtWidgets.QWidget] = {}
         self.hidden_structure_names: set[str] = set()
+        self.additional_target_subvolume_names: set[str] = set()
         self.structure_filter_dialog: Optional[QtWidgets.QDialog] = None
-        self.structure_filter_list_widget: Optional[QtWidgets.QListWidget] = None
+        self.structure_filter_tree_widget: Optional[QtWidgets.QTreeWidget] = None
         self.current_row: int = 0
         self.current_col: int = 0
         self.max_dose_index_zyx: Optional[Tuple[int, int, int]] = None
@@ -963,8 +964,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraint_editor_state = None
         self.constraint_editor_widgets = {}
         self.hidden_structure_names = set()
-        if self.structure_filter_list_widget is not None:
-            self.structure_filter_list_widget.clear()
+        self.additional_target_subvolume_names = set()
+        if self.structure_filter_tree_widget is not None:
+            self.structure_filter_tree_widget.clear()
         if self.structure_filter_dialog is not None:
             self.structure_filter_dialog.hide()
         self.max_dose_index_zyx = None
@@ -1192,7 +1194,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.clear_patient_session_state()
 
     def ensure_structure_filter_dialog(self) -> QtWidgets.QDialog:
-        if self.structure_filter_dialog is not None and self.structure_filter_list_widget is not None:
+        if self.structure_filter_dialog is not None and self.structure_filter_tree_widget is not None:
             return self.structure_filter_dialog
 
         dialog = QtWidgets.QDialog(self, QtCore.Qt.WindowType.Popup)
@@ -1201,61 +1203,105 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        hint_label = QtWidgets.QLabel("Check structures to hide them from the Axial and DVH lists.")
+        hint_label = QtWidgets.QLabel(
+            "Use Exclude to hide a structure from the Axial and DVH lists. "
+            "Use Target to include a structure as a target subvolume in the Targets tab."
+        )
         hint_label.setWordWrap(True)
         layout.addWidget(hint_label)
 
-        list_widget = QtWidgets.QListWidget()
-        list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
-        list_widget.setMinimumWidth(280)
-        list_widget.setMinimumHeight(320)
-        list_widget.itemChanged.connect(self.on_structure_filter_item_changed)
-        layout.addWidget(list_widget)
+        tree_widget = QtWidgets.QTreeWidget()
+        tree_widget.setColumnCount(3)
+        tree_widget.setHeaderLabels(["Exclude", "Target", "Structure"])
+        tree_widget.setRootIsDecorated(False)
+        tree_widget.setItemsExpandable(False)
+        tree_widget.setUniformRowHeights(True)
+        tree_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
+        tree_widget.setMinimumWidth(420)
+        tree_widget.setMinimumHeight(340)
+        tree_widget.header().setStretchLastSection(True)
+        tree_widget.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        tree_widget.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        tree_widget.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        tree_widget.itemChanged.connect(self.on_structure_filter_item_changed)
+        layout.addWidget(tree_widget)
 
         self.structure_filter_dialog = dialog
-        self.structure_filter_list_widget = list_widget
+        self.structure_filter_tree_widget = tree_widget
         return dialog
 
     def populate_structure_filter_dialog(self) -> None:
-        if self.structure_filter_list_widget is None:
+        if self.structure_filter_tree_widget is None:
             return
 
         entries = self.get_filterable_structure_entries()
-        blocker = QtCore.QSignalBlocker(self.structure_filter_list_widget)
-        self.structure_filter_list_widget.clear()
+        blocker = QtCore.QSignalBlocker(self.structure_filter_tree_widget)
+        self.structure_filter_tree_widget.clear()
         for normalized_name, structure_name in entries:
-            item = QtWidgets.QListWidgetItem(structure_name)
+            item = QtWidgets.QTreeWidgetItem(self.structure_filter_tree_widget)
+            item.setData(0, QtCore.Qt.ItemDataRole.UserRole, normalized_name)
             item.setFlags(
-                item.flags()
+                QtCore.Qt.ItemFlag.ItemIsEnabled
                 | QtCore.Qt.ItemFlag.ItemIsUserCheckable
-                | QtCore.Qt.ItemFlag.ItemIsEnabled
             )
-            item.setData(QtCore.Qt.ItemDataRole.UserRole, normalized_name)
+            item.setText(2, structure_name)
             item.setCheckState(
+                0,
                 QtCore.Qt.CheckState.Checked
                 if normalized_name in self.hidden_structure_names
-                else QtCore.Qt.CheckState.Unchecked
+                else QtCore.Qt.CheckState.Unchecked,
             )
-            self.structure_filter_list_widget.addItem(item)
+            item.setCheckState(
+                1,
+                QtCore.Qt.CheckState.Checked
+                if normalized_name in self.additional_target_subvolume_names
+                else QtCore.Qt.CheckState.Unchecked,
+            )
+            if normalized_name.startswith("PTV"):
+                item.setText(1, "Primary")
+                item.setCheckState(1, QtCore.Qt.CheckState.Unchecked)
         del blocker
 
-    def apply_hidden_structure_filter(self) -> None:
+    def apply_structure_filter_settings(self, *, refresh_lists: bool) -> None:
         if self.rtstruct is None:
             return
-        self.populate_structures_list()
-        self.on_structure_visibility_changed()
-        self.on_dvh_structure_visibility_changed()
+        self.target_containment_cache = {}
+        self.cached_target_table_rows = None
+        if refresh_lists:
+            self.populate_structures_list()
+            self.on_structure_visibility_changed()
+            self.on_dvh_structure_visibility_changed()
+        self.update_targets_table()
         self.update_dvh_cache_button()
 
-    def on_structure_filter_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
-        normalized_name = normalize_structure_name(str(item.data(QtCore.Qt.ItemDataRole.UserRole) or ""))
+    def on_structure_filter_item_changed(
+        self,
+        item: QtWidgets.QTreeWidgetItem,
+        column: int,
+    ) -> None:
+        normalized_name = normalize_structure_name(str(item.data(0, QtCore.Qt.ItemDataRole.UserRole) or ""))
         if not normalized_name:
             return
-        if item.checkState() == QtCore.Qt.CheckState.Checked:
+        hidden_before = normalized_name in self.hidden_structure_names
+        target_before = normalized_name in self.additional_target_subvolume_names
+        if item.checkState(0) == QtCore.Qt.CheckState.Checked:
             self.hidden_structure_names.add(normalized_name)
         else:
             self.hidden_structure_names.discard(normalized_name)
-        self.apply_hidden_structure_filter()
+        if normalized_name.startswith("PTV"):
+            if item.checkState(1) != QtCore.Qt.CheckState.Unchecked:
+                blocker = QtCore.QSignalBlocker(self.structure_filter_tree_widget)
+                item.setCheckState(1, QtCore.Qt.CheckState.Unchecked)
+                del blocker
+            self.additional_target_subvolume_names.discard(normalized_name)
+        elif item.checkState(1) == QtCore.Qt.CheckState.Checked:
+            self.additional_target_subvolume_names.add(normalized_name)
+        else:
+            self.additional_target_subvolume_names.discard(normalized_name)
+        hidden_changed = hidden_before != (normalized_name in self.hidden_structure_names)
+        target_changed = target_before != (normalized_name in self.additional_target_subvolume_names)
+        if hidden_changed or target_changed:
+            self.apply_structure_filter_settings(refresh_lists=hidden_changed)
 
     def on_show_structure_filter_popup(self) -> None:
         if self.rtstruct is None:
@@ -2314,7 +2360,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         payload = {
-            "version": 13,
+            "version": 14,
             "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
             "selected_constraint_set": selected_constraint_set,
             "constraints_file": Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
@@ -2335,6 +2381,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "target_table_rows": self.serialize_target_table_rows(target_rows),
             "max_tissue": self.build_max_tissue_payload(),
             "stereotactic_target_doses": self.stereotactic_target_dose_text_by_name,
+            "hidden_structure_names": sorted(self.hidden_structure_names),
+            "additional_target_subvolume_names": sorted(self.additional_target_subvolume_names),
             "constraint_notes": self.constraint_notes,
             "target_notes": self.build_target_notes_for_save(target_rows),
         }
@@ -2470,6 +2518,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             stereotactic_dose_payload = {}
         if not isinstance(stereotactic_dose_payload, dict):
             return False
+        hidden_structure_payload = payload.get("hidden_structure_names", [])
+        if hidden_structure_payload is None:
+            hidden_structure_payload = []
+        if not isinstance(hidden_structure_payload, list):
+            return False
+        additional_target_subvolume_payload = payload.get("additional_target_subvolume_names", [])
+        if additional_target_subvolume_payload is None:
+            additional_target_subvolume_payload = []
+        if not isinstance(additional_target_subvolume_payload, list):
+            return False
         target_table_rows = self.deserialize_target_table_rows(payload.get("target_table_rows"))
         max_tissue_payload = payload.get("max_tissue")
         if max_tissue_payload is not None and not isinstance(max_tissue_payload, dict):
@@ -2491,6 +2549,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             normalize_structure_name(str(name)): str(value).strip()
             for name, value in stereotactic_dose_payload.items()
             if normalize_structure_name(str(name))
+        }
+        self.hidden_structure_names = {
+            normalize_structure_name(str(name))
+            for name in hidden_structure_payload
+            if self.is_base_listable_structure_name(normalize_structure_name(str(name)))
+        }
+        self.additional_target_subvolume_names = {
+            normalize_structure_name(str(name))
+            for name in additional_target_subvolume_payload
+            if self.is_base_listable_structure_name(normalize_structure_name(str(name)))
+            and not normalize_structure_name(str(name)).startswith("PTV")
         }
         self.constraint_notes = {str(key): str(value) for key, value in notes_payload.items() if str(value).strip()}
         cleaned_target_notes = {
@@ -4187,7 +4256,10 @@ h2 {{
                 continue
             if not self.is_listable_structure_name(normalized_name):
                 continue
-            if not self.is_nested_target_structure_name(normalized_name):
+            if not (
+                self.is_nested_target_structure_name(normalized_name)
+                or normalized_name in self.additional_target_subvolume_names
+            ):
                 continue
             if self.structure_is_fully_encompassed(parent_structure, structure):
                 nested_structures.append(structure)
