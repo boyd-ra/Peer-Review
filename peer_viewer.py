@@ -6036,8 +6036,14 @@ h2 {{
                 if not self.structure_is_visible(idx):
                     continue
                 for rc in s.points_rc_by_slice.get(k, []):
-                    rr = rc[:, 0]
-                    cc = rc[:, 1]
+                    rr = np.asarray(rc[:, 0], dtype=np.float32)
+                    cc = np.asarray(rc[:, 1], dtype=np.float32)
+                    if rr.size >= 2 and cc.size >= 2:
+                        first_row = float(rr[0])
+                        first_col = float(cc[0])
+                        if not (np.isclose(float(rr[-1]), first_row) and np.isclose(float(cc[-1]), first_col)):
+                            rr = np.append(rr, np.float32(first_row))
+                            cc = np.append(cc, np.float32(first_col))
                     curve = pg.PlotCurveItem(
                         x=cc,
                         y=rr,
