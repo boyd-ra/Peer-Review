@@ -5055,6 +5055,7 @@ h2 {{
         label = QtWidgets.QLabel(display_name)
         label.setStyleSheet(f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]});")
         font = label.font()
+        font.setPointSize(self.targets_table.font().pointSize())
         if is_primary_ptv:
             font.setBold(True)
         label.setFont(font)
@@ -5082,6 +5083,9 @@ h2 {{
         if not is_primary_ptv:
             label = QtWidgets.QLabel(coverage_text)
             label.setStyleSheet("color: #f2f2f2;")
+            label_font = label.font()
+            label_font.setPointSize(self.targets_table.font().pointSize())
+            label.setFont(label_font)
             layout.addWidget(label)
             layout.addStretch(1)
             return widget
@@ -5094,6 +5098,9 @@ h2 {{
         if prefix_text:
             label = QtWidgets.QLabel(prefix_text)
             label.setStyleSheet("color: #f2f2f2;")
+            label_font = label.font()
+            label_font.setPointSize(self.targets_table.font().pointSize())
+            label.setFont(label_font)
             layout.addWidget(label)
 
         dose_edit = QtWidgets.QLineEdit()
@@ -5105,6 +5112,9 @@ h2 {{
         dose_validator = QtGui.QDoubleValidator(0.0, 999.99, 2, dose_edit)
         dose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
         dose_edit.setValidator(dose_validator)
+        dose_font = dose_edit.font()
+        dose_font.setPointSize(self.targets_table.font().pointSize())
+        dose_edit.setFont(dose_font)
         dose_edit.editingFinished.connect(
             lambda name=normalized_name, structure=structure_name, edit=dose_edit: self.on_stereotactic_dose_editing_finished(
                 name,
