@@ -110,6 +110,155 @@ class RectZoomViewBox(pg.ViewBox):
         event.ignore()
 
 
+def build_app_palette() -> QtGui.QPalette:
+    palette = QtGui.QPalette()
+    palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#2f2f2f"))
+    palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#f2f2f2"))
+    palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#232323"))
+    palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor("#2b2b2b"))
+    palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor("#232323"))
+    palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor("#f2f2f2"))
+    palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor("#f2f2f2"))
+    palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#4a4a4a"))
+    palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#f2f2f2"))
+    palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor("#ffffff"))
+    palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor("#3e7dd8"))
+    palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#ffffff"))
+    palette.setColor(QtGui.QPalette.ColorRole.Light, QtGui.QColor("#5d5d5d"))
+    palette.setColor(QtGui.QPalette.ColorRole.Midlight, QtGui.QColor("#505050"))
+    palette.setColor(QtGui.QPalette.ColorRole.Dark, QtGui.QColor("#1b1b1b"))
+    palette.setColor(QtGui.QPalette.ColorRole.Mid, QtGui.QColor("#363636"))
+    palette.setColor(QtGui.QPalette.ColorRole.Shadow, QtGui.QColor("#101010"))
+    palette.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.Text, QtGui.QColor("#8f8f8f"))
+    palette.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor("#8f8f8f"))
+    palette.setColor(QtGui.QPalette.ColorGroup.Disabled, QtGui.QPalette.ColorRole.WindowText, QtGui.QColor("#9b9b9b"))
+    return palette
+
+
+def build_app_stylesheet() -> str:
+    return """
+QMainWindow, QWidget {
+  background-color: #2f2f2f;
+  color: #f2f2f2;
+}
+QToolBar {
+  background-color: #343434;
+  border: none;
+  spacing: 6px;
+  padding: 4px 6px;
+}
+QToolBar::separator {
+  background: #505050;
+  width: 1px;
+  margin: 6px 8px;
+}
+QToolButton, QPushButton {
+  background-color: #4a4a4a;
+  color: #f2f2f2;
+  border: 1px solid #616161;
+  border-radius: 5px;
+  padding: 4px 10px;
+}
+QToolButton:hover, QPushButton:hover {
+  background-color: #585858;
+}
+QToolButton:pressed, QPushButton:pressed {
+  background-color: #666666;
+}
+QToolButton:disabled, QPushButton:disabled {
+  background-color: #3a3a3a;
+  color: #8f8f8f;
+  border-color: #4a4a4a;
+}
+QLineEdit, QComboBox, QAbstractSpinBox {
+  background-color: #232323;
+  color: #f2f2f2;
+  border: 1px solid #5c5c5c;
+  border-radius: 4px;
+  padding: 3px 6px;
+  selection-background-color: #3e7dd8;
+}
+QComboBox::drop-down {
+  border: none;
+  width: 18px;
+}
+QComboBox QAbstractItemView {
+  background-color: #232323;
+  color: #f2f2f2;
+  selection-background-color: #3e7dd8;
+  selection-color: #ffffff;
+}
+QTabWidget::pane {
+  border: 1px solid #4f4f4f;
+  background-color: #2f2f2f;
+}
+QTabBar::tab {
+  background-color: #444444;
+  color: #f2f2f2;
+  border: 1px solid #5f5f5f;
+  border-bottom: none;
+  padding: 6px 14px;
+  min-width: 72px;
+}
+QTabBar::tab:selected {
+  background-color: #2f2f2f;
+}
+QTabBar::tab:!selected:hover {
+  background-color: #505050;
+}
+QHeaderView::section {
+  background-color: #414141;
+  color: #f2f2f2;
+  border: 1px solid #555555;
+  padding: 4px 6px;
+}
+QTableWidget, QListWidget {
+  background-color: #232323;
+  color: #f2f2f2;
+  border: 1px solid #4f4f4f;
+  alternate-background-color: #2b2b2b;
+}
+QTableWidget::item:selected, QListWidget::item:selected {
+  background-color: #3e7dd8;
+  color: #ffffff;
+}
+QCheckBox {
+  color: #f2f2f2;
+}
+QSlider::groove:horizontal {
+  border: 1px solid #444444;
+  height: 6px;
+  background: #232323;
+  border-radius: 3px;
+}
+QSlider::handle:horizontal {
+  background: #d0d0d0;
+  border: 1px solid #7a7a7a;
+  width: 14px;
+  margin: -5px 0;
+  border-radius: 7px;
+}
+QStatusBar {
+  background-color: #343434;
+  color: #d0d0d0;
+}
+QScrollBar:vertical, QScrollBar:horizontal {
+  background: #2a2a2a;
+  border: none;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+  background: #5c5c5c;
+  border-radius: 4px;
+}
+"""
+
+
+def apply_app_theme(app: QtWidgets.QApplication) -> None:
+    app.setStyle("Fusion")
+    app.setPalette(build_app_palette())
+    app.setStyleSheet(build_app_stylesheet())
+
+
 class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -5908,6 +6057,7 @@ h2 {{
 def main():
     pg.setConfigOptions(antialias=True)
     app = QtWidgets.QApplication(sys.argv)
+    apply_app_theme(app)
     win = RTPlanReviewWindow()
     win.show()
     sys.exit(app.exec())
