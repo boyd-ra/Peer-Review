@@ -494,6 +494,26 @@ def parse_goal_value(value_text: str) -> Tuple[Optional[float], str]:
     return value, unit
 
 
+def parse_goal_value_range(value_text: str) -> Tuple[Optional[float], Optional[float], str]:
+    text = value_text.strip()
+    if not text:
+        return None, None, ""
+
+    match = re.match(
+        r"^\s*([-+]?\d*\.?\d+)\s*-\s*([-+]?\d*\.?\d+)\s*([A-Za-z%]+)?\s*$",
+        text,
+    )
+    if match is None:
+        return None, None, ""
+
+    first_value = float(match.group(1))
+    second_value = float(match.group(2))
+    unit = (match.group(3) or "").upper()
+    if unit == "CM3":
+        unit = "CC"
+    return first_value, second_value, unit
+
+
 def format_metric_value(value: Optional[float], unit: str) -> str:
     if value is None or not np.isfinite(value):
         return "n/a"
@@ -540,6 +560,10 @@ def parse_d_metric_volume(metric_key: str) -> Tuple[Optional[float], str]:
 def evaluate_structure_goal(curve: DVHCurve, goal: StructureGoal) -> StructureGoalEvaluation:
     metric_key = goal.metric.strip().upper().replace(" ", "")
     goal_value, goal_unit = parse_goal_value(goal.value_text)
+    variation_value, variation_limit, variation_unit = parse_goal_value_range(goal.value_text)
+    if goal_value is None and variation_value is not None:
+        goal_value = variation_value
+        goal_unit = variation_unit
     actual_value: Optional[float] = None
     actual_unit = "GY"
 
@@ -572,14 +596,42 @@ def evaluate_structure_goal(curve: DVHCurve, goal: StructureGoal) -> StructureGo
                     actual_unit = "GY"
 
     passed: Optional[bool] = None
+    status = ""
     if actual_value is not None and goal_value is not None:
         comparator = goal.comparator.strip()
         if comparator in {"<", "<="}:
-            passed = actual_value <= goal_value if comparator == "<=" else actual_value < goal_value
+            passes_primary = actual_value <= goal_value if comparator == "<=" else actual_value < goal_value
+            if passes_primary:
+                passed = True
+                status = "pass"
+            elif variation_value is not None and variation_limit is not None:
+                if actual_value <= variation_limit:
+                    passed = None
+                    status = "variation"
+                else:
+                    passed = False
+                    status = "fail"
+            else:
+                passed = False
+                status = "fail"
         elif comparator in {">", ">="}:
-            passed = actual_value >= goal_value if comparator == ">=" else actual_value > goal_value
+            passes_primary = actual_value >= goal_value if comparator == ">=" else actual_value > goal_value
+            if passes_primary:
+                passed = True
+                status = "pass"
+            elif variation_value is not None and variation_limit is not None:
+                if actual_value >= variation_limit:
+                    passed = None
+                    status = "variation"
+                else:
+                    passed = False
+                    status = "fail"
+            else:
+                passed = False
+                status = "fail"
         elif comparator in {"=", "=="}:
             passed = bool(np.isclose(actual_value, goal_value))
+            status = "pass" if passed else "fail"
 
     return StructureGoalEvaluation(
         metric=goal.metric,
@@ -587,6 +639,7 @@ def evaluate_structure_goal(curve: DVHCurve, goal: StructureGoal) -> StructureGo
         goal_text=goal.value_text,
         actual_text=format_metric_value(actual_value, actual_unit),
         passed=passed,
+        status=status,
     )
 
 

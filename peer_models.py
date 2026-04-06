@@ -84,6 +84,7 @@ class StructureGoalEvaluation:
     goal_text: str
     actual_text: str
     passed: Optional[bool] = None
+    status: str = ""
 
 
 @dataclass

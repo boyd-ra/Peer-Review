@@ -40,6 +40,7 @@ from peer_helpers import (
     normalize_structure_name,
     orthogonal_row_scale,
     parse_goal_value,
+    parse_goal_value_range,
     parse_v_metric_threshold_gy,
     resample_orthogonal_plane,
     sample_dose_to_ct_slice,
@@ -378,12 +379,38 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structures_list = QtWidgets.QListWidget()
         self.structures_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.structures_list.setSpacing(1)
+        self.patient_name_label = QtWidgets.QLabel("")
+        self.patient_name_label.setWordWrap(True)
+        self.patient_name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.patient_name_label.setMargin(2)
+        patient_name_font = self.patient_name_label.font()
+        patient_name_font.setPointSize(patient_name_font.pointSize() + 1)
+        patient_name_font.setBold(True)
+        self.patient_name_label.setFont(patient_name_font)
+        self.patient_name_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.patient_name_label.setVisible(False)
         self.patient_plan_label = QtWidgets.QLabel("")
         self.patient_plan_label.setWordWrap(True)
         self.patient_plan_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.patient_plan_label.setMargin(2)
+        self.patient_plan_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self.patient_plan_label.setVisible(False)
 
-        sidebar_layout.addWidget(self.patient_plan_label)
+        self.patient_summary_widget = QtWidgets.QWidget()
+        patient_summary_layout = QtWidgets.QVBoxLayout(self.patient_summary_widget)
+        patient_summary_layout.setContentsMargins(0, 0, 0, 0)
+        patient_summary_layout.setSpacing(0)
+        patient_summary_layout.addWidget(self.patient_name_label)
+        patient_summary_layout.addWidget(self.patient_plan_label)
+
+        self.axial_sidebar_widget = sidebar_widget
+        sidebar_layout.addWidget(self.patient_summary_widget)
         sidebar_layout.addSpacing(10)
         sidebar_layout.addWidget(QtWidgets.QLabel("Structures"))
         sidebar_layout.addWidget(self.structures_list, 1)
@@ -835,7 +862,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.plan_phases = list(patient_discovery.plan_phases)
             self.current_rtplan_paths = list(rtplan_paths)
             self.patient_plan_lines = patient_discovery.patient_plan_lines
-            self.update_patient_plan_label()
+            self.update_patient_plan_label(pump_events=True)
 
             stage_start = perf_counter()
             self.image_view_bounds = compute_image_view_bounds(self.ct)
@@ -1414,14 +1441,62 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_filter_action.setEnabled(self.rtstruct is not None and bool(self.get_filterable_structure_entries()))
         self.add_constraint_button.setEnabled(self.rtstruct is not None)
 
-    def update_patient_plan_label(self):
+    def _refresh_sidebar_label_geometry(self, label: QtWidgets.QLabel) -> None:
+        label.ensurePolished()
+        if not label.text().strip():
+            label.setFixedHeight(0)
+            return
+        height = max(
+            label.sizeHint().height(),
+            QtGui.QFontMetrics(label.font()).lineSpacing() * max(1, len(label.text().splitlines()))
+            + (2 * label.margin())
+            + 2,
+        )
+        label.setFixedHeight(height)
+        label.updateGeometry()
+
+    def refresh_patient_plan_label_layout(self, *, pump_events: bool = False) -> None:
+        self._refresh_sidebar_label_geometry(self.patient_name_label)
+        self._refresh_sidebar_label_geometry(self.patient_plan_label)
+        if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
+            self.patient_summary_widget.layout().activate()
+            self.patient_summary_widget.updateGeometry()
+        if hasattr(self, "axial_sidebar_widget") and self.axial_sidebar_widget is not None:
+            self.axial_sidebar_widget.layout().activate()
+            self.axial_sidebar_widget.updateGeometry()
+            self.axial_sidebar_widget.repaint()
+        if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
+            self.patient_summary_widget.repaint()
+        self.patient_name_label.repaint()
+        self.patient_plan_label.repaint()
+        if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
+            QtCore.QCoreApplication.sendPostedEvents(self.patient_summary_widget, int(QtCore.QEvent.Type.Paint))
+        QtCore.QCoreApplication.sendPostedEvents(self.patient_name_label, int(QtCore.QEvent.Type.Paint))
+        QtCore.QCoreApplication.sendPostedEvents(self.patient_plan_label, int(QtCore.QEvent.Type.Paint))
+        if hasattr(self, "axial_sidebar_widget") and self.axial_sidebar_widget is not None:
+            QtCore.QCoreApplication.sendPostedEvents(self.axial_sidebar_widget, int(QtCore.QEvent.Type.Paint))
+        if pump_events:
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def update_patient_plan_label(self, *, pump_events: bool = False):
         if not self.patient_plan_lines:
+            self.patient_name_label.clear()
+            self.patient_name_label.setFixedHeight(0)
+            self.patient_name_label.setVisible(False)
             self.patient_plan_label.clear()
+            self.patient_plan_label.setFixedHeight(0)
             self.patient_plan_label.setVisible(False)
             return
 
-        self.patient_plan_label.setText("\n".join(self.patient_plan_lines))
-        self.patient_plan_label.setVisible(True)
+        patient_name = str(self.patient_plan_lines[0]).strip()
+        details_text = "\n".join(str(line) for line in self.patient_plan_lines[1:])
+        self.patient_name_label.setText(patient_name)
+        self.patient_name_label.setVisible(bool(patient_name))
+        self.patient_plan_label.setText(details_text)
+        self.patient_plan_label.setVisible(bool(details_text))
+        self.refresh_patient_plan_label_layout(pump_events=pump_events)
 
     def refresh_constraint_sheet_combo(self, preferred_sheet_name: Optional[str] = None) -> None:
         workbook_path = get_constraints_workbook_path()
@@ -1589,6 +1664,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     "goal_text": evaluation.goal_text,
                     "actual_text": evaluation.actual_text,
                     "passed": evaluation.passed,
+                    "status": evaluation.status,
                 }
                 for evaluation in evaluations
             ]
@@ -1618,6 +1694,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         goal_text=str(evaluation_payload.get("goal_text", "")),
                         actual_text=str(evaluation_payload.get("actual_text", "")),
                         passed=evaluation_payload.get("passed"),
+                        status=str(evaluation_payload.get("status", "")),
                     )
                 )
             evaluations_by_structure[normalize_structure_name(str(structure_name))] = evaluations
@@ -2388,9 +2465,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         "notes": note_text,
                         "result_class": (
                             "result-pass"
-                            if evaluation is not None and evaluation.passed is True
+                            if evaluation is not None and evaluation.status == "pass"
+                            else "result-variation"
+                            if evaluation is not None and evaluation.status == "variation"
                             else "result-fail"
-                            if evaluation is not None and evaluation.passed is False
+                            if evaluation is not None and evaluation.status == "fail"
                             else ""
                         ),
                     }
@@ -2468,6 +2547,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     class_name = str(row.get(cell_class_keys[key], "")).strip()
                     if class_name == "result-pass":
                         cell_styles[0] = "background-color:#e5f5e8"
+                        cell_styles.append("font-weight:600")
+                    elif class_name == "result-variation":
+                        cell_styles[0] = "background-color:#fff4cc"
                         cell_styles.append("font-weight:600")
                     elif class_name == "result-fail":
                         cell_styles[0] = "background-color:#fde7e7"
@@ -2625,7 +2707,7 @@ h2 {{
   width: 100%;
 }}
 .patient-name {{
-  font-size: 14pt;
+  font-size: 16pt;
   font-weight: 700;
 }}
 .constraint-set {{
@@ -3463,9 +3545,11 @@ h2 {{
         return f"{goal_clause}: {evaluation.actual_text}"
 
     def structure_goal_line_color(self, evaluation: StructureGoalEvaluation) -> Optional[str]:
-        if evaluation.passed is True:
+        if evaluation.status == "pass" or evaluation.passed is True:
             return "#63c174"
-        if evaluation.passed is False:
+        if evaluation.status == "variation":
+            return "#ffd54a"
+        if evaluation.status == "fail" or evaluation.passed is False:
             return "#ff6b6b"
         return None
 
@@ -4926,7 +5010,7 @@ h2 {{
         if self.rtstruct is None:
             return
 
-        rows: List[Tuple[Tuple[int, int, int], QtGui.QColor, str, str, str, str, Optional[bool], str, str, str, bool]] = []
+        rows: List[Tuple[Tuple[int, int, int], QtGui.QColor, str, str, str, str, str, str, str, str, bool]] = []
         row_backgrounds = [QtGui.QColor(8, 8, 8), QtGui.QColor(34, 34, 34)]
         structure_group_index = 0
         for structure in self.rtstruct.structures:
@@ -4957,7 +5041,7 @@ h2 {{
                         goal.metric,
                         f"{goal.comparator.strip()} {goal.value_text.strip()}".strip(),
                         evaluation.actual_text if evaluation is not None else "",
-                        evaluation.passed if evaluation is not None else None,
+                        evaluation.status if evaluation is not None else "",
                         note_key,
                         note_title,
                         note_text,
@@ -4971,7 +5055,7 @@ h2 {{
         if row_offset:
             self.populate_constraint_editor_row(0)
 
-        for row_index, (color_rgb, background_color, oar, metric, goal_text, actual_text, passed, note_key, note_title, note_text, is_custom_only) in enumerate(rows, start=row_offset):
+        for row_index, (color_rgb, background_color, oar, metric, goal_text, actual_text, evaluation_status, note_key, note_title, note_text, is_custom_only) in enumerate(rows, start=row_offset):
             values = [oar, metric, goal_text, actual_text]
             for column_index, text in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(text)
@@ -4985,10 +5069,15 @@ h2 {{
                 elif is_custom_only and column_index in {1, 2}:
                     item.setForeground(QtGui.QColor("#ffd54a"))
                 elif column_index == 3:
-                    if passed is True:
+                    if evaluation_status == "pass":
                         item.setForeground(QtGui.QColor("#63c174"))
-                    elif passed is False:
+                        item.setBackground(QtGui.QColor("#18351f"))
+                    elif evaluation_status == "variation":
+                        item.setForeground(QtGui.QColor("#ffd54a"))
+                        item.setBackground(QtGui.QColor("#4a3f10"))
+                    elif evaluation_status == "fail":
                         item.setForeground(QtGui.QColor("#ff6b6b"))
+                        item.setBackground(QtGui.QColor("#3e1616"))
                 self.constraints_table.setItem(row_index, column_index, item)
             note_item = QtWidgets.QTableWidgetItem(note_text)
             note_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
@@ -5063,9 +5152,17 @@ h2 {{
         goals: List[StructureGoal],
         goal_index: int,
     ) -> str:
-        if normalized_name != "BLADDER" or goal_index != 0 or not goals:
-            return ""
-        return self.get_min_bladder_volume_note_text()
+        notes: List[str] = []
+        if 0 <= goal_index < len(goals):
+            goal = goals[goal_index]
+            variation_start, variation_end, _variation_unit = parse_goal_value_range(goal.value_text)
+            if variation_start is not None and variation_end is not None:
+                notes.append("Acceptable Variation")
+        if normalized_name == "BLADDER" and goal_index == 0 and goals:
+            bladder_note = self.get_min_bladder_volume_note_text()
+            if bladder_note:
+                notes.append(bladder_note)
+        return "    ".join(notes)
 
     def update_targets_table(self):
         if self.rtstruct is not None and self.ct is not None and self.tabs.currentWidget() is not self.targets_tab:
