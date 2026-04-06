@@ -1,0 +1,6 @@
+numpy
+PySide6
+pyqtgraph
+pydicom
+openpyxl
+scipy
