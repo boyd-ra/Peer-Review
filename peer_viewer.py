@@ -4937,10 +4937,10 @@ h2 {{
             elif fractions_planned == 5:
                 brain_metric_text = f"V24Gy (Brain) {brain_metric_cc:.1f} cc"
             return (
-                f"Vol {volume_cc:.3f} cc",
-                f"CI {ci_value:.3f}",
-                f"PCI {pci_value:.3f}",
-                f"GI {gi_value:.3f}",
+                f"Vol {volume_cc:.2f} cc",
+                f"CI {ci_value:.2f}",
+                f"PCI {pci_value:.2f}",
+                f"GI {gi_value:.2f}",
                 brain_metric_text,
             )
 
@@ -5001,10 +5001,10 @@ h2 {{
             brain_metric_cc,
         )
         return (
-            f"Vol {ptv_volume_cc:.3f} cc",
-            f"CI {ci_value:.3f}",
-            f"PCI {pci_value:.3f}",
-            f"GI {gi_value:.3f}",
+            f"Vol {ptv_volume_cc:.2f} cc",
+            f"CI {ci_value:.2f}",
+            f"PCI {pci_value:.2f}",
+            f"GI {gi_value:.2f}",
             brain_metric_text,
         )
 
@@ -5217,7 +5217,7 @@ h2 {{
                         fractions_planned=fractions_planned,
                     )
                 if max_dose_gy is not None and rx_reference_gy > 0.0:
-                    stereotactic_hi_text = f"HI {max_dose_gy / rx_reference_gy:.3f}"
+                    stereotactic_hi_text = f"HI {max_dose_gy / rx_reference_gy:.2f}"
                 stereotactic_parts = [
                     text
                     for text in (
