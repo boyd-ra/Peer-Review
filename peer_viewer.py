@@ -1266,6 +1266,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if self.rtstruct is None:
             return
         self.target_containment_cache = {}
+        self.stereotactic_metrics_cache = {}
         self.cached_target_table_rows = None
         if refresh_lists:
             self.populate_structures_list()
@@ -2057,6 +2058,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "get_primary_target_context": _callable_signature_hash(type(self).get_primary_target_context),
             "build_target_table_rows": _callable_signature_hash(type(self).build_target_table_rows),
             "compute_stereotactic_indices": _callable_signature_hash(type(self).compute_stereotactic_indices),
+            "get_nested_target_structures": _callable_signature_hash(type(self).get_nested_target_structures),
             "get_max_tissue_dose_goal_lines": _callable_signature_hash(type(self).get_max_tissue_dose_goal_lines),
             "get_default_stereotactic_dose_text": _callable_signature_hash(
                 type(self).get_default_stereotactic_dose_text
@@ -4215,6 +4217,48 @@ h2 {{
                 return False
         return True
 
+    def get_structure_mask_voxel_count(self, structure: StructureSliceContours) -> int:
+        return int(
+            sum(
+                int(np.count_nonzero(mask))
+                for mask in self.get_target_structure_slice_masks(structure).values()
+            )
+        )
+
+    def get_preferred_manual_target_parent_name(
+        self,
+        structure: StructureSliceContours,
+    ) -> Optional[str]:
+        if self.rtstruct is None:
+            return None
+
+        normalized_name = normalize_structure_name(structure.name)
+        if normalized_name not in self.additional_target_subvolume_names:
+            return None
+
+        candidate_parents: List[Tuple[int, str]] = []
+        for ptv_structure in self.get_sorted_ptv_structures():
+            parent_normalized_name = normalize_structure_name(ptv_structure.name)
+            if parent_normalized_name == normalized_name:
+                continue
+            if not self.structure_is_fully_encompassed(ptv_structure, structure):
+                continue
+            candidate_parents.append(
+                (
+                    self.get_structure_mask_voxel_count(ptv_structure),
+                    parent_normalized_name,
+                )
+            )
+
+        if not candidate_parents:
+            return None
+
+        _voxel_count, preferred_parent_name = min(
+            candidate_parents,
+            key=lambda item: (item[0], item[1]),
+        )
+        return preferred_parent_name
+
     def get_nested_target_structures(self, parent_structure: StructureSliceContours) -> List[StructureSliceContours]:
         if self.rtstruct is None:
             return []
@@ -4256,10 +4300,11 @@ h2 {{
                 continue
             if not self.is_listable_structure_name(normalized_name):
                 continue
-            if not (
-                self.is_nested_target_structure_name(normalized_name)
-                or normalized_name in self.additional_target_subvolume_names
-            ):
+            if normalized_name in self.additional_target_subvolume_names:
+                preferred_parent_name = self.get_preferred_manual_target_parent_name(structure)
+                if preferred_parent_name != parent_normalized_name:
+                    continue
+            elif not self.is_nested_target_structure_name(normalized_name):
                 continue
             if self.structure_is_fully_encompassed(parent_structure, structure):
                 nested_structures.append(structure)
