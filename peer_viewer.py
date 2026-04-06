@@ -218,6 +218,9 @@ QTableWidget, QListWidget {
   border: 1px solid #4f4f4f;
   alternate-background-color: #2b2b2b;
 }
+QTableWidget::item {
+  color: #f2f2f2;
+}
 QTableWidget::item:selected, QListWidget::item:selected {
   background-color: #3e7dd8;
   color: #ffffff;
@@ -5078,6 +5081,7 @@ h2 {{
 
         if not is_primary_ptv:
             label = QtWidgets.QLabel(coverage_text)
+            label.setStyleSheet("color: #f2f2f2;")
             layout.addWidget(label)
             layout.addStretch(1)
             return widget
@@ -5089,6 +5093,7 @@ h2 {{
 
         if prefix_text:
             label = QtWidgets.QLabel(prefix_text)
+            label.setStyleSheet("color: #f2f2f2;")
             layout.addWidget(label)
 
         dose_edit = QtWidgets.QLineEdit()
@@ -5210,6 +5215,7 @@ h2 {{
                 item = QtWidgets.QTableWidgetItem(text)
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
                 item.setBackground(background_color)
+                item.setForeground(QtGui.QColor("#f2f2f2"))
                 if column_index == 0 and text:
                     item.setForeground(QtGui.QColor(255, 255, 255))
                     font = item.font()
@@ -5231,6 +5237,7 @@ h2 {{
             note_item = QtWidgets.QTableWidgetItem(note_text)
             note_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
             note_item.setBackground(background_color)
+            note_item.setForeground(QtGui.QColor("#f2f2f2"))
             if note_text:
                 note_item.setToolTip(note_text)
             self.constraints_table.setItem(row_index, 4, note_item)
@@ -5382,6 +5389,7 @@ h2 {{
                 item = QtWidgets.QTableWidgetItem(text)
                 item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
                 item.setBackground(background_color)
+                item.setForeground(QtGui.QColor("#f2f2f2"))
                 if column_index == 4 and note_text:
                     item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
                     item.setToolTip(note_text)
