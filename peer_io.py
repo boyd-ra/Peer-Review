@@ -524,6 +524,20 @@ def _format_patient_name(name_value: object) -> str:
     text = str(name_value or "").strip()
     if not text:
         return ""
+    parts = [part.strip() for part in text.split("^")]
+    if len(parts) > 1:
+        family = parts[0] if len(parts) > 0 else ""
+        given = parts[1] if len(parts) > 1 else ""
+        middle = parts[2] if len(parts) > 2 else ""
+        prefix = parts[3] if len(parts) > 3 else ""
+        suffix = parts[4] if len(parts) > 4 else ""
+        reordered = " ".join(
+            part
+            for part in [prefix, given, middle, family, suffix]
+            if part
+        )
+        if reordered:
+            return reordered
     return " ".join(part for part in text.replace("^", " ").split() if part)
 
 

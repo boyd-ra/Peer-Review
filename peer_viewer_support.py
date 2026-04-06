@@ -334,7 +334,8 @@ class StructureListItemWidget(QtWidgets.QWidget):
             title_row_layout.setSpacing(6)
             if leading_button_text:
                 button = QtWidgets.QPushButton(leading_button_text)
-                button.setFixedWidth(34)
+                button_width = max(34, button.fontMetrics().horizontalAdvance(leading_button_text) + 18)
+                button.setFixedWidth(button_width)
                 button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
                 if leading_button_callback is not None:
                     button.clicked.connect(leading_button_callback)
@@ -375,7 +376,8 @@ class StructureListItemWidget(QtWidgets.QWidget):
             title_row_layout.addStretch(1)
             if trailing_button_text:
                 button = QtWidgets.QPushButton(trailing_button_text)
-                button.setFixedWidth(34)
+                button_width = max(40, button.fontMetrics().horizontalAdvance(trailing_button_text) + 18)
+                button.setFixedWidth(button_width)
                 button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
                 if trailing_button_callback is not None:
                     button.clicked.connect(trailing_button_callback)

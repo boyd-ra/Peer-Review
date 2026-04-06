@@ -4261,22 +4261,37 @@ h2 {{
             _phase, phase_rx_gy = phase_assignment
             if phase_rx_gy > 0.0:
                 return f"{phase_rx_gy:.2f}"
+
+        available_phases = [
+            phase
+            for phase in self.plan_phases
+            if phase.prescription_dose_gy > 0.0 and phase.dose_path
+        ]
+        is_five_fraction_fsrt = (
+            self.stereotactic_summary_enabled()
+            and bool(available_phases)
+            and {int(max(phase.fractions_planned, 0)) for phase in available_phases} == {5}
+        )
         digits = "".join(ch for ch in normalized_name if ch.isdigit())
         if digits:
             raw_value = int(digits)
+            if normalized_name.startswith("PTV") and is_five_fraction_fsrt and raw_value < 100:
+                if len(available_phases) == 1:
+                    return f"{available_phases[0].prescription_dose_gy:.2f}"
+                return f"{sum(phase.prescription_dose_gy for phase in available_phases):.2f}"
             if raw_value >= 100:
                 return f"{raw_value / 100.0:.2f}"
+        elif normalized_name.startswith("PTV") and is_five_fraction_fsrt:
+            if len(available_phases) == 1:
+                return f"{available_phases[0].prescription_dose_gy:.2f}"
+            return f"{sum(phase.prescription_dose_gy for phase in available_phases):.2f}"
 
         if self.stereotactic_summary_enabled():
             inferred_rx_gy = self.infer_srs_target_rx_gy_from_minimum_dose(normalized_name)
             if inferred_rx_gy is not None:
                 return f"{inferred_rx_gy:.2f}"
 
-        available_phase_rx = [
-            phase.prescription_dose_gy
-            for phase in self.plan_phases
-            if phase.prescription_dose_gy > 0.0 and phase.dose_path
-        ]
+        available_phase_rx = [phase.prescription_dose_gy for phase in available_phases]
         if len(available_phase_rx) == 1:
             return f"{available_phase_rx[0]:.2f}"
         if available_phase_rx:
@@ -4473,6 +4488,11 @@ h2 {{
         relevant_ptv_entries: List[Tuple[str, Dict[int, np.ndarray], Tuple[int, int, int, int, int, int]]] = []
         for ptv_structure in self.get_sorted_ptv_structures():
             ptv_normalized_name = normalize_structure_name(ptv_structure.name)
+            if ptv_normalized_name != normalized_name and (
+                self.structure_is_fully_encompassed(structure, ptv_structure)
+                or self.structure_is_fully_encompassed(ptv_structure, structure)
+            ):
+                continue
             ptv_masks = self.get_target_structure_slice_masks(ptv_structure)
             ptv_bbox = expanded_bbox_from_masks(ptv_masks)
             if ptv_bbox is None:
