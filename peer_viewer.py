@@ -310,9 +310,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_curve_cache: Dict[Tuple[str, str], Optional[DVHCurve]] = {}
         self.target_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
         self.stereotactic_metrics_cache: Dict[Tuple[str, str, float, int], Tuple[float, float, float, float, float]] = {}
+        self.stereotactic_volume_context_cache: Dict[Tuple[str, str, float], Optional[Dict[str, object]]] = {}
         self.max_tissue_dose_gy_cache: Optional[float] = None
         self.max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
         self.ptv_union_slice_mask_cache: Optional[Dict[int, np.ndarray]] = None
+        self.ptv_union_volume_mask_cache: Optional[np.ndarray] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
         self.target_containment_cache: Dict[str, List[str]] = {}
         self.structure_volume_mask_cache: Dict[str, np.ndarray] = {}
@@ -951,9 +953,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_curve_cache = {}
         self.target_metrics_cache = {}
         self.stereotactic_metrics_cache = {}
+        self.stereotactic_volume_context_cache = {}
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
         self.ptv_union_slice_mask_cache = None
+        self.ptv_union_volume_mask_cache = None
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
         self.structure_volume_mask_cache = {}
@@ -1063,7 +1067,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             if self.rtstruct_path:
                 self.show_progress_status("Loading structures", pump_events=True)
                 stage_start = perf_counter()
-                self.reload_rtstruct_from_current_selection(refresh_dvh=False, refresh_views=False)
+                self.reload_rtstruct_from_current_selection(
+                    refresh_dvh=False,
+                    refresh_views=False,
+                    refresh_lists=False,
+                )
                 timing_entries.append(("Load RTSTRUCT", perf_counter() - stage_start))
                 visible_range = self.get_visible_structure_slice_range()
                 if visible_range is not None:
@@ -1089,6 +1097,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.target_curve_cache = {}
                 self.target_metrics_cache = {}
                 self.stereotactic_metrics_cache = {}
+                self.stereotactic_volume_context_cache = {}
                 self.max_tissue_dose_gy_cache = None
                 self.max_tissue_index_zyx = None
                 self.cached_target_table_rows = None
@@ -1096,6 +1105,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             else:
                 timing_entries.append(("Load/merge RTDOSE", None))
                 timing_entries.append(("Resample dose to CT grid", None))
+
+            if self.rtstruct is not None:
+                self.populate_isodose_controls()
 
             stage_start = perf_counter()
             self.refresh_all_views()
@@ -1267,6 +1279,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
         self.target_containment_cache = {}
         self.stereotactic_metrics_cache = {}
+        self.stereotactic_volume_context_cache = {}
         self.cached_target_table_rows = None
         if refresh_lists:
             self.populate_structures_list()
@@ -1544,7 +1557,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             or self.image_view_bounds.coronal is not None
         )
 
-    def reload_rtstruct_from_current_selection(self, refresh_dvh: bool = True, refresh_views: bool = True):
+    def reload_rtstruct_from_current_selection(
+        self,
+        refresh_dvh: bool = True,
+        refresh_views: bool = True,
+        refresh_lists: bool = True,
+    ):
         if self.ct is None or not self.rtstruct_path:
             return
 
@@ -1558,16 +1576,19 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.target_curve_cache = {}
         self.target_metrics_cache = {}
         self.stereotactic_metrics_cache = {}
+        self.stereotactic_volume_context_cache = {}
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
         self.ptv_union_slice_mask_cache = None
+        self.ptv_union_volume_mask_cache = None
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
         self.structure_volume_mask_cache = {}
         self.structure_geometry_volume_cache = {}
         self.cached_target_table_rows = None
-        self.populate_structures_list()
-        self.populate_isodose_controls()
+        if refresh_lists:
+            self.populate_structures_list()
+            self.populate_isodose_controls()
         if refresh_dvh:
             self.refresh_dvh()
         if refresh_views:
@@ -3464,6 +3485,7 @@ h2 {{
         self.refresh_visible_structure_goal_evaluations()
         self.update_dvh_goal_evaluation_cache()
         self.update_dvh_secondary_metric_caches()
+        self.cached_target_table_rows = None
         self.update_structure_list_goal_texts()
         if self.selected_dvh_curve_name is not None and self.get_curve_for_name(self.selected_dvh_curve_name) is None:
             self.selected_dvh_curve_name = None
@@ -3472,8 +3494,6 @@ h2 {{
         else:
             self.dvh_status_label.setText("No structures produced DVH data on the current CT grid.")
             self.clear_dvh_curve_selection()
-        self.cached_target_table_rows = None
-        self.update_targets_table()
         self.render_dvh_plot()
         self.update_dvh_cache_button()
         self.update_background_dvh_timing_report(duration_s)
@@ -4101,6 +4121,19 @@ h2 {{
         self.ptv_union_slice_mask_cache = union_masks
         return union_masks
 
+    def get_ptv_union_volume_mask(self) -> Optional[np.ndarray]:
+        if self.ptv_union_volume_mask_cache is not None:
+            return self.ptv_union_volume_mask_cache
+        if self.ct is None:
+            return None
+
+        volume_mask = np.zeros(self.ct.volume_hu.shape, dtype=bool)
+        for slice_index, slice_mask in self.get_ptv_union_slice_masks().items():
+            if 0 <= slice_index < volume_mask.shape[0]:
+                volume_mask[slice_index] = slice_mask
+        self.ptv_union_volume_mask_cache = volume_mask
+        return volume_mask
+
     def get_local_structure_mask(
         self,
         structure: StructureSliceContours,
@@ -4368,6 +4401,189 @@ h2 {{
         volume_ct = np.stack(dose_planes, axis=0)
         self.phase_dose_volume_ct_cache[source_key] = volume_ct
         return volume_ct
+
+    def get_stereotactic_volume_context(
+        self,
+        structure: StructureSliceContours,
+        source_key: str,
+        minimum_threshold_gy: float,
+    ) -> Optional[Dict[str, object]]:
+        if self.ct is None or self.rtstruct is None or minimum_threshold_gy <= 0.0:
+            return None
+
+        normalized_name = normalize_structure_name(structure.name)
+        cache_key = (normalized_name, source_key, round(float(minimum_threshold_gy), 3))
+        if cache_key in self.stereotactic_volume_context_cache:
+            return self.stereotactic_volume_context_cache[cache_key]
+
+        try:
+            from scipy.ndimage import distance_transform_edt  # type: ignore
+        except Exception:  # pragma: no cover - optional runtime dependency
+            self.stereotactic_volume_context_cache[cache_key] = None
+            return None
+
+        dose_volume_ct = self.get_target_dose_volume_ct(source_key)
+        if dose_volume_ct is None:
+            self.stereotactic_volume_context_cache[cache_key] = None
+            return None
+
+        support_mask = np.asarray(dose_volume_ct >= float(minimum_threshold_gy), dtype=bool)
+        if not np.any(support_mask):
+            self.stereotactic_volume_context_cache[cache_key] = None
+            return None
+
+        relevant_ptv_entries = self.get_stereotactic_competing_ptv_entries(structure)
+        if not relevant_ptv_entries:
+            self.stereotactic_volume_context_cache[cache_key] = None
+            return None
+
+        coords = np.argwhere(support_mask)
+        z_start = int(np.min(coords[:, 0]))
+        z_end = int(np.max(coords[:, 0]))
+        row_start = int(np.min(coords[:, 1]))
+        row_end = int(np.max(coords[:, 1]))
+        col_start = int(np.min(coords[:, 2]))
+        col_end = int(np.max(coords[:, 2]))
+
+        for _ptv_name, ptv_masks in relevant_ptv_entries:
+            slice_indices = sorted(ptv_masks)
+            if slice_indices:
+                z_start = min(z_start, slice_indices[0])
+                z_end = max(z_end, slice_indices[-1])
+            for slice_mask in ptv_masks.values():
+                coords_2d = np.argwhere(slice_mask)
+                if coords_2d.size == 0:
+                    continue
+                row_start = min(row_start, int(np.min(coords_2d[:, 0])))
+                row_end = max(row_end, int(np.max(coords_2d[:, 0])))
+                col_start = min(col_start, int(np.min(coords_2d[:, 1])))
+                col_end = max(col_end, int(np.max(coords_2d[:, 1])))
+
+        dose_block = np.asarray(
+            dose_volume_ct[
+                z_start: z_end + 1,
+                row_start: row_end + 1,
+                col_start: col_end + 1,
+            ],
+            dtype=np.float32,
+        )
+        if dose_block.size == 0:
+            self.stereotactic_volume_context_cache[cache_key] = None
+            return None
+
+        local_shape = dose_block.shape
+        local_ptv_masks: List[np.ndarray] = []
+        target_index: Optional[int] = None
+        for index, (ptv_normalized_name, ptv_masks) in enumerate(relevant_ptv_entries):
+            local_mask = np.zeros(local_shape, dtype=bool)
+            for slice_index, slice_mask in ptv_masks.items():
+                if slice_index < z_start or slice_index > z_end:
+                    continue
+                local_z = slice_index - z_start
+                local_mask[local_z] = slice_mask[row_start: row_end + 1, col_start: col_end + 1]
+            local_ptv_masks.append(local_mask)
+            if ptv_normalized_name == normalized_name:
+                target_index = index
+
+        if target_index is None:
+            self.stereotactic_volume_context_cache[cache_key] = None
+            return None
+
+        voxel_volume_cc = float(np.prod(self.ct.spacing_xyz_mm) / 1000.0)
+        if len(local_ptv_masks) == 1:
+            target_weight = np.ones(local_shape, dtype=np.float32)
+        else:
+            sampling = (
+                float(self.ct.spacing_xyz_mm[2]),
+                float(self.ct.spacing_xyz_mm[1]),
+                float(self.ct.spacing_xyz_mm[0]),
+            )
+            eligible_distance_stack = np.stack(
+                [
+                    np.where(
+                        local_mask,
+                        distance_transform_edt(local_mask, sampling=sampling),
+                        distance_transform_edt(~local_mask, sampling=sampling),
+                    )
+                    for local_mask in local_ptv_masks
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
+            min_distance = np.min(eligible_distance_stack, axis=0)
+            finite_mask = np.isfinite(min_distance)
+            if not np.any(finite_mask):
+                self.stereotactic_volume_context_cache[cache_key] = None
+                return None
+
+            tie_mask = np.isclose(
+                eligible_distance_stack,
+                min_distance[None, ...],
+                atol=1e-6,
+            ) & np.isfinite(eligible_distance_stack)
+            tie_count = np.sum(tie_mask, axis=0)
+            target_weight = np.where(
+                finite_mask & tie_mask[target_index],
+                1.0 / np.maximum(tie_count, 1),
+                0.0,
+            ).astype(np.float32, copy=False)
+
+        context: Dict[str, object] = {
+            "target_weight": target_weight,
+            "dose_block": dose_block,
+            "voxel_volume_cc": voxel_volume_cc,
+            "z_start": z_start,
+            "z_end": z_end,
+            "row_start": row_start,
+            "row_end": row_end,
+            "col_start": col_start,
+            "col_end": col_end,
+        }
+        self.stereotactic_volume_context_cache[cache_key] = context
+        return context
+
+    def localize_stereotactic_extra_mask(
+        self,
+        context: Dict[str, object],
+        extra_mask: Optional[np.ndarray],
+    ) -> Optional[np.ndarray]:
+        if extra_mask is None:
+            return None
+
+        z_start = int(context["z_start"])
+        z_end = int(context["z_end"])
+        row_start = int(context["row_start"])
+        row_end = int(context["row_end"])
+        col_start = int(context["col_start"])
+        col_end = int(context["col_end"])
+        return np.asarray(
+            extra_mask[
+                z_start: z_end + 1,
+                row_start: row_end + 1,
+                col_start: col_end + 1,
+            ],
+            dtype=bool,
+        )
+
+    def compute_stereotactic_owned_volume_cc(
+        self,
+        context: Dict[str, object],
+        threshold_gy: float,
+        extra_mask: Optional[np.ndarray] = None,
+    ) -> float:
+        if threshold_gy <= 0.0:
+            return 0.0
+
+        target_weight = np.asarray(context["target_weight"], dtype=np.float32)
+        dose_block = np.asarray(context["dose_block"], dtype=np.float32)
+        voxel_volume_cc = float(context["voxel_volume_cc"])
+
+        isodose_mask = np.asarray(dose_block >= float(threshold_gy), dtype=bool)
+        localized_extra_mask = self.localize_stereotactic_extra_mask(context, extra_mask)
+        if localized_extra_mask is not None:
+            isodose_mask &= localized_extra_mask
+        if not np.any(isodose_mask):
+            return 0.0
+        return float(np.sum(target_weight[isodose_mask]) * voxel_volume_cc)
 
     def get_target_high_accuracy_curve(
         self,
@@ -4992,15 +5208,26 @@ h2 {{
         ptv_volume_cc = self.get_structure_geometry_volume_cc(structure)
         if ptv_volume_cc <= 0.0:
             return "", "", "", "", ""
-        ci_isodose_volume_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
+        ownership_thresholds = [threshold_gy, threshold_gy * 0.5]
+        if fractions_planned == 1:
+            ownership_thresholds.append(12.0)
+        elif fractions_planned == 5:
+            ownership_thresholds.append(24.0)
+        context = self.get_stereotactic_volume_context(
             structure,
             source_key,
+            min(ownership_thresholds),
+        )
+        if context is None:
+            return "", "", "", "", ""
+
+        ci_isodose_volume_cc = self.compute_stereotactic_owned_volume_cc(
+            context,
             threshold_gy,
         )
         gi_reference_volume_cc = ci_isodose_volume_cc
-        gradient_isodose_volume_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
-            structure,
-            source_key,
+        gradient_isodose_volume_cc = self.compute_stereotactic_owned_volume_cc(
+            context,
             threshold_gy * 0.5,
         )
         ci_value = ci_isodose_volume_cc / ptv_volume_cc
@@ -5023,17 +5250,15 @@ h2 {{
                     for nested_gtv_structure in nested_gtv_structures:
                         gtv_union_mask |= self.get_structure_volume_mask(nested_gtv_structure)
                     extra_mask = extra_mask & ~gtv_union_mask
-                brain_metric_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
-                    structure,
-                    source_key,
+                brain_metric_cc = self.compute_stereotactic_owned_volume_cc(
+                    context,
                     12.0,
                     extra_mask=extra_mask,
                 )
                 brain_metric_text = f"V12Gy (Brain-GTV) {brain_metric_cc:.1f} cc"
             elif fractions_planned == 5:
-                brain_metric_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
-                    structure,
-                    source_key,
+                brain_metric_cc = self.compute_stereotactic_owned_volume_cc(
+                    context,
                     24.0,
                     extra_mask=extra_mask,
                 )
@@ -5468,6 +5693,7 @@ h2 {{
         else:
             edit.clear()
         self.stereotactic_metrics_cache = {}
+        self.stereotactic_volume_context_cache = {}
         self.cached_target_table_rows = None
         self.update_targets_table()
 
@@ -5753,17 +5979,25 @@ h2 {{
     def get_dvh_structure_secondary_text(self, normalized_name: str) -> Tuple[Optional[str], Optional[str]]:
         parts: List[str] = []
 
-        structure = self.get_structure_by_normalized_name(normalized_name)
-        if structure is not None:
-            volume_cc = self.get_structure_geometry_volume_cc(structure)
-        else:
-            volume_cc = self.dvh_structure_volume_cache.get(normalized_name)
+        volume_cc = self.dvh_structure_volume_cache.get(normalized_name)
+        if volume_cc is None:
+            structure = self.get_structure_by_normalized_name(normalized_name)
+            if structure is not None:
+                volume_cc = self.get_structure_geometry_volume_cc(structure)
+                self.dvh_structure_volume_cache[normalized_name] = volume_cc
         if volume_cc is not None:
             parts.append(f"Vol {volume_cc:.2f} cc")
 
         if not parts:
             return None, None
         return "   ".join(parts), "#d0d0d0"
+
+    def get_dvh_structure_item_options(self, normalized_name: str) -> Dict[str, object]:
+        secondary_text, secondary_text_color = self.get_dvh_structure_secondary_text(normalized_name)
+        return {
+            "secondary_text": secondary_text,
+            "secondary_text_color": secondary_text_color,
+        }
 
     def get_structure_by_normalized_name(self, normalized_name: str) -> Optional[StructureSliceContours]:
         if self.rtstruct is None:
@@ -5826,34 +6060,28 @@ h2 {{
             ):
                 return []
 
-            max_tissue_dose_gy: Optional[float] = None
-            max_tissue_index: Optional[Tuple[int, int, int]] = None
-            total_slices = self.sampled_dose_volume_ct.shape[0]
-            for slice_index in range(total_slices):
-                dose_plane = self.sampled_dose_volume_ct[slice_index]
-                ptv_union_mask = ptv_union_masks.get(slice_index)
-                if ptv_union_mask is not None and ptv_union_mask.shape != dose_plane.shape:
-                    continue
-
-                if ptv_union_mask is None:
-                    tissue_mask = np.isfinite(dose_plane)
+            tissue_mask = np.isfinite(self.sampled_dose_volume_ct)
+            ptv_union_volume_mask = self.get_ptv_union_volume_mask()
+            if ptv_union_volume_mask is not None and ptv_union_volume_mask.shape == tissue_mask.shape:
+                tissue_mask &= ~ptv_union_volume_mask
+            if np.any(tissue_mask):
+                tissue_dose_volume = np.where(tissue_mask, self.sampled_dose_volume_ct, -np.inf)
+                max_tissue_dose_gy = float(np.max(tissue_dose_volume))
+                if np.isfinite(max_tissue_dose_gy):
+                    flat_index = int(np.argmax(tissue_dose_volume))
+                    max_index = np.unravel_index(flat_index, tissue_dose_volume.shape)
+                    self.max_tissue_dose_gy_cache = max_tissue_dose_gy
+                    self.max_tissue_index_zyx = (
+                        int(max_index[0]),
+                        int(max_index[1]),
+                        int(max_index[2]),
+                    )
                 else:
-                    tissue_mask = np.isfinite(dose_plane) & ~ptv_union_mask
-                if not np.any(tissue_mask):
-                    continue
-
-                tissue_dose_plane = np.where(tissue_mask, dose_plane, -np.inf)
-                slice_max = float(np.max(tissue_dose_plane))
-                if not np.isfinite(slice_max):
-                    continue
-                if max_tissue_dose_gy is None or slice_max > max_tissue_dose_gy:
-                    max_tissue_dose_gy = slice_max
-                    flat_index = int(np.argmax(tissue_dose_plane))
-                    max_row, max_col = np.unravel_index(flat_index, tissue_dose_plane.shape)
-                    max_tissue_index = (slice_index, int(max_row), int(max_col))
-
-            self.max_tissue_dose_gy_cache = max_tissue_dose_gy
-            self.max_tissue_index_zyx = max_tissue_index
+                    self.max_tissue_dose_gy_cache = None
+                    self.max_tissue_index_zyx = None
+            else:
+                self.max_tissue_dose_gy_cache = None
+                self.max_tissue_index_zyx = None
 
         if self.max_tissue_dose_gy_cache is None:
             return []
@@ -5955,10 +6183,7 @@ h2 {{
                 normalized_name.startswith("PTV")
                 or normalized_name in self.structure_goals_by_name
             ),
-            item_options_getter=lambda normalized_name: {
-                "secondary_text": self.get_dvh_structure_secondary_text(normalized_name)[0],
-                "secondary_text_color": self.get_dvh_structure_secondary_text(normalized_name)[1],
-            },
+            item_options_getter=self.get_dvh_structure_item_options,
         )
         self.update_constraints_table()
         self.update_targets_table()
