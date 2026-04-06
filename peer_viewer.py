@@ -27,11 +27,11 @@ except Exception:  # pragma: no cover - optional runtime dependency
 from peer_helpers import (
     build_structure_slice_mask,
     build_outline_series,
-    compute_isodose_volume_within_structure_margin_cc,
     compute_image_view_bounds,
     compute_single_structure_high_accuracy_curve,
     dose_at_volume_cc,
     dose_to_rgba,
+    estimate_structure_geometry_metrics,
     evaluate_structure_goal,
     fill_binary_holes_2d,
     get_dvh_method_signature,
@@ -306,6 +306,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraint_workbook_error: Optional[str] = None
         self.phase_dose_volumes_by_path: Dict[str, DoseVolume] = {}
         self.phase_dose_plane_cache: Dict[Tuple[str, int], np.ndarray] = {}
+        self.phase_dose_volume_ct_cache: Dict[str, np.ndarray] = {}
         self.target_curve_cache: Dict[Tuple[str, str], Optional[DVHCurve]] = {}
         self.target_metrics_cache: Dict[Tuple[str, str, float], Tuple[float, float, float]] = {}
         self.stereotactic_metrics_cache: Dict[Tuple[str, str, float, int], Tuple[float, float, float, float, float]] = {}
@@ -314,6 +315,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.ptv_union_slice_mask_cache: Optional[Dict[int, np.ndarray]] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
         self.target_containment_cache: Dict[str, List[str]] = {}
+        self.structure_volume_mask_cache: Dict[str, np.ndarray] = {}
+        self.structure_geometry_volume_cache: Dict[str, float] = {}
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
         self.defer_sidebar_summary_metrics: bool = False
         self.stereotactic_target_dose_text_by_name: Dict[str, str] = {}
@@ -943,6 +946,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_structure_goal_evaluation_cache = {}
         self.phase_dose_volumes_by_path = {}
         self.phase_dose_plane_cache = {}
+        self.phase_dose_volume_ct_cache = {}
         self.target_curve_cache = {}
         self.target_metrics_cache = {}
         self.stereotactic_metrics_cache = {}
@@ -951,6 +955,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.ptv_union_slice_mask_cache = None
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
+        self.structure_volume_mask_cache = {}
+        self.structure_geometry_volume_cache = {}
         self.cached_target_table_rows = None
         self.defer_sidebar_summary_metrics = False
         self.targets_table_refresh_pending = False
@@ -1510,6 +1516,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.ptv_union_slice_mask_cache = None
         self.target_slice_mask_cache = {}
         self.target_containment_cache = {}
+        self.structure_volume_mask_cache = {}
+        self.structure_geometry_volume_cache = {}
         self.cached_target_table_rows = None
         self.populate_structures_list()
         self.populate_isodose_controls()
@@ -3096,7 +3104,11 @@ h2 {{
     def update_dvh_secondary_metric_caches(self) -> None:
         for curve in self.dvh_curves:
             normalized_name = normalize_structure_name(curve.name)
-            self.dvh_structure_volume_cache[normalized_name] = float(curve.volume_cc)
+            structure = self.get_structure_by_normalized_name(normalized_name)
+            if structure is not None:
+                self.dvh_structure_volume_cache[normalized_name] = self.get_structure_geometry_volume_cc(structure)
+            else:
+                self.dvh_structure_volume_cache[normalized_name] = float(curve.volume_cc)
 
         cached_target_rows = self.cached_target_table_rows or []
         for row in cached_target_rows:
@@ -4041,6 +4053,41 @@ h2 {{
             local_mask[local_z] = slice_mask[row_start: row_end + 1, col_start: col_end + 1]
         return local_mask
 
+    def get_structure_volume_mask(self, structure: StructureSliceContours) -> np.ndarray:
+        if self.ct is None:
+            return np.zeros((0, 0, 0), dtype=bool)
+
+        normalized_name = normalize_structure_name(structure.name)
+        cached_mask = self.structure_volume_mask_cache.get(normalized_name)
+        if cached_mask is not None:
+            return cached_mask
+
+        volume_mask = np.zeros(self.ct.volume_hu.shape, dtype=bool)
+        for slice_index, slice_mask in self.get_target_structure_slice_masks(structure).items():
+            if 0 <= slice_index < volume_mask.shape[0]:
+                volume_mask[slice_index] = slice_mask
+        self.structure_volume_mask_cache[normalized_name] = volume_mask
+        return volume_mask
+
+    def get_structure_geometry_volume_cc(self, structure: StructureSliceContours) -> float:
+        if self.ct is None or self.dose is None:
+            return 0.0
+
+        normalized_name = normalize_structure_name(structure.name)
+        cached_volume_cc = self.structure_geometry_volume_cache.get(normalized_name)
+        if cached_volume_cc is not None:
+            return cached_volume_cc
+
+        metrics = estimate_structure_geometry_metrics(
+            self.ct,
+            self.dose,
+            structure,
+            structure_mask_cache=self.get_target_structure_slice_masks(structure),
+        )
+        volume_cc = float(metrics.volume_mm3 / 1000.0)
+        self.structure_geometry_volume_cache[normalized_name] = volume_cc
+        return volume_cc
+
     def get_brain_structure(self) -> Optional[StructureSliceContours]:
         if self.rtstruct is None:
             return None
@@ -4055,6 +4102,28 @@ h2 {{
             if normalized_name.startswith("BRAIN") and "BRAINSTEM" not in normalized_name:
                 fallback_match = structure
         return preferred_match or fallback_match
+
+    def get_stereotactic_competing_ptv_entries(
+        self,
+        structure: StructureSliceContours,
+    ) -> List[Tuple[str, Dict[int, np.ndarray]]]:
+        if self.rtstruct is None:
+            return []
+
+        normalized_name = normalize_structure_name(structure.name)
+        entries: List[Tuple[str, Dict[int, np.ndarray]]] = []
+        for ptv_structure in self.get_sorted_ptv_structures():
+            ptv_normalized_name = normalize_structure_name(ptv_structure.name)
+            if ptv_normalized_name != normalized_name and (
+                self.structure_is_fully_encompassed(structure, ptv_structure)
+                or self.structure_is_fully_encompassed(ptv_structure, structure)
+            ):
+                continue
+            ptv_masks = self.get_target_structure_slice_masks(ptv_structure)
+            if not ptv_masks:
+                continue
+            entries.append((ptv_normalized_name, ptv_masks))
+        return entries
 
     def structure_is_fully_encompassed(
         self,
@@ -4159,6 +4228,29 @@ h2 {{
         if source_key == "combined":
             return self.dose
         return self.get_phase_dose_volume(source_key)
+
+    def get_target_dose_volume_ct(self, source_key: str) -> Optional[np.ndarray]:
+        if self.ct is None:
+            return None
+        if source_key == "combined":
+            return self.sampled_dose_volume_ct
+
+        cached = self.phase_dose_volume_ct_cache.get(source_key)
+        if cached is not None:
+            return cached
+
+        dose_planes: List[np.ndarray] = []
+        for slice_index in range(self.ct.volume_hu.shape[0]):
+            dose_plane = self.get_phase_dose_plane(source_key, slice_index)
+            if dose_plane is None:
+                return None
+            dose_planes.append(np.asarray(dose_plane, dtype=np.float32))
+        if not dose_planes:
+            return None
+
+        volume_ct = np.stack(dose_planes, axis=0)
+        self.phase_dose_volume_ct_cache[source_key] = volume_ct
+        return volume_ct
 
     def get_target_high_accuracy_curve(
         self,
@@ -4486,14 +4578,7 @@ h2 {{
             )
 
         relevant_ptv_entries: List[Tuple[str, Dict[int, np.ndarray], Tuple[int, int, int, int, int, int]]] = []
-        for ptv_structure in self.get_sorted_ptv_structures():
-            ptv_normalized_name = normalize_structure_name(ptv_structure.name)
-            if ptv_normalized_name != normalized_name and (
-                self.structure_is_fully_encompassed(structure, ptv_structure)
-                or self.structure_is_fully_encompassed(ptv_structure, structure)
-            ):
-                continue
-            ptv_masks = self.get_target_structure_slice_masks(ptv_structure)
+        for ptv_normalized_name, ptv_masks in self.get_stereotactic_competing_ptv_entries(structure):
             ptv_bbox = expanded_bbox_from_masks(ptv_masks)
             if ptv_bbox is None:
                 continue
@@ -4618,6 +4703,125 @@ h2 {{
 
         return float(np.sum(target_weight[isodose_mask]) * voxel_volume_cc)
 
+    def compute_partitioned_nearest_ptv_threshold_volume_cc(
+        self,
+        structure: StructureSliceContours,
+        source_key: str,
+        threshold_gy: float,
+        extra_mask: Optional[np.ndarray] = None,
+    ) -> float:
+        if self.ct is None or self.rtstruct is None or threshold_gy <= 0.0:
+            return 0.0
+
+        try:
+            from scipy.ndimage import distance_transform_edt  # type: ignore
+        except Exception:  # pragma: no cover - optional runtime dependency
+            return 0.0
+
+        dose_volume_ct = self.get_target_dose_volume_ct(source_key)
+        if dose_volume_ct is None:
+            return 0.0
+
+        isodose_mask = np.asarray(dose_volume_ct >= float(threshold_gy), dtype=bool)
+        if extra_mask is not None:
+            isodose_mask &= np.asarray(extra_mask, dtype=bool)
+        if not np.any(isodose_mask):
+            return 0.0
+
+        relevant_ptv_entries = self.get_stereotactic_competing_ptv_entries(structure)
+        if not relevant_ptv_entries:
+            return 0.0
+
+        coords = np.argwhere(isodose_mask)
+        z_start = int(np.min(coords[:, 0]))
+        z_end = int(np.max(coords[:, 0]))
+        row_start = int(np.min(coords[:, 1]))
+        row_end = int(np.max(coords[:, 1]))
+        col_start = int(np.min(coords[:, 2]))
+        col_end = int(np.max(coords[:, 2]))
+
+        for _ptv_name, ptv_masks in relevant_ptv_entries:
+            slice_indices = sorted(ptv_masks)
+            if slice_indices:
+                z_start = min(z_start, slice_indices[0])
+                z_end = max(z_end, slice_indices[-1])
+            for slice_mask in ptv_masks.values():
+                coords_2d = np.argwhere(slice_mask)
+                if coords_2d.size == 0:
+                    continue
+                row_start = min(row_start, int(np.min(coords_2d[:, 0])))
+                row_end = max(row_end, int(np.max(coords_2d[:, 0])))
+                col_start = min(col_start, int(np.min(coords_2d[:, 1])))
+                col_end = max(col_end, int(np.max(coords_2d[:, 1])))
+
+        local_threshold_mask = isodose_mask[
+            z_start: z_end + 1,
+            row_start: row_end + 1,
+            col_start: col_end + 1,
+        ]
+        if not np.any(local_threshold_mask):
+            return 0.0
+
+        local_shape = local_threshold_mask.shape
+        local_ptv_masks: List[np.ndarray] = []
+        target_index: Optional[int] = None
+        target_normalized_name = normalize_structure_name(structure.name)
+        for index, (ptv_normalized_name, ptv_masks) in enumerate(relevant_ptv_entries):
+            local_mask = np.zeros(local_shape, dtype=bool)
+            for slice_index, slice_mask in ptv_masks.items():
+                if slice_index < z_start or slice_index > z_end:
+                    continue
+                local_z = slice_index - z_start
+                local_mask[local_z] = slice_mask[row_start: row_end + 1, col_start: col_end + 1]
+            local_ptv_masks.append(local_mask)
+            if ptv_normalized_name == target_normalized_name:
+                target_index = index
+
+        if target_index is None:
+            return 0.0
+
+        voxel_volume_cc = float(np.prod(self.ct.spacing_xyz_mm) / 1000.0)
+        if len(local_ptv_masks) == 1:
+            return float(np.count_nonzero(local_threshold_mask)) * voxel_volume_cc
+
+        sampling = (
+            float(self.ct.spacing_xyz_mm[2]),
+            float(self.ct.spacing_xyz_mm[1]),
+            float(self.ct.spacing_xyz_mm[0]),
+        )
+        eligible_distance_stack = np.stack(
+            [
+                np.where(
+                    local_threshold_mask,
+                    np.where(
+                        local_mask,
+                        distance_transform_edt(local_mask, sampling=sampling),
+                        distance_transform_edt(~local_mask, sampling=sampling),
+                    ),
+                    np.inf,
+                )
+                for local_mask in local_ptv_masks
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+        min_distance = np.min(eligible_distance_stack, axis=0)
+        finite_mask = np.isfinite(min_distance) & local_threshold_mask
+        if not np.any(finite_mask):
+            return 0.0
+
+        tie_mask = np.isclose(
+            eligible_distance_stack,
+            min_distance[None, ...],
+            atol=1e-6,
+        ) & np.isfinite(eligible_distance_stack)
+        tie_count = np.sum(tie_mask, axis=0)
+        target_weight = np.where(
+            finite_mask & tie_mask[target_index],
+            1.0 / np.maximum(tie_count, 1),
+            0.0,
+        ).astype(np.float32, copy=False)
+        return float(np.sum(target_weight[local_threshold_mask]) * voxel_volume_cc)
+
     def get_target_fraction_count(
         self,
         normalized_name: str,
@@ -4668,36 +4872,20 @@ h2 {{
                 brain_metric_text,
             )
 
-        curve = self.get_target_high_accuracy_curve(structure, source_key)
-        if curve is None or curve.volume_cc <= 0.0:
+        ptv_volume_cc = self.get_structure_geometry_volume_cc(structure)
+        if ptv_volume_cc <= 0.0:
             return "", "", "", "", ""
-        ptv_volume_cc = float(curve.volume_cc)
-        ci_context = self.build_partitioned_stereotactic_context(
+        ci_isodose_volume_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
             structure,
             source_key,
-            margin_mm=5.0,
+            threshold_gy,
         )
-        gi_context = self.build_partitioned_stereotactic_context(
+        gi_reference_volume_cc = ci_isodose_volume_cc
+        gradient_isodose_volume_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
             structure,
             source_key,
-            margin_mm=10.0,
+            threshold_gy * 0.5,
         )
-        if ci_context is None or gi_context is None:
-            return "", "", "", "", ""
-        dose_volume = self.get_target_dose_volume(source_key)
-        if dose_volume is not None and int(ci_context.get("relevant_ptv_count", 1)) <= 1:
-            ci_isodose_volume_cc = compute_isodose_volume_within_structure_margin_cc(
-                self.ct,
-                dose_volume,
-                structure,
-                threshold_gy,
-                proximity_mm=5.0,
-                structure_mask_cache=self.get_target_structure_slice_masks(structure),
-            )
-        else:
-            ci_isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(ci_context, threshold_gy)
-        gi_reference_volume_cc = self.compute_partitioned_stereotactic_volume_cc(gi_context, threshold_gy)
-        gradient_isodose_volume_cc = self.compute_partitioned_stereotactic_volume_cc(gi_context, threshold_gy * 0.5)
         ci_value = ci_isodose_volume_cc / ptv_volume_cc
         coverage_decimal = float(np.clip(coverage_pct / 100.0, 0.0, 1.0))
         pci_value = float((coverage_decimal ** 2) / ci_value) if ci_value > 0.0 else 0.0
@@ -4706,22 +4894,7 @@ h2 {{
         brain_metric_text = ""
         brain_structure = self.get_brain_structure()
         if brain_structure is not None and fractions_planned in {1, 5}:
-            z_start = int(gi_context["z_start"])
-            z_end = int(gi_context["z_end"])
-            row_start = int(gi_context["row_start"])
-            row_end = int(gi_context["row_end"])
-            col_start = int(gi_context["col_start"])
-            col_end = int(gi_context["col_end"])
-            brain_local_mask = self.get_local_structure_mask(
-                brain_structure,
-                z_start,
-                z_end,
-                row_start,
-                row_end,
-                col_start,
-                col_end,
-            )
-            extra_mask = brain_local_mask
+            extra_mask = self.get_structure_volume_mask(brain_structure)
             if fractions_planned == 1:
                 nested_gtv_structures = [
                     nested_structure
@@ -4729,27 +4902,21 @@ h2 {{
                     if normalize_structure_name(nested_structure.name).startswith("GTV")
                 ]
                 if nested_gtv_structures:
-                    gtv_union_mask = np.zeros_like(brain_local_mask, dtype=bool)
+                    gtv_union_mask = np.zeros_like(extra_mask, dtype=bool)
                     for nested_gtv_structure in nested_gtv_structures:
-                        gtv_union_mask |= self.get_local_structure_mask(
-                            nested_gtv_structure,
-                            z_start,
-                            z_end,
-                            row_start,
-                            row_end,
-                            col_start,
-                            col_end,
-                        )
-                    extra_mask = brain_local_mask & ~gtv_union_mask
-                brain_metric_cc = self.compute_partitioned_stereotactic_volume_cc(
-                    gi_context,
+                        gtv_union_mask |= self.get_structure_volume_mask(nested_gtv_structure)
+                    extra_mask = extra_mask & ~gtv_union_mask
+                brain_metric_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
+                    structure,
+                    source_key,
                     12.0,
                     extra_mask=extra_mask,
                 )
                 brain_metric_text = f"V12Gy (Brain-GTV) {brain_metric_cc:.1f} cc"
             elif fractions_planned == 5:
-                brain_metric_cc = self.compute_partitioned_stereotactic_volume_cc(
-                    gi_context,
+                brain_metric_cc = self.compute_partitioned_nearest_ptv_threshold_volume_cc(
+                    structure,
+                    source_key,
                     24.0,
                     extra_mask=extra_mask,
                 )
@@ -5467,11 +5634,11 @@ h2 {{
         return lines
 
     def get_dvh_structure_secondary_text(self, normalized_name: str) -> Tuple[Optional[str], Optional[str]]:
-        curve = self.get_curve_for_name(normalized_name)
         parts: List[str] = []
 
-        if curve is not None:
-            volume_cc = float(curve.volume_cc)
+        structure = self.get_structure_by_normalized_name(normalized_name)
+        if structure is not None:
+            volume_cc = self.get_structure_geometry_volume_cc(structure)
         else:
             volume_cc = self.dvh_structure_volume_cache.get(normalized_name)
         if volume_cc is not None:
