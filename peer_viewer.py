@@ -1125,9 +1125,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.populate_isodose_controls()
 
             stage_start = perf_counter()
-            self.refresh_all_views()
+            self.update_display()
             self.apply_image_based_view_ranges()
-            timing_entries.append(("Refresh views", perf_counter() - stage_start))
+            timing_entries.append(("Refresh axial view", perf_counter() - stage_start))
 
             self.latest_timing_entries = list(timing_entries)
             self.latest_timing_folder = folder
@@ -1150,7 +1150,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             if self.rtstruct is not None and self.ct is not None:
                 if cache_loaded:
                     self.populate_structures_list()
+                    stage_start = perf_counter()
                     self.refresh_all_views()
+                    timing_entries.append(("Refresh full views", perf_counter() - stage_start))
                     self.render_dvh_plot()
                     if self.dvh_curves:
                         self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
@@ -1162,7 +1164,13 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
                     self.show_progress_status("Computing metrics", pump_events=True)
                     self.populate_structures_list()
+                    stage_start = perf_counter()
                     self.refresh_all_views()
+                    timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+            elif self.ct is not None:
+                stage_start = perf_counter()
+                self.refresh_orthogonal_views_from_controls()
+                timing_entries.append(("Refresh full views", perf_counter() - stage_start))
             if cache_loaded:
                 self.show_progress_status("Loaded saved JSON cache")
             timing_entries.append(("Load saved DVH cache", cache_load_duration))
@@ -4897,32 +4905,65 @@ h2 {{
 
     def get_default_stereotactic_dose_text(self, structure_name: str) -> str:
         normalized_name = normalize_structure_name(structure_name)
-        phase_assignment = self.get_phase_target_assignments().get(normalized_name)
-        if phase_assignment is not None:
-            _phase, phase_rx_gy = phase_assignment
-            if phase_rx_gy > 0.0:
-                return f"{phase_rx_gy:.2f}"
-
         available_phases = [
             phase
             for phase in self.plan_phases
             if phase.prescription_dose_gy > 0.0 and phase.dose_path
         ]
-        is_five_fraction_fsrt = (
+        fraction_counts = {
+            int(max(phase.fractions_planned, 0))
+            for phase in available_phases
+            if phase.fractions_planned > 0
+        }
+        is_single_fraction_srs = (
             self.stereotactic_summary_enabled()
             and bool(available_phases)
-            and {int(max(phase.fractions_planned, 0)) for phase in available_phases} == {5}
+            and fraction_counts == {1}
         )
+        is_multifraction_fsrt = (
+            self.stereotactic_summary_enabled()
+            and bool(available_phases)
+            and len(fraction_counts) == 1
+            and next(iter(fraction_counts), 0) > 1
+        )
+
         digits = "".join(ch for ch in normalized_name if ch.isdigit())
-        if digits:
-            raw_value = int(digits)
-            if normalized_name.startswith("PTV") and is_five_fraction_fsrt and raw_value < 100:
+        raw_value = int(digits) if digits else None
+        if raw_value is not None and raw_value >= 100:
+            return f"{raw_value / 100.0:.2f}"
+
+        phase_assignment = self.get_phase_target_assignments().get(normalized_name)
+        is_ambiguous_stereotactic_ptv = (
+            normalized_name.startswith("PTV")
+            and self.stereotactic_summary_enabled()
+            and (raw_value is None or raw_value < 100)
+        )
+        if is_ambiguous_stereotactic_ptv:
+            if is_single_fraction_srs:
+                inferred_rx_gy = self.infer_srs_target_rx_gy_from_minimum_dose(normalized_name)
+                if inferred_rx_gy is not None:
+                    return f"{inferred_rx_gy:.2f}"
+            if is_multifraction_fsrt:
+                if phase_assignment is not None:
+                    _phase, phase_rx_gy = phase_assignment
+                    if phase_rx_gy > 0.0:
+                        return f"{phase_rx_gy:.2f}"
                 if len(available_phases) == 1:
                     return f"{available_phases[0].prescription_dose_gy:.2f}"
                 return f"{sum(phase.prescription_dose_gy for phase in available_phases):.2f}"
-            if raw_value >= 100:
-                return f"{raw_value / 100.0:.2f}"
-        elif normalized_name.startswith("PTV") and is_five_fraction_fsrt:
+
+        if phase_assignment is not None:
+            _phase, phase_rx_gy = phase_assignment
+            if phase_rx_gy > 0.0:
+                return f"{phase_rx_gy:.2f}"
+
+        if digits:
+            raw_value = int(digits)
+            if normalized_name.startswith("PTV") and is_multifraction_fsrt and raw_value < 100:
+                if len(available_phases) == 1:
+                    return f"{available_phases[0].prescription_dose_gy:.2f}"
+                return f"{sum(phase.prescription_dose_gy for phase in available_phases):.2f}"
+        elif normalized_name.startswith("PTV") and is_multifraction_fsrt:
             if len(available_phases) == 1:
                 return f"{available_phases[0].prescription_dose_gy:.2f}"
             return f"{sum(phase.prescription_dose_gy for phase in available_phases):.2f}"
@@ -4973,7 +5014,7 @@ h2 {{
             return None
 
         minimum_dose_gy = float(curve.min_dose_gy)
-        candidate_rx_gy = [18.0, 21.0]
+        candidate_rx_gy = [18.0, 21.0, 24.0]
         return min(candidate_rx_gy, key=lambda value: abs(minimum_dose_gy - value))
 
     def stereotactic_summary_enabled(self) -> bool:
