@@ -279,7 +279,7 @@ def apply_app_theme(app: QtWidgets.QApplication) -> None:
 class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Radiotherapy Plan Review - Starter Viewer")
+        self.setWindowTitle("Radiotherapy Plan Review - powered by CommonSense™")
         self.resize(1450, 900)
 
         self.ct: Optional[CTVolume] = None
@@ -341,6 +341,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraint_editor_widgets: Dict[str, QtWidgets.QWidget] = {}
         self.hidden_structure_names: set[str] = set()
         self.additional_target_subvolume_names: set[str] = set()
+        self.pending_saved_dvh_selected_names: Optional[List[str]] = None
         self.structure_filter_dialog: Optional[QtWidgets.QDialog] = None
         self.structure_filter_tree_widget: Optional[QtWidgets.QTreeWidget] = None
         self.current_row: int = 0
@@ -983,6 +984,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraint_editor_widgets = {}
         self.hidden_structure_names = set()
         self.additional_target_subvolume_names = set()
+        self.pending_saved_dvh_selected_names = None
         if self.structure_filter_tree_widget is not None:
             self.structure_filter_tree_widget.clear()
         if self.structure_filter_dialog is not None:
@@ -2869,7 +2871,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.cached_target_table_rows = target_table_rows if use_cached_target_rows else None
         self.update_dvh_secondary_metric_caches()
         if saved_selected_names:
-            self.dvh_structure_list.set_checked_names(saved_selected_names)
+            if refresh_ui:
+                self.dvh_structure_list.set_checked_names(saved_selected_names)
+            else:
+                self.pending_saved_dvh_selected_names = list(saved_selected_names)
+        else:
+            self.pending_saved_dvh_selected_names = None
         self.refresh_visible_structure_goal_evaluations(precomputed=goal_evaluations or None)
         self.update_dvh_goal_evaluation_cache(goal_evaluations or None)
         if refresh_ui:
@@ -2920,17 +2927,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         for structure in self.rtstruct.structures:
             normalized_name = normalize_structure_name(structure.name)
             goals = self.structure_goals_by_name.get(normalized_name, [])
-            evaluations = self.structure_goal_evaluations.get(normalized_name)
-            if not evaluations:
-                evaluations = self.dvh_structure_goal_evaluation_cache.get(normalized_name, [])
             if not goals:
                 continue
+            evaluations = self.get_constraint_evaluations_for_structure(normalized_name, goals)
 
             for goal_index, goal in enumerate(goals):
                 evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
                 note_key = self.get_constraint_note_key(normalized_name, goal)
                 note_text = self.compose_constraint_note_text(
-                    self.get_computed_constraint_note_text(normalized_name, goals, goal_index),
+                    self.get_computed_constraint_note_text(normalized_name, goals, goal_index, evaluation),
                     self.constraint_notes.get(note_key, ""),
                 )
                 rows.append(
@@ -6266,12 +6271,15 @@ h2 {{
         self.update_axial_overlay_positions()
 
     def get_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
+        goals = self.structure_goals_by_name.get(normalized_name, [])
+        if not goals:
+            return []
         return [
             (
                 self.format_structure_goal_line(evaluation),
                 self.structure_goal_line_color(evaluation),
             )
-            for evaluation in self.structure_goal_evaluations.get(normalized_name, [])
+            for evaluation in self.get_constraint_evaluations_for_structure(normalized_name, goals)
         ]
 
     def get_dvh_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
@@ -6498,6 +6506,9 @@ h2 {{
             ),
             item_options_getter=self.get_dvh_structure_item_options,
         )
+        if self.pending_saved_dvh_selected_names:
+            self.dvh_structure_list.set_checked_names(self.pending_saved_dvh_selected_names)
+            self.pending_saved_dvh_selected_names = None
         self.update_constraints_table()
         self.update_targets_table()
 

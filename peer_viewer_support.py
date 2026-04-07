@@ -425,6 +425,28 @@ class StructureListItemWidget(QtWidgets.QWidget):
         self.checkbox.setChecked(checked)
         del blocker
 
+    def update_name_and_color(self, name: str, color_rgb: Tuple[int, int, int]) -> None:
+        if self.checkbox is not None:
+            self.checkbox.setText(name)
+            self.checkbox.setStyleSheet(
+                "QCheckBox { "
+                f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]}); "
+                "font-weight: 600; padding: 2px 0px; } "
+                "QCheckBox::indicator { "
+                "width: 14px; height: 14px; border: 1px solid #7a7a7a; "
+                "border-radius: 3px; background-color: #1c1c1c; } "
+                "QCheckBox::indicator:checked { "
+                "border: 1px solid #79e08f; background-color: #2f9e44; } "
+                "QCheckBox::indicator:hover { border: 1px solid #a0a0a0; }"
+            )
+        if self.title_label is not None:
+            self.title_label.setText(name)
+            self.title_label.setStyleSheet(
+                f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]});"
+                " font-weight: 600; padding: 2px 0px;"
+            )
+        self.updateGeometry()
+
     def set_goal_lines(self, goal_lines: List[Tuple[str, Optional[str]]]) -> None:
         if self.inline_goals and self.inline_goal_label is not None:
             inline_text = goal_lines[0][0] if goal_lines else ""
@@ -542,18 +564,30 @@ class StructureListManager(QtCore.QObject):
     ) -> None:
         previous_visibility = self.visibility_map()
         for tag, list_widget in self._collections:
-            self._populate_list(
-                list_widget,
-                self._widget_maps[tag],
-                self._item_maps[tag],
-                previous_visibility,
-                tag,
-                rtstruct,
-                goal_line_getter,
-                default_visibility_resolver,
-                show_checkbox_resolver,
-                item_options_getter,
-            )
+            widget_map = self._widget_maps[tag]
+            item_map = self._item_maps[tag]
+            if self._can_reuse_existing_items(widget_map, rtstruct) and self._refresh_existing_items(
+                    widget_map,
+                    item_map,
+                    rtstruct,
+                    goal_line_getter,
+                    show_checkbox_resolver,
+                    item_options_getter,
+                ):
+                pass
+            else:
+                self._populate_list(
+                    list_widget,
+                    widget_map,
+                    item_map,
+                    previous_visibility,
+                    tag,
+                    rtstruct,
+                    goal_line_getter,
+                    default_visibility_resolver,
+                    show_checkbox_resolver,
+                    item_options_getter,
+                )
         self.schedule_layout_refresh()
 
     def update_goal_lines(
@@ -725,6 +759,51 @@ class StructureListManager(QtCore.QObject):
             item.setSizeHint(widget.sizeHint())
             widget_map[normalized_name] = widget
             item_map[normalized_name] = item
+
+    def _can_reuse_existing_items(
+        self,
+        widget_map: Dict[str, StructureListItemWidget],
+        rtstruct: Optional[RTStructData],
+    ) -> bool:
+        if rtstruct is None:
+            return not widget_map
+        requested_names = [normalize_structure_name(structure.name) for structure in rtstruct.structures]
+        return list(widget_map.keys()) == requested_names
+
+    def _refresh_existing_items(
+        self,
+        widget_map: Dict[str, StructureListItemWidget],
+        item_map: Dict[str, QtWidgets.QListWidgetItem],
+        rtstruct: Optional[RTStructData],
+        goal_line_getter: Callable[[str], List[Tuple[str, Optional[str]]]],
+        show_checkbox_resolver: Optional[Callable[[str], bool]],
+        item_options_getter: Optional[Callable[[str], Dict[str, object]]],
+    ) -> bool:
+        if rtstruct is None:
+            return True
+
+        for structure in rtstruct.structures:
+            normalized_name = normalize_structure_name(structure.name)
+            widget = widget_map.get(normalized_name)
+            item = item_map.get(normalized_name)
+            if widget is None or item is None:
+                return False
+            desired_show_checkbox = self._interactive and (
+                show_checkbox_resolver(normalized_name)
+                if show_checkbox_resolver is not None
+                else True
+            )
+            if widget.show_checkbox != desired_show_checkbox:
+                return False
+            widget.update_name_and_color(structure.name, structure.color_rgb)
+            widget.set_goal_lines(goal_line_getter(normalized_name))
+            item_options = item_options_getter(normalized_name) if item_options_getter is not None else {}
+            widget.set_secondary_text(
+                item_options.get("secondary_text"),
+                item_options.get("secondary_text_color"),
+            )
+            item.setSizeHint(widget.sizeHint())
+        return True
 
     def _on_widget_checked_changed(self, normalized_name: str, source_tag: str, checked: bool) -> None:
         for tag, _list_widget in self._collections:
