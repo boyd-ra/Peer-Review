@@ -111,6 +111,14 @@ from peer_targets import (
     stereotactic_summary_enabled as stereotactic_summary_enabled_helper,
     target_table_rows_require_recompute as target_table_rows_require_recompute_helper,
 )
+from peer_targets_table import (
+    build_target_table_presentation_rows,
+    create_target_coverage_cell_widget as create_target_coverage_cell_widget_helper,
+    create_target_name_cell_widget as create_target_name_cell_widget_helper,
+    create_target_note_button_widget as create_target_note_button_widget_helper,
+    get_target_table_column_widths,
+    populate_target_table_rows,
+)
 from peer_widgets import LineSwatchWidget, RangeSlider, WindowLevelSlider
 from peer_viewer_support import (
     DVHComputationManager,
@@ -3965,42 +3973,13 @@ h2 {{
         title: str,
         background_color: Optional[QtGui.QColor] = None,
     ) -> QtWidgets.QWidget:
-        button = QtWidgets.QPushButton("Note")
-        button.setFixedWidth(56)
-        button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
-        button.setAutoDefault(False)
-        button.setDefault(False)
-        note_text = self.target_notes.get(note_key, "").strip()
-        if note_text:
-            font = button.font()
-            font.setBold(True)
-            button.setFont(font)
-            button.setToolTip(note_text)
-        else:
-            button.setToolTip(f"Add note for {title}")
-        if background_color is not None:
-            button.setStyleSheet(
-                "QPushButton {"
-                f" background-color: {background_color.lighter(112).name()};"
-                f" border: 1px solid {background_color.lighter(150).name()};"
-                " padding: 2px 6px;"
-                "}"
-            )
-        button.clicked.connect(
-            lambda _checked=False, key=note_key, dialog_title=title: self.edit_target_note(key, dialog_title)
+        return create_target_note_button_widget_helper(
+            note_key,
+            title,
+            self.target_notes.get(note_key, ""),
+            background_color,
+            on_edit_note=self.edit_target_note,
         )
-        container = QtWidgets.QWidget()
-        if background_color is not None:
-            container.setAutoFillBackground(True)
-            palette = container.palette()
-            palette.setColor(QtGui.QPalette.ColorRole.Window, background_color)
-            container.setPalette(palette)
-        layout = QtWidgets.QHBoxLayout(container)
-        layout.setContentsMargins(2, 0, 2, 0)
-        layout.addStretch(1)
-        layout.addWidget(button)
-        layout.addStretch(1)
-        return container
 
     def edit_target_note(self, note_key: str, title: str):
         existing_note = self.target_notes.get(note_key, "")
@@ -5150,21 +5129,7 @@ h2 {{
         if self.targets_table.columnCount() != 6:
             return
 
-        viewport_width = max(self.targets_table.viewport().width(), 1)
-        ptv_width = max(1, int(round(viewport_width * 0.15)))
-        coverage_width = max(1, int(round(viewport_width * 0.15)))
-        min_dose_width = max(1, int(round(viewport_width * 0.075)))
-        max_dose_width = max(1, int(round(viewport_width * 0.075)))
-        note_button_width = max(72, int(round(viewport_width * 0.06)))
-        notes_width = max(1, viewport_width - (ptv_width + coverage_width + min_dose_width + max_dose_width + note_button_width))
-        column_widths = [
-            ptv_width,  # PTV
-            coverage_width,  # Coverage
-            min_dose_width,  # Min dose
-            max_dose_width,  # Max dose
-            notes_width,  # Notes
-            note_button_width,  # Note button
-        ]
+        column_widths = get_target_table_column_widths(self.targets_table.viewport().width())
 
         for column_index, width in enumerate(column_widths):
             self.targets_table.setColumnWidth(column_index, max(1, width))
@@ -5180,23 +5145,13 @@ h2 {{
         normalized_name: Optional[str] = None,
         is_primary_ptv: bool = False,
     ) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        widget.setStyleSheet(f"background-color: {background_color.name()};")
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setContentsMargins(6, 0, 6, 0)
-        layout.setSpacing(6)
-
-        label = QtWidgets.QLabel(display_name)
-        label.setStyleSheet(f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]});")
-        font = label.font()
-        font.setPointSize(self.targets_table.font().pointSize())
-        if is_primary_ptv:
-            font.setBold(True)
-        label.setFont(font)
-        layout.addWidget(label)
-        layout.addStretch(1)
-
-        return widget
+        return create_target_name_cell_widget_helper(
+            display_name,
+            color_rgb,
+            background_color,
+            font_point_size=self.targets_table.font().pointSize(),
+            is_primary_ptv=is_primary_ptv,
+        )
 
     def create_target_coverage_cell_widget(
         self,
@@ -5208,57 +5163,17 @@ h2 {{
         is_primary_ptv: bool,
         resolved_dose_text: Optional[str] = None,
     ) -> QtWidgets.QWidget:
-        widget = QtWidgets.QWidget()
-        widget.setStyleSheet(f"background-color: {background_color.name()};")
-        layout = QtWidgets.QHBoxLayout(widget)
-        layout.setContentsMargins(6, 0, 6, 0)
-        layout.setSpacing(6)
-
-        if not is_primary_ptv:
-            label = QtWidgets.QLabel(coverage_text)
-            label.setStyleSheet("color: #f2f2f2;")
-            label_font = label.font()
-            label_font.setPointSize(self.targets_table.font().pointSize())
-            label.setFont(label_font)
-            layout.addWidget(label)
-            layout.addStretch(1)
-            return widget
-
-        prefix_text = coverage_text.strip()
-        if "@" in prefix_text:
-            before_at, _sep, _after_at = prefix_text.partition("@")
-            prefix_text = f"{before_at.strip()} @" if before_at.strip() else "@"
-
-        if prefix_text:
-            label = QtWidgets.QLabel(prefix_text)
-            label.setStyleSheet("color: #f2f2f2;")
-            label_font = label.font()
-            label_font.setPointSize(self.targets_table.font().pointSize())
-            label.setFont(label_font)
-            layout.addWidget(label)
-
-        dose_edit = QtWidgets.QLineEdit()
-        dose_edit.setFixedWidth(62)
-        dose_edit.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        dose_edit.setPlaceholderText("Dose")
-        dose_edit.setText((resolved_dose_text or self.get_stereotactic_dose_text(normalized_name, structure_name)).strip())
-        dose_edit.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-        dose_validator = QtGui.QDoubleValidator(0.0, 999.99, 2, dose_edit)
-        dose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
-        dose_edit.setValidator(dose_validator)
-        dose_font = dose_edit.font()
-        dose_font.setPointSize(self.targets_table.font().pointSize())
-        dose_edit.setFont(dose_font)
-        dose_edit.editingFinished.connect(
-            lambda name=normalized_name, structure=structure_name, edit=dose_edit: self.on_stereotactic_dose_editing_finished(
-                name,
-                structure,
-                edit,
-            )
+        return create_target_coverage_cell_widget_helper(
+            coverage_text,
+            background_color,
+            structure_name=structure_name,
+            normalized_name=normalized_name,
+            is_primary_ptv=is_primary_ptv,
+            resolved_dose_text=resolved_dose_text,
+            fallback_dose_text=self.get_stereotactic_dose_text(normalized_name, structure_name),
+            font_point_size=self.targets_table.font().pointSize(),
+            on_editing_finished=self.on_stereotactic_dose_editing_finished,
         )
-        layout.addWidget(dose_edit, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
-        layout.addStretch(1)
-        return widget
 
     def on_stereotactic_dose_editing_finished(
         self,
@@ -5505,73 +5420,24 @@ h2 {{
             return
 
         rows = self.get_target_table_rows()
-        self.targets_table.setRowCount(len(rows))
+        presentation_rows = build_target_table_presentation_rows(
+            rows,
+            target_notes=self.target_notes,
+            get_target_note_key_for_row=self.get_target_note_key_for_row,
+            compose_target_note_text=self.compose_target_note_text,
+            get_target_row_reference_dose_text=self.get_target_row_reference_dose_text,
+        )
         primary_background = QtGui.QColor(8, 8, 8)
         nested_background = QtGui.QColor(34, 34, 34)
-        for row_index, row in enumerate(rows):
-            normalized_name = str(row.get("normalized_name", ""))
-            parent_normalized_name = row.get("parent_normalized_name")
-            structure_name = str(row.get("structure_name", ""))
-            parent_structure_name = row.get("parent_structure_name")
-            display_name = str(row.get("display_name", structure_name))
-            coverage_text = str(row.get("coverage_text", ""))
-            minimum_dose_text = str(row.get("minimum_dose_text", ""))
-            maximum_dose_text = str(row.get("maximum_dose_text", ""))
-            reference_dose_text = self.get_target_row_reference_dose_text(row)
-            is_primary_ptv = bool(row.get("is_primary_ptv", False))
-            color_rgb = tuple(int(value) for value in row.get("color_rgb", (255, 255, 255)))
-
-            background_color = primary_background if is_primary_ptv else nested_background
-
-            note_key = self.get_target_note_key_for_row(row)
-            if is_primary_ptv:
-                note_title = f"{structure_name} target review"
-            else:
-                note_title = f"{structure_name} within {parent_structure_name} target review"
-            stored_note_text = self.target_notes.get(note_key, "").strip()
-            computed_note_text = str(row.get("notes_text", "")).strip()
-            note_text = self.compose_target_note_text(computed_note_text, stored_note_text)
-
-            self.targets_table.setCellWidget(
-                row_index,
-                0,
-                self.create_target_name_cell_widget(
-                    display_name,
-                    color_rgb,
-                    background_color,
-                    structure_name=structure_name,
-                    normalized_name=normalized_name if is_primary_ptv else None,
-                    is_primary_ptv=is_primary_ptv,
-                ),
-            )
-
-            self.targets_table.setCellWidget(
-                row_index,
-                1,
-                self.create_target_coverage_cell_widget(
-                    coverage_text,
-                    background_color,
-                    structure_name=structure_name,
-                    normalized_name=normalized_name,
-                    is_primary_ptv=is_primary_ptv,
-                    resolved_dose_text=reference_dose_text,
-                ),
-            )
-
-            for column_index, text in enumerate((minimum_dose_text, maximum_dose_text, note_text), start=2):
-                item = QtWidgets.QTableWidgetItem(text)
-                item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-                item.setBackground(background_color)
-                item.setForeground(QtGui.QColor("#f2f2f2"))
-                if column_index == 4 and note_text:
-                    item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-                    item.setToolTip(note_text)
-                self.targets_table.setItem(row_index, column_index, item)
-            self.targets_table.setCellWidget(
-                row_index,
-                5,
-                self.create_target_note_button(note_key, note_title, background_color),
-            )
+        populate_target_table_rows(
+            self.targets_table,
+            presentation_rows,
+            primary_background=primary_background,
+            nested_background=nested_background,
+            get_fallback_dose_text=self.get_stereotactic_dose_text,
+            on_editing_finished=self.on_stereotactic_dose_editing_finished,
+            on_edit_note=self.edit_target_note,
+        )
 
         self.targets_table.resizeColumnsToContents()
         self.targets_table.resizeRowsToContents()
