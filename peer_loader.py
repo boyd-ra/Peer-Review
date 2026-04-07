@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -11,6 +12,14 @@ from peer_io import load_ct_series_and_discover_patient_files
 from peer_models import CTVolume, DoseVolume, PatientFileDiscovery, RTStructData
 
 
+@dataclass(slots=True)
+class ReviewCacheAvailability:
+    dvh_can_start: bool
+    cache_path: Optional[Path]
+    cache_found: bool
+    derived_sidecar_only: bool
+
+
 def load_patient_scan_and_discovery(folder: str) -> Tuple[CTVolume, PatientFileDiscovery]:
     return load_ct_series_and_discover_patient_files(folder)
 
@@ -19,6 +28,27 @@ def resample_dose_to_ct_volume(ct: CTVolume, dose: DoseVolume) -> np.ndarray:
     return np.stack(
         [sample_dose_to_ct_slice(ct, dose, slice_index) for slice_index in range(ct.volume_hu.shape[0])],
         axis=0,
+    )
+
+
+def get_review_cache_availability(
+    *,
+    dvh_can_start: bool,
+    cache_path: Optional[Path],
+    derived_array_cache_path: Optional[Path],
+) -> ReviewCacheAvailability:
+    cache_found = cache_path is not None and cache_path.exists()
+    derived_sidecar_only = (
+        dvh_can_start
+        and not cache_found
+        and derived_array_cache_path is not None
+        and derived_array_cache_path.exists()
+    )
+    return ReviewCacheAvailability(
+        dvh_can_start=dvh_can_start,
+        cache_path=cache_path,
+        cache_found=cache_found,
+        derived_sidecar_only=derived_sidecar_only,
     )
 
 

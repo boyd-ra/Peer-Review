@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import gc
 import html
-import json
 import logging
 import math
 import re
@@ -47,13 +46,23 @@ from peer_helpers import (
 )
 from peer_cache import (
     callable_signature_hash,
+    build_review_cache_payload,
+    deserialize_dvh_curve as deserialize_dvh_curve_payload,
+    deserialize_goal_evaluations as deserialize_goal_evaluations_payload,
+    deserialize_structure_goals as deserialize_structure_goals_payload,
+    deserialize_target_table_rows as deserialize_target_table_rows_payload,
     get_ct_geometry_signature as compute_ct_geometry_signature,
     get_derived_array_cache_path as compute_derived_array_cache_path,
     get_derived_array_cache_signature as compute_derived_array_cache_signature,
     get_derived_cache_structures as select_derived_cache_structures,
     get_dvh_cache_path as compute_dvh_cache_path,
+    load_review_cache_file,
     load_derived_array_cache as load_derived_array_cache_file,
     save_derived_array_cache as save_derived_array_cache_file,
+    serialize_dvh_curve as serialize_dvh_curve_payload,
+    serialize_goal_evaluations as serialize_goal_evaluations_payload,
+    serialize_structure_goals as serialize_structure_goals_payload,
+    serialize_target_table_rows as serialize_target_table_rows_payload,
     write_json_atomic,
 )
 from peer_io import (
@@ -66,8 +75,10 @@ from peer_io import (
 )
 from peer_loader import (
     build_load_timing_report_text,
+    get_review_cache_availability,
     load_patient_scan_and_discovery,
     resample_dose_to_ct_volume,
+    ReviewCacheAvailability,
 )
 from peer_models import (
     CTVolume,
@@ -1019,6 +1030,72 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.clear_viewer_image_items()
         gc.collect()
 
+    def _load_saved_review_cache_if_available(
+        self,
+        *,
+        derived_array_cache_path: Optional[Path],
+    ) -> Tuple[ReviewCacheAvailability, bool, Optional[float]]:
+        cache_info = get_review_cache_availability(
+            dvh_can_start=self.ct is not None and self.dose is not None and self.rtstruct is not None,
+            cache_path=self.get_dvh_cache_path(),
+            derived_array_cache_path=derived_array_cache_path,
+        )
+        cache_loaded = False
+        cache_load_duration: Optional[float] = None
+        if cache_info.dvh_can_start:
+            if cache_info.cache_found:
+                self.show_progress_status("Found saved JSON cache", pump_events=True)
+            elif cache_info.derived_sidecar_only:
+                self.show_progress_status("Found saved derived cache only; no saved JSON review data", pump_events=True)
+            stage_start = perf_counter()
+            cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
+            cache_load_duration = perf_counter() - stage_start if cache_loaded else None
+        return cache_info, cache_loaded, cache_load_duration
+
+    def _finalize_patient_load_interactive_state(
+        self,
+        *,
+        cache_info: ReviewCacheAvailability,
+        cache_loaded: bool,
+        cache_load_duration: Optional[float],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        overall_start: float,
+    ) -> None:
+        self.defer_sidebar_summary_metrics = False
+        if self.rtstruct is not None and self.ct is not None:
+            if cache_loaded:
+                self.populate_structures_list()
+                stage_start = perf_counter()
+                self.refresh_all_views()
+                timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+                self.render_dvh_plot()
+                if self.dvh_curves:
+                    self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
+                else:
+                    self.dvh_status_label.setText("Saved DVH cache contained no curves.")
+                self.update_dvh_cache_button()
+            else:
+                if cache_info.cache_found:
+                    self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
+                elif cache_info.derived_sidecar_only:
+                    self.show_progress_status("Using derived cache only; recalculating review state", pump_events=True)
+                self.show_progress_status("Computing metrics", pump_events=True)
+                self.populate_structures_list()
+                stage_start = perf_counter()
+                self.refresh_all_views()
+                timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+        elif self.ct is not None:
+            stage_start = perf_counter()
+            self.refresh_orthogonal_views_from_controls()
+            timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+
+        if cache_loaded:
+            self.show_progress_status("Loaded saved JSON cache")
+        timing_entries.append(("Load saved DVH cache", cache_load_duration))
+        if not cache_loaded:
+            timing_entries.append(("Compute DVH (background)" if cache_info.dvh_can_start else "Compute DVH", None))
+        timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
+
     def on_load_patient_folder(self):
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Patient Folder")
         if not folder:
@@ -1154,57 +1231,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.latest_timing_rtstruct_path = rtstruct_path
             self.latest_timing_rtdose_paths = list(rtdose_paths)
 
-            dvh_can_start = self.ct is not None and self.dose is not None and self.rtstruct is not None
-            cache_loaded = False
-            cache_load_duration: Optional[float] = None
-            cache_path = self.get_dvh_cache_path()
-            cache_found = cache_path is not None and cache_path.exists()
-            derived_sidecar_only = (
-                not cache_found
-                and derived_array_cache_path is not None
-                and derived_array_cache_path.exists()
+            cache_info, cache_loaded, cache_load_duration = self._load_saved_review_cache_if_available(
+                derived_array_cache_path=derived_array_cache_path,
             )
-            if dvh_can_start:
-                if cache_found:
-                    self.show_progress_status("Found saved JSON cache", pump_events=True)
-                elif derived_sidecar_only:
-                    self.show_progress_status("Found saved derived cache only; no saved JSON review data", pump_events=True)
-                stage_start = perf_counter()
-                cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
-                cache_load_duration = perf_counter() - stage_start if cache_loaded else None
-            self.defer_sidebar_summary_metrics = False
-            if self.rtstruct is not None and self.ct is not None:
-                if cache_loaded:
-                    self.populate_structures_list()
-                    stage_start = perf_counter()
-                    self.refresh_all_views()
-                    timing_entries.append(("Refresh full views", perf_counter() - stage_start))
-                    self.render_dvh_plot()
-                    if self.dvh_curves:
-                        self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
-                    else:
-                        self.dvh_status_label.setText("Saved DVH cache contained no curves.")
-                    self.update_dvh_cache_button()
-                else:
-                    if cache_found:
-                        self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
-                    elif derived_sidecar_only:
-                        self.show_progress_status("Using derived cache only; recalculating review state", pump_events=True)
-                    self.show_progress_status("Computing metrics", pump_events=True)
-                    self.populate_structures_list()
-                    stage_start = perf_counter()
-                    self.refresh_all_views()
-                    timing_entries.append(("Refresh full views", perf_counter() - stage_start))
-            elif self.ct is not None:
-                stage_start = perf_counter()
-                self.refresh_orthogonal_views_from_controls()
-                timing_entries.append(("Refresh full views", perf_counter() - stage_start))
-            if cache_loaded:
-                self.show_progress_status("Loaded saved JSON cache")
-            timing_entries.append(("Load saved DVH cache", cache_load_duration))
-            if not cache_loaded:
-                timing_entries.append(("Compute DVH (background)" if dvh_can_start else "Compute DVH", None))
-            timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
+            self._finalize_patient_load_interactive_state(
+                cache_info=cache_info,
+                cache_loaded=cache_loaded,
+                cache_load_duration=cache_load_duration,
+                timing_entries=timing_entries,
+                overall_start=overall_start,
+            )
 
             self.latest_timing_entries = list(timing_entries)
             self.latest_timing_folder = folder
@@ -1217,7 +1253,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             dvh_started = False
             if not cache_loaded:
                 dvh_started = self.refresh_dvh()
-                if not dvh_started and dvh_can_start:
+                if not dvh_started and cache_info.dvh_can_start:
                     self.latest_timing_entries = [
                         ("Compute DVH", duration_s) if label == "Compute DVH (background)" else (label, duration_s)
                         for label, duration_s in self.latest_timing_entries
@@ -1889,142 +1925,32 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
         self.apply_constraint_sheet(target_sheet_name, refresh_lists=True, refresh_dvh=True)
 
-    def _json_safe_metadata_value(self, value):
-        if isinstance(value, (str, bool)) or value is None:
-            return value
-        if isinstance(value, (int, float)):
-            return value
-        if isinstance(value, np.generic):
-            return value.item()
-        return str(value)
-
     def serialize_dvh_curve(self, curve: DVHCurve) -> Dict[str, object]:
-        return {
-            "name": curve.name,
-            "color_rgb": list(curve.color_rgb),
-            "dose_bins_gy": [float(value) for value in curve.dose_bins_gy],
-            "volume_pct": [float(value) for value in curve.volume_pct],
-            "voxel_count": int(curve.voxel_count),
-            "volume_cc": float(curve.volume_cc),
-            "mean_dose_gy": float(curve.mean_dose_gy),
-            "max_dose_gy": float(curve.max_dose_gy),
-            "min_dose_gy": float(curve.min_dose_gy),
-            "volume_cc_axis": [float(value) for value in curve.volume_cc_axis],
-            "oversampling_factor": float(curve.oversampling_factor),
-            "used_fractional_labelmap": bool(curve.used_fractional_labelmap),
-            "metadata": {
-                str(key): self._json_safe_metadata_value(value)
-                for key, value in curve.metadata.items()
-            },
-        }
+        return serialize_dvh_curve_payload(curve)
 
     def deserialize_dvh_curve(self, payload: Dict[str, object]) -> DVHCurve:
-        return DVHCurve(
-            name=str(payload.get("name", "")),
-            color_rgb=tuple(int(value) for value in payload.get("color_rgb", [255, 255, 255])),
-            dose_bins_gy=np.asarray(payload.get("dose_bins_gy", []), dtype=np.float32),
-            volume_pct=np.asarray(payload.get("volume_pct", []), dtype=np.float32),
-            voxel_count=int(payload.get("voxel_count", 0)),
-            volume_cc=float(payload.get("volume_cc", 0.0)),
-            mean_dose_gy=float(payload.get("mean_dose_gy", 0.0)),
-            max_dose_gy=float(payload.get("max_dose_gy", 0.0)),
-            min_dose_gy=float(payload.get("min_dose_gy", 0.0)),
-            volume_cc_axis=np.asarray(payload.get("volume_cc_axis", []), dtype=np.float32),
-            oversampling_factor=float(payload.get("oversampling_factor", 1.0)),
-            used_fractional_labelmap=bool(payload.get("used_fractional_labelmap", False)),
-            metadata=dict(payload.get("metadata", {})),
-        )
+        return deserialize_dvh_curve_payload(payload)
 
     def serialize_goal_evaluations(self) -> Dict[str, List[Dict[str, object]]]:
-        serialized: Dict[str, List[Dict[str, object]]] = {}
-        for structure_name, evaluations in self.structure_goal_evaluations.items():
-            serialized[structure_name] = [
-                {
-                    "metric": evaluation.metric,
-                    "comparator": evaluation.comparator,
-                    "goal_text": evaluation.goal_text,
-                    "actual_text": evaluation.actual_text,
-                    "passed": evaluation.passed,
-                    "status": evaluation.status,
-                }
-                for evaluation in evaluations
-            ]
-        return serialized
+        return serialize_goal_evaluations_payload(self.structure_goal_evaluations)
 
     def deserialize_goal_evaluations(
         self,
         payload: object,
     ) -> Optional[Dict[str, List[StructureGoalEvaluation]]]:
-        if payload is None:
-            return {}
-        if not isinstance(payload, dict):
-            return None
-
-        evaluations_by_structure: Dict[str, List[StructureGoalEvaluation]] = {}
-        for structure_name, evaluation_payloads in payload.items():
-            if not isinstance(evaluation_payloads, list):
-                return None
-            evaluations: List[StructureGoalEvaluation] = []
-            for evaluation_payload in evaluation_payloads:
-                if not isinstance(evaluation_payload, dict):
-                    return None
-                evaluations.append(
-                    StructureGoalEvaluation(
-                        metric=str(evaluation_payload.get("metric", "")),
-                        comparator=str(evaluation_payload.get("comparator", "")),
-                        goal_text=str(evaluation_payload.get("goal_text", "")),
-                        actual_text=str(evaluation_payload.get("actual_text", "")),
-                        passed=evaluation_payload.get("passed"),
-                        status=str(evaluation_payload.get("status", "")),
-                    )
-                )
-            evaluations_by_structure[normalize_structure_name(str(structure_name))] = evaluations
-        return evaluations_by_structure
+        return deserialize_goal_evaluations_payload(payload)
 
     def serialize_structure_goals(
         self,
         goals_by_structure: Dict[str, List[StructureGoal]],
     ) -> Dict[str, List[Dict[str, str]]]:
-        serialized: Dict[str, List[Dict[str, str]]] = {}
-        for structure_name, goals in goals_by_structure.items():
-            serialized[structure_name] = [
-                {
-                    "structure_name": goal.structure_name,
-                    "metric": goal.metric,
-                    "comparator": goal.comparator,
-                    "value_text": goal.value_text,
-                }
-                for goal in goals
-            ]
-        return serialized
+        return serialize_structure_goals_payload(goals_by_structure)
 
     def deserialize_structure_goals(
         self,
         payload: object,
     ) -> Optional[Dict[str, List[StructureGoal]]]:
-        if payload is None:
-            return {}
-        if not isinstance(payload, dict):
-            return None
-
-        goals_by_structure: Dict[str, List[StructureGoal]] = {}
-        for structure_name, goal_payloads in payload.items():
-            if not isinstance(goal_payloads, list):
-                return None
-            goals: List[StructureGoal] = []
-            for goal_payload in goal_payloads:
-                if not isinstance(goal_payload, dict):
-                    return None
-                goals.append(
-                    StructureGoal(
-                        structure_name=str(goal_payload.get("structure_name", structure_name)),
-                        metric=str(goal_payload.get("metric", "")),
-                        comparator=str(goal_payload.get("comparator", "")),
-                        value_text=str(goal_payload.get("value_text", "")),
-                    )
-                )
-            goals_by_structure[normalize_structure_name(str(structure_name))] = goals
-        return goals_by_structure
+        return deserialize_structure_goals_payload(payload)
 
     def rebuild_structure_goals_by_name(self) -> None:
         merged: Dict[str, List[StructureGoal]] = {}
@@ -2037,64 +1963,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_structure_goal_evaluation_cache = {}
 
     def serialize_target_table_rows(self, rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
-        serialized_rows: List[Dict[str, object]] = []
-        for row in rows:
-            serialized_rows.append(
-                {
-                    "structure_name": str(row.get("structure_name", "")),
-                    "normalized_name": str(row.get("normalized_name", "")),
-                    "parent_structure_name": row.get("parent_structure_name"),
-                    "parent_normalized_name": row.get("parent_normalized_name"),
-                    "display_name": str(row.get("display_name", "")),
-                    "reference_dose_text": str(row.get("reference_dose_text", "")),
-                    "coverage_text": str(row.get("coverage_text", "")),
-                    "minimum_dose_text": str(row.get("minimum_dose_text", "")),
-                    "maximum_dose_text": str(row.get("maximum_dose_text", "")),
-                    "notes_text": str(row.get("notes_text", "")),
-                    "is_primary_ptv": bool(row.get("is_primary_ptv", False)),
-                    "color_rgb": [int(value) for value in row.get("color_rgb", [255, 255, 255])],
-                }
-            )
-        return serialized_rows
+        return serialize_target_table_rows_payload(rows)
 
     def deserialize_target_table_rows(self, payload: object) -> Optional[List[Dict[str, object]]]:
-        if payload is None:
-            return []
-        if not isinstance(payload, list):
-            return None
-
-        rows: List[Dict[str, object]] = []
-        for row_payload in payload:
-            if not isinstance(row_payload, dict):
-                return None
-            color_values = row_payload.get("color_rgb", [255, 255, 255])
-            if not isinstance(color_values, list) or len(color_values) != 3:
-                return None
-            rows.append(
-                {
-                    "structure_name": str(row_payload.get("structure_name", "")),
-                    "normalized_name": normalize_structure_name(str(row_payload.get("normalized_name", ""))),
-                    "parent_structure_name": (
-                        None
-                        if row_payload.get("parent_structure_name") in {None, ""}
-                        else str(row_payload.get("parent_structure_name"))
-                    ),
-                    "parent_normalized_name": (
-                        None
-                        if row_payload.get("parent_normalized_name") in {None, ""}
-                        else normalize_structure_name(str(row_payload.get("parent_normalized_name")))
-                    ),
-                    "display_name": str(row_payload.get("display_name", "")),
-                    "reference_dose_text": str(row_payload.get("reference_dose_text", "")),
-                    "coverage_text": str(row_payload.get("coverage_text", "")),
-                    "minimum_dose_text": str(row_payload.get("minimum_dose_text", "")),
-                    "maximum_dose_text": str(row_payload.get("maximum_dose_text", "")),
-                    "notes_text": str(row_payload.get("notes_text", "")),
-                    "is_primary_ptv": bool(row_payload.get("is_primary_ptv", False)),
-                    "color_rgb": tuple(int(value) for value in color_values),
-                }
-            )
-        return rows
+        return deserialize_target_table_rows_payload(payload)
 
     def get_target_row_reference_dose_text(self, row: Dict[str, object]) -> str:
         stored_text = str(row.get("reference_dose_text", "")).strip()
@@ -2436,35 +2308,33 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         derived_array_cache_path = self.get_derived_array_cache_path(path)
-        payload = {
-            "version": 15,
-            "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
-            "selected_constraint_set": selected_constraint_set,
-            "constraints_file": Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
-            "constraints_sheet": self.constraints_sheet_name,
-            "rtstruct_file": Path(self.rtstruct_path).name if self.rtstruct_path else None,
-            "constraints_fingerprint": build_file_fingerprint(self.structure_filter_csv_path),
-            "rtstruct_fingerprint": build_file_fingerprint(self.rtstruct_path),
-            "rtdose_fingerprints": build_file_fingerprints(self.latest_timing_rtdose_paths),
-            "rtplan_fingerprints": build_file_fingerprints(self.current_rtplan_paths),
-            "derived_array_cache_file": derived_array_cache_path.name if derived_array_cache_path is not None else None,
-            "derived_array_cache_signature": self.get_derived_array_cache_signature(),
-            "structure_names": [normalize_structure_name(structure.name) for structure in self.rtstruct.structures],
-            "dvh_structure_names": self.get_selected_dvh_structure_names(),
-            "dvh_mode": self.get_dvh_mode(),
-            "dvh_method_signature": get_dvh_method_signature(),
-            "target_method_signature": self.get_target_method_signature(),
-            "curves": [self.serialize_dvh_curve(curve) for curve in self.dvh_curves],
-            "custom_constraints": self.serialize_structure_goals(self.custom_structure_goals_by_name),
-            "goal_evaluations": self.serialize_goal_evaluations(),
-            "target_table_rows": self.serialize_target_table_rows(target_rows),
-            "max_tissue": self.build_max_tissue_payload(),
-            "stereotactic_target_doses": self.stereotactic_target_dose_text_by_name,
-            "hidden_structure_names": sorted(self.hidden_structure_names),
-            "additional_target_subvolume_names": sorted(self.additional_target_subvolume_names),
-            "constraint_notes": self.constraint_notes,
-            "target_notes": self.build_target_notes_for_save(target_rows),
-        }
+        payload = build_review_cache_payload(
+            selected_constraint_set=selected_constraint_set,
+            constraints_file_name=Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
+            constraints_sheet_name=self.constraints_sheet_name,
+            rtstruct_file_name=Path(self.rtstruct_path).name if self.rtstruct_path else None,
+            constraints_fingerprint=build_file_fingerprint(self.structure_filter_csv_path),
+            rtstruct_fingerprint=build_file_fingerprint(self.rtstruct_path),
+            rtdose_fingerprints=build_file_fingerprints(self.latest_timing_rtdose_paths),
+            rtplan_fingerprints=build_file_fingerprints(self.current_rtplan_paths),
+            derived_array_cache_file_name=derived_array_cache_path.name if derived_array_cache_path is not None else None,
+            derived_array_cache_signature=self.get_derived_array_cache_signature(),
+            structure_names=[normalize_structure_name(structure.name) for structure in self.rtstruct.structures],
+            dvh_structure_names=self.get_selected_dvh_structure_names(),
+            dvh_mode=self.get_dvh_mode(),
+            dvh_method_signature=get_dvh_method_signature(),
+            target_method_signature=self.get_target_method_signature(),
+            curves=self.dvh_curves,
+            custom_constraints=self.custom_structure_goals_by_name,
+            goal_evaluations=self.structure_goal_evaluations,
+            target_table_rows=target_rows,
+            max_tissue_payload=self.build_max_tissue_payload(),
+            stereotactic_target_doses=self.stereotactic_target_dose_text_by_name,
+            hidden_structure_names=sorted(self.hidden_structure_names),
+            additional_target_subvolume_names=sorted(self.additional_target_subvolume_names),
+            constraint_notes=self.constraint_notes,
+            target_notes=self.build_target_notes_for_save(target_rows),
+        )
         write_json_atomic(path, payload)
 
         if derived_array_cache_path is None:
@@ -2563,14 +2433,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def load_saved_dvh_cache(self, path: Path, *, refresh_ui: bool = True) -> bool:
         if self.rtstruct is None:
             return False
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        loaded_cache = load_review_cache_file(path)
+        if loaded_cache is None:
             return False
-        try:
-            cache_version = int(payload.get("version", 0))
-        except (TypeError, ValueError):
-            cache_version = 0
+        payload = loaded_cache.payload
+        cache_version = loaded_cache.cache_version
 
         expected_names = [normalize_structure_name(structure.name) for structure in self.rtstruct.structures]
         expected_name_set = set(expected_names)
