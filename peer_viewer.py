@@ -23,19 +23,13 @@ except Exception:  # pragma: no cover - optional runtime dependency
 
 from peer_helpers import (
     build_structure_slice_mask,
-    build_outline_series,
     compute_image_view_bounds,
     compute_single_structure_high_accuracy_curve,
     dose_at_volume_cc,
-    dose_to_rgba,
     estimate_structure_geometry_metrics,
     fill_binary_holes_2d,
     get_dvh_method_signature,
-    line_intersections_at_col,
-    line_intersections_at_row,
     normalize_structure_name,
-    orthogonal_row_scale,
-    resample_orthogonal_plane,
     sample_dose_to_ct_slice,
     volume_cc_at_dose_gy,
     volume_pct_at_dose_gy,
@@ -113,6 +107,19 @@ from peer_loader import (
     load_patient_scan_and_discovery,
     resample_dose_to_ct_volume,
     ReviewCacheAvailability,
+)
+from peer_rendering import (
+    apply_isodose_items,
+    apply_polyline_specs,
+    build_active_isodose_levels,
+    build_axial_hover_text,
+    build_axial_overlay_positions,
+    build_axial_render_state,
+    build_max_dose_center_points,
+    build_max_dose_marker_state,
+    build_orthogonal_render_state,
+    clear_overlay_items as clear_overlay_items_helper,
+    resolve_axial_indices,
 )
 from peer_models import (
     CTVolume,
@@ -1592,19 +1599,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
 
     def center_views_on_max_dose(self):
-        if self.ct is None or self.max_dose_index_zyx is None:
+        center_points = build_max_dose_center_points(self.ct, self.max_dose_index_zyx)
+        if center_points is None:
             return
-
-        k, r, c = self.max_dose_index_zyx
-        sx = float(self.ct.spacing_xyz_mm[0])
-        sy = float(self.ct.spacing_xyz_mm[1])
-        sz = float(self.ct.spacing_xyz_mm[2])
-        sagittal_scale = orthogonal_row_scale(sz, sy)
-        coronal_scale = orthogonal_row_scale(sz, sx)
-
-        self.center_view_on_point(self.axial_view, float(c), float(r))
-        self.center_view_on_point(self.sagittal_view, float(r), float(k) * sagittal_scale)
-        self.center_view_on_point(self.coronal_view, float(c), float(k) * coronal_scale)
+        self.center_view_on_point(self.axial_view, *center_points.axial_point)
+        self.center_view_on_point(self.sagittal_view, *center_points.sagittal_point)
+        self.center_view_on_point(self.coronal_view, *center_points.coronal_point)
 
     def set_autoscroll_ui_locked(self, locked: bool):
         self.set_view_interaction_enabled(not locked)
@@ -5360,9 +5360,7 @@ h2 {{
         return width, level
 
     def clear_overlay_items(self, view: pg.ViewBox, items: List[pg.GraphicsObject]):
-        for item in items:
-            view.removeItem(item)
-        items.clear()
+        clear_overlay_items_helper(view, items)
 
     def populate_isodose_controls(self):
         for idx, edit in enumerate(self.isodose_edit_widgets):
@@ -5378,24 +5376,10 @@ h2 {{
             del blocker
 
     def get_active_isodose_levels(self) -> List[Tuple[float, Tuple[int, int, int]]]:
-        levels: List[Tuple[float, Tuple[int, int, int]]] = []
-        seen: set[float] = set()
-        for color_rgb, edit in zip(self.isodose_colors, self.isodose_edit_widgets):
-            text = edit.text().strip()
-            if not text:
-                continue
-            try:
-                dose_gy = float(text)
-            except ValueError:
-                continue
-            if dose_gy <= 0.0:
-                continue
-            rounded = round(dose_gy, 3)
-            if rounded in seen:
-                continue
-            seen.add(rounded)
-            levels.append((dose_gy, color_rgb))
-        return levels
+        return build_active_isodose_levels(
+            [edit.text() for edit in self.isodose_edit_widgets],
+            list(self.isodose_colors),
+        )
 
     def on_isodose_editing_finished(self):
         sender = self.sender()
@@ -5419,59 +5403,31 @@ h2 {{
         target_items: List[pg.IsocurveItem],
         dose_plane: Optional[np.ndarray],
     ):
-        self.clear_overlay_items(view, target_items)
-        if dose_plane is None or self.rtstruct is None:
+        if self.rtstruct is None:
+            self.clear_overlay_items(view, target_items)
             return
-
-        if not np.isfinite(dose_plane).any():
-            return
-
-        max_dose = float(np.nanmax(dose_plane))
-        if max_dose <= 0.0:
-            return
-
-        for dose_gy, color_rgb in self.get_active_isodose_levels():
-            if dose_gy <= 0.0 or dose_gy > max_dose:
-                continue
-            pen = pg.mkPen(color=color_rgb, width=3, style=QtCore.Qt.PenStyle.DashLine)
-            item = pg.IsocurveItem(
-                data=dose_plane,
-                level=dose_gy,
-                pen=pen,
-                axisOrder="row-major",
-            )
-            item.setZValue(1.5)
-            view.addItem(item)
-            target_items.append(item)
+        apply_isodose_items(view, target_items, dose_plane, self.get_active_isodose_levels())
 
     def update_max_dose_markers(self):
-        if self.ct is None or self.max_dose_index_zyx is None:
+        marker_state = build_max_dose_marker_state(
+            self.ct,
+            self.max_dose_index_zyx,
+            int(self.slice_slider.value()),
+            self.current_row,
+            self.current_col,
+        )
+        if marker_state.axial_point is None:
             self.axial_max_marker.setData([], [])
+        else:
+            self.axial_max_marker.setData([marker_state.axial_point[0]], [marker_state.axial_point[1]])
+        if marker_state.sagittal_point is None:
             self.sagittal_max_marker.setData([], [])
+        else:
+            self.sagittal_max_marker.setData([marker_state.sagittal_point[0]], [marker_state.sagittal_point[1]])
+        if marker_state.coronal_point is None:
             self.coronal_max_marker.setData([], [])
-            return
-
-        k, r, c = self.max_dose_index_zyx
-        sx = float(self.ct.spacing_xyz_mm[0])
-        sy = float(self.ct.spacing_xyz_mm[1])
-        sz = float(self.ct.spacing_xyz_mm[2])
-        sagittal_scale = orthogonal_row_scale(sz, sy)
-        coronal_scale = orthogonal_row_scale(sz, sx)
-
-        if int(self.slice_slider.value()) == k:
-            self.axial_max_marker.setData([float(c)], [float(r)])
         else:
-            self.axial_max_marker.setData([], [])
-
-        if int(np.clip(self.current_col, 0, self.ct.cols - 1)) == c:
-            self.sagittal_max_marker.setData([float(r)], [float(k) * sagittal_scale])
-        else:
-            self.sagittal_max_marker.setData([], [])
-
-        if int(np.clip(self.current_row, 0, self.ct.rows - 1)) == r:
-            self.coronal_max_marker.setData([float(c)], [float(k) * coronal_scale])
-        else:
-            self.coronal_max_marker.setData([], [])
+            self.coronal_max_marker.setData([marker_state.coronal_point[0]], [marker_state.coronal_point[1]])
 
     def refresh_orthogonal_views_from_controls(self):
         if self.ct is None:
@@ -5491,47 +5447,30 @@ h2 {{
 
         row_idx = int(np.clip(self.current_row, 0, self.ct.rows - 1))
         col_idx = int(np.clip(self.current_col, 0, self.ct.cols - 1))
-        sx = float(self.ct.spacing_xyz_mm[0])
-        sy = float(self.ct.spacing_xyz_mm[1])
-        sz = float(self.ct.spacing_xyz_mm[2])
-        sagittal_scale = orthogonal_row_scale(sz, sy)
-        coronal_scale = orthogonal_row_scale(sz, sx)
+        min_dose, max_dose = self.get_dose_display_range()
+        render_state = build_orthogonal_render_state(
+            self.ct,
+            self.rtstruct,
+            self.sampled_dose_volume_ct,
+            row_idx,
+            col_idx,
+            lo,
+            hi,
+            self.current_dose_alpha(),
+            min_dose,
+            max_dose,
+            self.structure_is_visible,
+        )
 
-        sagittal_plane = self.ct.volume_hu[:, :, col_idx]
-        coronal_plane = self.ct.volume_hu[:, row_idx, :]
-        sagittal_plane = resample_orthogonal_plane(sagittal_plane, sz, sy)
-        coronal_plane = resample_orthogonal_plane(coronal_plane, sz, sx)
+        self.sagittal_ct_item.setImage(render_state.sagittal_plane, levels=(lo, hi), autoLevels=False)
+        self.coronal_ct_item.setImage(render_state.coronal_plane, levels=(lo, hi), autoLevels=False)
+        self.sagittal_dose_item.setImage(render_state.sagittal_dose_rgba, autoLevels=False)
+        self.coronal_dose_item.setImage(render_state.coronal_dose_rgba, autoLevels=False)
 
-        self.sagittal_ct_item.setImage(sagittal_plane, levels=(lo, hi), autoLevels=False)
-        self.coronal_ct_item.setImage(coronal_plane, levels=(lo, hi), autoLevels=False)
-
-        if self.sampled_dose_volume_ct is not None:
-            min_dose, max_dose = self.get_dose_display_range()
-            sagittal_dose = resample_orthogonal_plane(self.sampled_dose_volume_ct[:, :, col_idx], sz, sy)
-            coronal_dose = resample_orthogonal_plane(self.sampled_dose_volume_ct[:, row_idx, :], sz, sx)
-            self.sagittal_dose_item.setImage(
-                dose_to_rgba(
-                    sagittal_dose,
-                    alpha=self.current_dose_alpha(),
-                    min_dose_gy=min_dose,
-                    max_dose_gy=max_dose,
-                ),
-                autoLevels=False,
-            )
-            self.coronal_dose_item.setImage(
-                dose_to_rgba(
-                    coronal_dose,
-                    alpha=self.current_dose_alpha(),
-                    min_dose_gy=min_dose,
-                    max_dose_gy=max_dose,
-                ),
-                autoLevels=False,
-            )
-            self.add_isodose_items(self.sagittal_view, self.sagittal_isodose_items, sagittal_dose)
-            self.add_isodose_items(self.coronal_view, self.coronal_isodose_items, coronal_dose)
+        if render_state.sagittal_dose_plane is not None and render_state.coronal_dose_plane is not None:
+            self.add_isodose_items(self.sagittal_view, self.sagittal_isodose_items, render_state.sagittal_dose_plane)
+            self.add_isodose_items(self.coronal_view, self.coronal_isodose_items, render_state.coronal_dose_plane)
         else:
-            self.sagittal_dose_item.setImage(np.zeros(sagittal_plane.shape + (4,), dtype=np.uint8), autoLevels=False)
-            self.coronal_dose_item.setImage(np.zeros(coronal_plane.shape + (4,), dtype=np.uint8), autoLevels=False)
             self.clear_overlay_items(self.sagittal_view, self.sagittal_isodose_items)
             self.clear_overlay_items(self.coronal_view, self.coronal_isodose_items)
 
@@ -5542,38 +5481,8 @@ h2 {{
             self.update_max_dose_markers()
             return
 
-        for idx, structure in enumerate(self.rtstruct.structures):
-            if not self.structure_is_visible(idx):
-                continue
-            pen = pg.mkPen(color=structure.color_rgb, width=4)
-            sagittal_samples: Dict[int, List[float]] = {}
-            coronal_samples: Dict[int, List[float]] = {}
-            for slice_index, contours in structure.points_rc_by_slice.items():
-                for contour_rc in contours:
-                    sagittal_intersections = line_intersections_at_col(contour_rc, float(col_idx))
-                    if sagittal_intersections:
-                        sagittal_samples.setdefault(slice_index, []).extend(sagittal_intersections)
-
-                    coronal_intersections = line_intersections_at_row(contour_rc, float(row_idx))
-                    if coronal_intersections:
-                        coronal_samples.setdefault(slice_index, []).extend(coronal_intersections)
-
-            for slice_index in sagittal_samples:
-                sagittal_samples[slice_index].sort()
-            for slice_index in coronal_samples:
-                coronal_samples[slice_index].sort()
-
-            for xs, ys in build_outline_series(sagittal_samples, sagittal_scale):
-                curve = pg.PlotCurveItem(x=xs, y=ys, pen=pen)
-                curve.setZValue(2)
-                self.sagittal_view.addItem(curve)
-                self.sagittal_contour_items.append(curve)
-
-            for xs, ys in build_outline_series(coronal_samples, coronal_scale):
-                curve = pg.PlotCurveItem(x=xs, y=ys, pen=pen)
-                curve.setZValue(2)
-                self.coronal_view.addItem(curve)
-                self.coronal_contour_items.append(curve)
+        apply_polyline_specs(self.sagittal_view, self.sagittal_contour_items, render_state.sagittal_contours)
+        apply_polyline_specs(self.coronal_view, self.coronal_contour_items, render_state.coronal_contours)
 
         self.update_max_dose_markers()
 
@@ -5585,15 +5494,16 @@ h2 {{
             return
 
         mouse_point = self.axial_view.mapSceneToView(event.scenePos())
-        c = int(round(mouse_point.x()))
-        r = int(round(mouse_point.y()))
-        if 0 <= r < self.ct.rows and 0 <= c < self.ct.cols:
-            self.current_row = r
-            self.current_col = c
-            ww, wl = self.get_window_level()
-            lo = wl - ww / 2.0
-            hi = wl + ww / 2.0
-            self.update_orthogonal_views(lo, hi)
+        indices = resolve_axial_indices(self.ct, float(mouse_point.x()), float(mouse_point.y()))
+        if indices is None:
+            return
+        r, c = indices
+        self.current_row = r
+        self.current_col = c
+        ww, wl = self.get_window_level()
+        lo = wl - ww / 2.0
+        hi = wl + ww / 2.0
+        self.update_orthogonal_views(lo, hi)
 
     def update_display(self):
         if self.ct is None:
@@ -5602,61 +5512,39 @@ h2 {{
             return
 
         k = int(self.slice_slider.value())
-        ct_plane = self.ct.volume_hu[k]
         ww, wl = self.get_window_level()
         lo = wl - ww / 2.0
         hi = wl + ww / 2.0
 
-        self.ct_item.setImage(ct_plane, levels=(lo, hi), autoLevels=False)
+        min_dose, max_dose = self.get_dose_display_range()
+        render_state = build_axial_render_state(
+            self.ct,
+            self.dose,
+            self.rtstruct,
+            self.sampled_dose_volume_ct,
+            k,
+            lo,
+            hi,
+            self.current_dose_alpha(),
+            min_dose,
+            max_dose,
+            self.structure_is_visible,
+        )
 
-        if self.dose is not None:
-            if self.sampled_dose_volume_ct is not None:
-                dose_plane = self.sampled_dose_volume_ct[k]
-            else:
-                dose_plane = sample_dose_to_ct_slice(self.ct, self.dose, k)
-            self.displayed_dose_plane = dose_plane
-            min_dose, max_dose = self.get_dose_display_range()
-            rgba = dose_to_rgba(
-                dose_plane,
-                alpha=self.current_dose_alpha(),
-                min_dose_gy=min_dose,
-                max_dose_gy=max_dose,
-            )
-            self.dose_item.setImage(rgba, autoLevels=False)
-            self.add_isodose_items(self.axial_view, self.axial_isodose_items, dose_plane)
+        self.ct_item.setImage(render_state.ct_plane, levels=(lo, hi), autoLevels=False)
+        self.displayed_dose_plane = render_state.dose_plane
+        self.dose_item.setImage(render_state.dose_rgba, autoLevels=False)
+        if render_state.dose_plane is not None:
+            self.add_isodose_items(self.axial_view, self.axial_isodose_items, render_state.dose_plane)
         else:
-            self.displayed_dose_plane = None
-            empty = np.zeros((self.ct.rows, self.ct.cols, 4), dtype=np.uint8)
-            self.dose_item.setImage(empty, autoLevels=False)
             self.clear_overlay_items(self.axial_view, self.axial_isodose_items)
 
         self.clear_overlay_items(self.axial_view, self.axial_contour_items)
+        apply_polyline_specs(self.axial_view, self.axial_contour_items, render_state.contour_specs)
 
-        if self.rtstruct is not None:
-            for idx, s in enumerate(self.rtstruct.structures):
-                if not self.structure_is_visible(idx):
-                    continue
-                for rc in s.points_rc_by_slice.get(k, []):
-                    rr = np.asarray(rc[:, 0], dtype=np.float32)
-                    cc = np.asarray(rc[:, 1], dtype=np.float32)
-                    if rr.size >= 2 and cc.size >= 2:
-                        first_row = float(rr[0])
-                        first_col = float(cc[0])
-                        if not (np.isclose(float(rr[-1]), first_row) and np.isclose(float(cc[-1]), first_col)):
-                            rr = np.append(rr, np.float32(first_row))
-                            cc = np.append(cc, np.float32(first_col))
-                    curve = pg.PlotCurveItem(
-                        x=cc,
-                        y=rr,
-                        pen=pg.mkPen(color=s.color_rgb, width=4),
-                    )
-                    curve.setZValue(2)
-                    self.axial_view.addItem(curve)
-                    self.axial_contour_items.append(curve)
-
-        self.slice_label.setText(f"Slice: {k + 1}/{self.ct.volume_hu.shape[0]}")
-        self.z_label.setText(f"Plane pos: {self.ct.z_positions_mm[k]:.2f}")
-        self.window_label.setText(f"WL/WW: {int(wl)} / {int(ww)}")
+        self.slice_label.setText(render_state.slice_label_text)
+        self.z_label.setText(render_state.z_label_text)
+        self.window_label.setText(render_state.window_label_text)
         self.update_dose_range_controls()
         self.update_max_dose_markers()
         self.update_axial_overlay_positions()
@@ -5665,16 +5553,22 @@ h2 {{
         margin = 10
         if hasattr(self, "axial_autoscroll_overlay"):
             self.axial_autoscroll_overlay.adjustSize()
-            self.axial_autoscroll_overlay.move(margin, margin)
+        if hasattr(self, "axial_readout_label"):
+            self.axial_readout_label.adjustSize()
+        readout_width = self.axial_readout_label.width() if hasattr(self, "axial_readout_label") else 0
+        overlay_positions = build_axial_overlay_positions(
+            self.axial_graphics_widget.width(),
+            readout_width,
+            margin=margin,
+        )
+        if hasattr(self, "axial_autoscroll_overlay"):
+            self.axial_autoscroll_overlay.move(*overlay_positions.autoscroll_pos)
         if not hasattr(self, "axial_readout_label"):
             return
         if self.ct is None:
             self.axial_readout_label.hide()
             return
-        self.axial_readout_label.adjustSize()
-        x = max(margin, self.axial_graphics_widget.width() - self.axial_readout_label.width() - margin)
-        y = margin
-        self.axial_readout_label.move(x, y)
+        self.axial_readout_label.move(*overlay_positions.readout_pos)
 
     def on_mouse_moved(self, pos):
         if self.ct is None or self.autoscroll_button.isChecked():
@@ -5682,18 +5576,17 @@ h2 {{
             return
 
         mouse_point = self.axial_view.mapSceneToView(pos)
-        c = int(round(mouse_point.x()))
-        r = int(round(mouse_point.y()))
-        if not (0 <= r < self.ct.rows and 0 <= c < self.ct.cols):
+        indices = resolve_axial_indices(self.ct, float(mouse_point.x()), float(mouse_point.y()))
+        if indices is None:
             self.axial_readout_label.hide()
             return
+        r, c = indices
 
         k = int(self.slice_slider.value())
-        hu = float(self.ct.volume_hu[k, r, c])
-        msg = f"HU {hu:.1f}"
-        if self.displayed_dose_plane is not None:
-            dose_gy = float(self.displayed_dose_plane[r, c])
-            msg += f"\nDose {dose_gy:.2f} Gy"
+        msg = build_axial_hover_text(self.ct, self.displayed_dose_plane, k, r, c)
+        if msg is None:
+            self.axial_readout_label.hide()
+            return
         self.axial_readout_label.setText(msg)
         self.update_axial_overlay_positions()
         self.axial_readout_label.show()
