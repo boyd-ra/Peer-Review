@@ -3383,7 +3383,11 @@ h2 {{
         ]
         if not visible_curves:
             return
-        max_dose = max(float(curve.dose_bins_gy[-1]) for curve in visible_curves)
+        max_dose = max(
+            float(self.get_dvh_plot_arrays(curve)[0][-1])
+            for curve in visible_curves
+            if self.get_dvh_plot_arrays(curve)[0].size
+        )
         self.dvh_plot.setXRange(0.0, max(max_dose, 1.0), padding=0.02)
         self.dvh_plot.setYRange(0.0, 100.0, padding=0.02)
 
@@ -3522,7 +3526,10 @@ h2 {{
         for curve in self.dvh_curves:
             if curve.dose_bins_gy.size == 0:
                 continue
-            clamped_dose = float(np.clip(clicked_dose, float(curve.dose_bins_gy[0]), float(curve.dose_bins_gy[-1])))
+            plot_dose_bins, _plot_volume_pct = self.get_dvh_plot_arrays(curve)
+            if plot_dose_bins.size == 0:
+                continue
+            clamped_dose = float(np.clip(clicked_dose, float(plot_dose_bins[0]), float(plot_dose_bins[-1])))
             volume_pct = float(volume_pct_at_dose_gy(curve, clamped_dose))
             curve_scene_pos = plot_item.vb.mapViewToScene(QtCore.QPointF(clamped_dose, volume_pct))
             distance_px = float(QtCore.QLineF(scene_pos, curve_scene_pos).length())
@@ -3564,7 +3571,11 @@ h2 {{
             return
 
         view_pos = plot_item.vb.mapSceneToView(scene_pos)
-        dose_gy = float(np.clip(view_pos.x(), float(curve.dose_bins_gy[0]), float(curve.dose_bins_gy[-1])))
+        plot_dose_bins, _plot_volume_pct = self.get_dvh_plot_arrays(curve)
+        if plot_dose_bins.size == 0:
+            self.clear_dvh_curve_selection()
+            return
+        dose_gy = float(np.clip(view_pos.x(), float(plot_dose_bins[0]), float(plot_dose_bins[-1])))
         volume_pct = float(volume_pct_at_dose_gy(curve, dose_gy))
         volume_cc = float(volume_cc_at_dose_gy(curve, dose_gy))
         self.dvh_curve_marker.setData(
@@ -3624,11 +3635,7 @@ h2 {{
             normalized_name = normalize_structure_name(curve.name)
             if not self.dvh_structure_is_visible(normalized_name):
                 continue
-            plot_dose_bins = curve.dose_bins_gy
-            plot_volume_pct = curve.volume_pct
-            if plot_dose_bins.size > 1 and float(plot_dose_bins[0]) <= 0.0:
-                plot_dose_bins = plot_dose_bins[1:]
-                plot_volume_pct = plot_volume_pct[1:]
+            plot_dose_bins, plot_volume_pct = self.get_dvh_plot_arrays(curve)
             item = self.dvh_plot.plot(
                 plot_dose_bins,
                 plot_volume_pct,
@@ -3648,7 +3655,20 @@ h2 {{
                 )
             else:
                 self.fit_dvh_view_to_visible_curves()
-        self.update_dvh_curve_highlighting()
+
+    def get_dvh_plot_arrays(self, curve: DVHCurve) -> Tuple[np.ndarray, np.ndarray]:
+        plot_dose_bins = curve.dose_bins_gy
+        plot_volume_pct = curve.volume_pct
+        if plot_dose_bins.size <= 1 or plot_volume_pct.size != plot_dose_bins.size:
+            return plot_dose_bins, plot_volume_pct
+        zero_indices = np.flatnonzero(plot_volume_pct.astype(np.float64) <= 1e-6)
+        if zero_indices.size == 0:
+            return plot_dose_bins, plot_volume_pct
+        end_index = max(int(zero_indices[0]) + 1, 2)
+        return (
+            plot_dose_bins[:end_index].astype(np.float32, copy=False),
+            plot_volume_pct[:end_index].astype(np.float32, copy=False),
+        )
         if self.selected_dvh_curve_name is None:
             self.dvh_readout_label.setText("Click a DVH curve to inspect dose and volume.")
 
