@@ -92,13 +92,16 @@ from peer_models import (
     StructureSliceContours,
 )
 from peer_targets import (
+    build_target_table_rows as build_target_table_rows_helper,
     build_target_notes_for_save as build_target_notes_for_save_helper,
+    compute_stereotactic_indices as compute_stereotactic_indices_helper,
     compute_stereotactic_owned_volume_cc as compute_stereotactic_owned_volume_cc_helper,
     compose_target_note_text as compose_target_note_text_helper,
     extract_manual_target_notes as extract_manual_target_notes_helper,
     get_default_stereotactic_dose_text as get_default_stereotactic_dose_text_helper,
     get_phase_target_assignments as get_phase_target_assignments_helper,
     get_preferred_manual_target_parent_name as get_preferred_manual_target_parent_name_helper,
+    get_primary_target_context as get_primary_target_context_helper,
     get_sorted_ptv_structures as get_sorted_ptv_structures_helper,
     get_stereotactic_competing_ptv_entries as get_stereotactic_competing_ptv_entries_helper,
     get_target_fraction_count as get_target_fraction_count_helper,
@@ -5058,96 +5061,27 @@ h2 {{
     ) -> Tuple[str, str, str, str, str]:
         if self.ct is None:
             return "", "", "", "", ""
-
-        normalized_name = normalize_structure_name(structure.name)
-        cache_key = (normalized_name, source_key, round(float(threshold_gy), 3), int(fractions_planned))
-        cached = self.stereotactic_metrics_cache.get(cache_key)
-        if cached is not None:
-            volume_cc, ci_value, pci_value, gi_value, brain_metric_cc = cached
-            brain_metric_text = ""
-            if fractions_planned == 1:
-                brain_metric_text = f"V12Gy (Brain-GTV) {brain_metric_cc:.1f} cc"
-            elif fractions_planned == 5:
-                brain_metric_text = f"V24Gy (Brain) {brain_metric_cc:.1f} cc"
-            return (
-                f"Vol {volume_cc:.2f} cc",
-                f"CI {ci_value:.2f}",
-                f"PCI {pci_value:.2f}",
-                f"GI {gi_value:.2f}",
-                brain_metric_text,
-            )
-
-        ptv_volume_cc = self.get_structure_geometry_volume_cc(structure)
-        if ptv_volume_cc <= 0.0:
-            return "", "", "", "", ""
-        ownership_thresholds = [threshold_gy, threshold_gy * 0.5]
-        if fractions_planned == 1:
-            ownership_thresholds.append(12.0)
-        elif fractions_planned == 5:
-            ownership_thresholds.append(24.0)
-        context = self.get_stereotactic_volume_context(
+        return compute_stereotactic_indices_helper(
             structure,
-            source_key,
-            min(ownership_thresholds),
-        )
-        if context is None:
-            return "", "", "", "", ""
-
-        ci_isodose_volume_cc = self.compute_stereotactic_owned_volume_cc(
-            context,
             threshold_gy,
-        )
-        gi_reference_volume_cc = ci_isodose_volume_cc
-        gradient_isodose_volume_cc = self.compute_stereotactic_owned_volume_cc(
-            context,
-            threshold_gy * 0.5,
-        )
-        ci_value = ci_isodose_volume_cc / ptv_volume_cc
-        coverage_decimal = float(np.clip(coverage_pct / 100.0, 0.0, 1.0))
-        pci_value = float((coverage_decimal ** 2) / ci_value) if ci_value > 0.0 else 0.0
-        gi_value = gradient_isodose_volume_cc / gi_reference_volume_cc if gi_reference_volume_cc > 0.0 else 0.0
-        brain_metric_cc = 0.0
-        brain_metric_text = ""
-        brain_structure = self.get_brain_structure()
-        if brain_structure is not None and fractions_planned in {1, 5}:
-            extra_mask = self.get_structure_volume_mask(brain_structure)
-            if fractions_planned == 1:
-                nested_gtv_structures = [
-                    nested_structure
-                    for nested_structure in self.get_nested_target_structures(structure)
-                    if normalize_structure_name(nested_structure.name).startswith("GTV")
-                ]
-                if nested_gtv_structures:
-                    gtv_union_mask = np.zeros_like(extra_mask, dtype=bool)
-                    for nested_gtv_structure in nested_gtv_structures:
-                        gtv_union_mask |= self.get_structure_volume_mask(nested_gtv_structure)
-                    extra_mask = extra_mask & ~gtv_union_mask
-                brain_metric_cc = self.compute_stereotactic_owned_volume_cc(
-                    context,
-                    12.0,
-                    extra_mask=extra_mask,
-                )
-                brain_metric_text = f"V12Gy (Brain-GTV) {brain_metric_cc:.1f} cc"
-            elif fractions_planned == 5:
-                brain_metric_cc = self.compute_stereotactic_owned_volume_cc(
-                    context,
-                    24.0,
-                    extra_mask=extra_mask,
-                )
-                brain_metric_text = f"V24Gy (Brain) {brain_metric_cc:.1f} cc"
-        self.stereotactic_metrics_cache[cache_key] = (
-            ptv_volume_cc,
-            ci_value,
-            pci_value,
-            gi_value,
-            brain_metric_cc,
-        )
-        return (
-            f"Vol {ptv_volume_cc:.2f} cc",
-            f"CI {ci_value:.2f}",
-            f"PCI {pci_value:.2f}",
-            f"GI {gi_value:.2f}",
-            brain_metric_text,
+            coverage_pct,
+            source_key,
+            fractions_planned,
+            stereotactic_metrics_cache=self.stereotactic_metrics_cache,
+            get_structure_geometry_volume_cc=self.get_structure_geometry_volume_cc,
+            get_stereotactic_volume_context=lambda target_structure, target_source_key, minimum_threshold: self.get_stereotactic_volume_context(
+                target_structure,
+                target_source_key,
+                minimum_threshold,
+            ),
+            compute_stereotactic_owned_volume_cc=lambda context, value_threshold_gy, extra_mask: self.compute_stereotactic_owned_volume_cc(
+                context,
+                value_threshold_gy,
+                extra_mask=extra_mask,
+            ),
+            get_brain_structure=self.get_brain_structure,
+            get_structure_volume_mask=self.get_structure_volume_mask,
+            get_nested_target_structures=self.get_nested_target_structures,
         )
 
     def get_primary_target_context(
@@ -5156,42 +5090,19 @@ h2 {{
         phase_assignments: Dict[str, Tuple[RTPlanPhase, float]],
         single_phase: Optional[RTPlanPhase],
     ) -> Tuple[float, str, Tuple[Optional[float], Optional[float], Optional[float]]]:
-        normalized_name = normalize_structure_name(structure.name)
-        total_rx_gy = self.parse_ptv_rx_gy_from_name(structure.name)
-        natural_reference_gy = total_rx_gy if total_rx_gy is not None else 0.0
-        source_key = "combined"
-        phase_assignment = phase_assignments.get(normalized_name)
-        if phase_assignment is not None:
-            phase, phase_rx_gy = phase_assignment
-            natural_reference_gy = phase_rx_gy
-            source_key = phase.dose_path
-        reference_override_gy = self.get_stereotactic_threshold_gy(normalized_name, structure.name)
-        rx_reference_gy = reference_override_gy if reference_override_gy is not None else natural_reference_gy
-
-        metric_values: Tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
-        if rx_reference_gy > 0.0 and source_key != "combined":
-            metric_values = self.compute_structure_target_metric_values(
-                structure,
-                rx_reference_gy,
-                source_key=source_key,
-            )
-            return rx_reference_gy, source_key, metric_values
-
-        if rx_reference_gy > 0.0 and self.sampled_dose_volume_ct is not None:
-            metric_values = self.compute_structure_target_metric_values(
-                structure,
-                rx_reference_gy,
-                source_key=source_key,
-            )
-            if metric_values[0] is None and single_phase is not None:
-                source_key = single_phase.dose_path
-                metric_values = self.compute_structure_target_metric_values(
-                    structure,
-                    rx_reference_gy,
-                    source_key=source_key,
-                )
-
-        return rx_reference_gy, source_key, metric_values
+        return get_primary_target_context_helper(
+            structure,
+            phase_assignments=phase_assignments,
+            single_phase=single_phase,
+            parse_ptv_rx_gy_from_name=self.parse_ptv_rx_gy_from_name,
+            get_stereotactic_threshold_gy=self.get_stereotactic_threshold_gy,
+            compute_structure_target_metric_values=lambda target_structure, threshold_gy, target_source_key: self.compute_structure_target_metric_values(
+                target_structure,
+                threshold_gy,
+                source_key=target_source_key,
+            ),
+            has_sampled_dose_volume_ct=self.sampled_dose_volume_ct is not None,
+        )
 
     def get_phase_target_assignments(self) -> Dict[str, Tuple[RTPlanPhase, float]]:
         return get_phase_target_assignments_helper(
@@ -5201,145 +5112,31 @@ h2 {{
         )
 
     def build_target_table_rows(self) -> List[Dict[str, object]]:
-        if self.rtstruct is None or self.ct is None:
-            return []
-
-        phase_assignments = self.get_phase_target_assignments()
-        single_phase: Optional[RTPlanPhase] = None
-        available_phases = [
-            phase
-            for phase in self.plan_phases
-            if phase.prescription_dose_gy > 0.0 and phase.dose_path
-        ]
-        if len(available_phases) == 1:
-            single_phase = available_phases[0]
-        rows: List[Dict[str, object]] = []
-        for structure in self.get_sorted_ptv_structures():
-            normalized_name = normalize_structure_name(structure.name)
-            total_rx_gy = self.parse_ptv_rx_gy_from_name(structure.name)
-            initial_reference_gy = self.get_stereotactic_threshold_gy(normalized_name, structure.name)
-
-            minimum_dose_text = ""
-            maximum_dose_text = ""
-            coverage_text = f"@ {initial_reference_gy:.2f} Gy" if initial_reference_gy is not None and initial_reference_gy > 0.0 else ""
-            stereotactic_summary_text = ""
-            (
-                rx_reference_gy,
-                source_key,
-                primary_metric_values,
-            ) = self.get_primary_target_context(
-                structure,
-                phase_assignments,
-                single_phase,
-            )
-            fractions_planned = self.get_target_fraction_count(
-                normalized_name,
-                source_key,
-                phase_assignments,
-                single_phase,
-            )
-            min_dose_gy, max_dose_gy, coverage_pct = primary_metric_values
-            if min_dose_gy is not None and max_dose_gy is not None and coverage_pct is not None:
-                minimum_dose_text = self.format_target_dose_text(min_dose_gy, rx_reference_gy)
-                maximum_dose_text = self.format_target_dose_text(max_dose_gy, rx_reference_gy)
-                coverage_text = f"{coverage_pct:.1f}% @ {rx_reference_gy:.2f} Gy"
-
-            rows.append(
-                {
-                    "structure_name": structure.name,
-                    "normalized_name": normalized_name,
-                    "parent_structure_name": None,
-                    "parent_normalized_name": None,
-                    "display_name": structure.name,
-                    "reference_dose_text": f"{rx_reference_gy:.2f}" if rx_reference_gy > 0.0 else "",
-                    "coverage_text": coverage_text,
-                    "minimum_dose_text": minimum_dose_text,
-                    "maximum_dose_text": maximum_dose_text,
-                    "notes_text": stereotactic_summary_text,
-                    "is_primary_ptv": True,
-                    "color_rgb": structure.color_rgb,
-                }
-            )
-
-            if self.stereotactic_summary_enabled():
-                stereotactic_volume_text = ""
-                stereotactic_ci_text = ""
-                stereotactic_pci_text = ""
-                stereotactic_gi_text = ""
-                stereotactic_brain_metric_text = ""
-                stereotactic_hi_text = ""
-                if coverage_pct is not None and rx_reference_gy > 0.0:
-                    (
-                        stereotactic_volume_text,
-                        stereotactic_ci_text,
-                        stereotactic_pci_text,
-                        stereotactic_gi_text,
-                        stereotactic_brain_metric_text,
-                    ) = self.compute_stereotactic_indices(
-                        structure,
-                        rx_reference_gy,
-                        coverage_pct,
-                        source_key=source_key,
-                        fractions_planned=fractions_planned,
-                    )
-                if max_dose_gy is not None and rx_reference_gy > 0.0:
-                    stereotactic_hi_text = f"HI {max_dose_gy / rx_reference_gy:.2f}"
-                stereotactic_parts = [
-                    text
-                    for text in (
-                        stereotactic_volume_text,
-                        stereotactic_ci_text,
-                        stereotactic_pci_text,
-                        stereotactic_gi_text,
-                        stereotactic_hi_text,
-                        stereotactic_brain_metric_text,
-                    )
-                    if text
-                ]
-                if stereotactic_parts:
-                    rows[-1]["notes_text"] = "    ".join(stereotactic_parts)
-
-            for nested_structure in self.get_nested_target_structures(structure):
-                nested_normalized_name = normalize_structure_name(nested_structure.name)
-                nested_minimum_dose_text = ""
-                nested_maximum_dose_text = ""
-                nested_coverage_text = f"@ {rx_reference_gy:.2f} Gy"
-                if rx_reference_gy > 0.0:
-                    nested_metric_source_key = source_key
-                    nested_metric_values = self.compute_structure_target_metric_values(
-                        nested_structure,
-                        rx_reference_gy,
-                        source_key=nested_metric_source_key,
-                    )
-                    if (
-                        nested_metric_values[0] is None
-                        and nested_metric_source_key != "combined"
-                        and self.sampled_dose_volume_ct is not None
-                    ):
-                        nested_metric_source_key = "combined"
-                    nested_minimum_dose_text, nested_maximum_dose_text, nested_coverage_text = self.compute_structure_target_metrics(
-                        nested_structure,
-                        rx_reference_gy,
-                        source_key=nested_metric_source_key,
-                    )
-                rows.append(
-                    {
-                        "structure_name": nested_structure.name,
-                        "normalized_name": nested_normalized_name,
-                        "parent_structure_name": structure.name,
-                        "parent_normalized_name": normalized_name,
-                        "display_name": f"    {nested_structure.name}",
-                        "reference_dose_text": f"{rx_reference_gy:.2f}" if rx_reference_gy > 0.0 else "",
-                        "coverage_text": nested_coverage_text,
-                        "minimum_dose_text": nested_minimum_dose_text,
-                        "maximum_dose_text": nested_maximum_dose_text,
-                        "notes_text": "",
-                        "is_primary_ptv": False,
-                        "color_rgb": nested_structure.color_rgb,
-                    }
-                )
-
-        return rows
+        return build_target_table_rows_helper(
+            rtstruct=self.rtstruct,
+            has_ct=self.ct is not None,
+            plan_phases=self.plan_phases,
+            sorted_ptv_structures=self.get_sorted_ptv_structures(),
+            phase_assignments=self.get_phase_target_assignments(),
+            stereotactic_summary_enabled=self.stereotactic_summary_enabled(),
+            parse_ptv_rx_gy_from_name=self.parse_ptv_rx_gy_from_name,
+            get_stereotactic_threshold_gy=self.get_stereotactic_threshold_gy,
+            get_primary_target_context=self.get_primary_target_context,
+            get_target_fraction_count=self.get_target_fraction_count,
+            compute_stereotactic_indices=self.compute_stereotactic_indices,
+            get_nested_target_structures=self.get_nested_target_structures,
+            compute_structure_target_metric_values=lambda target_structure, threshold_gy, target_source_key: self.compute_structure_target_metric_values(
+                target_structure,
+                threshold_gy,
+                source_key=target_source_key,
+            ),
+            compute_structure_target_metrics=lambda target_structure, threshold_gy, target_source_key: self.compute_structure_target_metrics(
+                target_structure,
+                threshold_gy,
+                source_key=target_source_key,
+            ),
+            format_target_dose_text=self.format_target_dose_text,
+        )
 
     def get_target_table_rows(self) -> List[Dict[str, object]]:
         if self.cached_target_table_rows is None:
