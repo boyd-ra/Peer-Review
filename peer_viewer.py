@@ -77,6 +77,15 @@ from peer_constraints_table import (
     prostate_constraint_summary_enabled as prostate_constraint_summary_enabled_helper,
     refresh_constraints_table,
 )
+from peer_dvh_controller import (
+    build_dvh_readout_state,
+    find_nearest_dvh_curve_name as find_nearest_dvh_curve_name_helper,
+    get_curve_for_name as get_curve_for_name_helper,
+    get_current_curve_names as get_current_dvh_curve_names_helper,
+    get_dvh_plot_arrays as get_dvh_plot_arrays_helper,
+    get_visible_dvh_curves as get_visible_dvh_curves_helper,
+    get_visible_dvh_view_range,
+)
 from peer_io import (
     get_constraints_workbook_path,
     list_constraints_workbook_sheets,
@@ -3058,25 +3067,15 @@ h2 {{
         )
 
     def get_visible_dvh_curves(self) -> List[DVHCurve]:
-        return [
-            curve
-            for curve in self.dvh_curves
-            if self.dvh_structure_is_visible(normalize_structure_name(curve.name))
-        ]
+        return get_visible_dvh_curves_helper(self.dvh_curves, self.dvh_structure_is_visible)
 
     def fit_dvh_view_to_visible_curves(self) -> None:
-        visible_curves = [
-            curve for curve in self.get_visible_dvh_curves() if curve.dose_bins_gy.size
-        ]
-        if not visible_curves:
+        view_range = get_visible_dvh_view_range(self.dvh_curves, self.dvh_structure_is_visible)
+        if view_range is None:
             return
-        max_dose = max(
-            float(self.get_dvh_plot_arrays(curve)[0][-1])
-            for curve in visible_curves
-            if self.get_dvh_plot_arrays(curve)[0].size
-        )
-        self.dvh_plot.setXRange(0.0, max(max_dose, 1.0), padding=0.02)
-        self.dvh_plot.setYRange(0.0, 100.0, padding=0.02)
+        x_range, y_range = view_range
+        self.dvh_plot.setXRange(x_range[0], x_range[1], padding=0.02)
+        self.dvh_plot.setYRange(y_range[0], y_range[1], padding=0.02)
 
     def get_autoscroll_speed_mm_per_s(self) -> Optional[float]:
         if self.ct is None:
@@ -3156,10 +3155,7 @@ h2 {{
         self.clear_dvh_curve_selection()
 
     def get_curve_for_name(self, normalized_name: str) -> Optional[DVHCurve]:
-        for curve in self.dvh_curves:
-            if normalize_structure_name(curve.name) == normalized_name:
-                return curve
-        return None
+        return get_curve_for_name_helper(self.dvh_curves, normalized_name)
 
     def update_dvh_curve_highlighting(self):
         for normalized_name, item in self.dvh_plot_items.items():
@@ -3193,47 +3189,12 @@ h2 {{
             )
 
     def find_nearest_dvh_curve_name(self, scene_pos: QtCore.QPointF, tolerance_px: float = 16.0) -> Optional[str]:
-        if not self.dvh_curves:
-            return None
-
-        plot_item = self.dvh_plot.getPlotItem()
-        if not plot_item.vb.sceneBoundingRect().contains(scene_pos):
-            return None
-
-        view_pos = plot_item.vb.mapSceneToView(scene_pos)
-        clicked_dose = float(view_pos.x())
-        clicked_volume = float(view_pos.y())
-        x_range, y_range = plot_item.vb.viewRange()
-        x_span = max(float(x_range[1] - x_range[0]), 1e-6)
-        y_span = max(float(y_range[1] - y_range[0]), 1e-6)
-        best_name: Optional[str] = None
-        best_distance_px: Optional[float] = None
-        best_normalized_score: Optional[float] = None
-
-        for curve in self.dvh_curves:
-            if curve.dose_bins_gy.size == 0:
-                continue
-            plot_dose_bins, _plot_volume_pct = self.get_dvh_plot_arrays(curve)
-            if plot_dose_bins.size == 0:
-                continue
-            clamped_dose = float(np.clip(clicked_dose, float(plot_dose_bins[0]), float(plot_dose_bins[-1])))
-            volume_pct = float(volume_pct_at_dose_gy(curve, clamped_dose))
-            curve_scene_pos = plot_item.vb.mapViewToScene(QtCore.QPointF(clamped_dose, volume_pct))
-            distance_px = float(QtCore.QLineF(scene_pos, curve_scene_pos).length())
-            dose_distance = abs(clamped_dose - clicked_dose) / x_span
-            volume_distance = abs(volume_pct - clicked_volume) / y_span
-            normalized_score = volume_distance + 0.35 * dose_distance
-            if best_distance_px is None or distance_px < best_distance_px:
-                best_distance_px = distance_px
-            if best_normalized_score is None or normalized_score < best_normalized_score:
-                best_normalized_score = normalized_score
-                best_name = normalize_structure_name(curve.name)
-
-        if best_distance_px is not None and best_distance_px <= tolerance_px:
-            return best_name
-        if best_normalized_score is not None and best_normalized_score <= 0.15:
-            return best_name
-        return None
+        return find_nearest_dvh_curve_name_helper(
+            self.dvh_curves,
+            self.dvh_plot.getPlotItem(),
+            scene_pos,
+            tolerance_px=tolerance_px,
+        )
 
     def update_dvh_curve_readout(self, scene_pos: QtCore.QPointF):
         if self.selected_dvh_curve_name is None:
@@ -3248,7 +3209,8 @@ h2 {{
             return
 
         plot_item = self.dvh_plot.getPlotItem()
-        if not plot_item.vb.sceneBoundingRect().contains(scene_pos):
+        readout_state = build_dvh_readout_state(curve, plot_item, scene_pos)
+        if readout_state is None:
             self.dvh_curve_marker.setData([], [])
             self.dvh_crosshair_vline.setVisible(False)
             self.dvh_crosshair_hline.setVisible(False)
@@ -3257,27 +3219,17 @@ h2 {{
             )
             return
 
-        view_pos = plot_item.vb.mapSceneToView(scene_pos)
-        plot_dose_bins, _plot_volume_pct = self.get_dvh_plot_arrays(curve)
-        if plot_dose_bins.size == 0:
-            self.clear_dvh_curve_selection()
-            return
-        dose_gy = float(np.clip(view_pos.x(), float(plot_dose_bins[0]), float(plot_dose_bins[-1])))
-        volume_pct = float(volume_pct_at_dose_gy(curve, dose_gy))
-        volume_cc = float(volume_cc_at_dose_gy(curve, dose_gy))
         self.dvh_curve_marker.setData(
-            [dose_gy],
-            [volume_pct],
+            [readout_state.dose_gy],
+            [readout_state.volume_pct],
             pen=pg.mkPen(curve.color_rgb, width=2),
             brush=pg.mkBrush(curve.color_rgb),
         )
-        self.dvh_crosshair_vline.setValue(dose_gy)
-        self.dvh_crosshair_hline.setValue(volume_pct)
+        self.dvh_crosshair_vline.setValue(readout_state.dose_gy)
+        self.dvh_crosshair_hline.setValue(readout_state.volume_pct)
         self.dvh_crosshair_vline.setVisible(True)
         self.dvh_crosshair_hline.setVisible(True)
-        self.dvh_readout_label.setText(
-            f"{curve.name}: Dose {dose_gy:.2f} Gy | Volume {volume_pct:.1f}% ({volume_cc:.2f} cc)"
-        )
+        self.dvh_readout_label.setText(readout_state.text)
 
     def on_dvh_mouse_moved(self, event):
         if isinstance(event, tuple):
@@ -3344,20 +3296,7 @@ h2 {{
                 self.fit_dvh_view_to_visible_curves()
 
     def get_dvh_plot_arrays(self, curve: DVHCurve) -> Tuple[np.ndarray, np.ndarray]:
-        plot_dose_bins = curve.dose_bins_gy
-        plot_volume_pct = curve.volume_pct
-        if plot_dose_bins.size <= 1 or plot_volume_pct.size != plot_dose_bins.size:
-            return plot_dose_bins, plot_volume_pct
-        zero_indices = np.flatnonzero(plot_volume_pct.astype(np.float64) <= 1e-6)
-        if zero_indices.size == 0:
-            return plot_dose_bins, plot_volume_pct
-        end_index = max(int(zero_indices[0]) + 1, 2)
-        return (
-            plot_dose_bins[:end_index].astype(np.float32, copy=False),
-            plot_volume_pct[:end_index].astype(np.float32, copy=False),
-        )
-        if self.selected_dvh_curve_name is None:
-            self.dvh_readout_label.setText("Click a DVH curve to inspect dose and volume.")
+        return get_dvh_plot_arrays_helper(curve)
 
     def refresh_dvh(self):
         if self.ct is None or self.dose is None or self.rtstruct is None:
@@ -3453,7 +3392,7 @@ h2 {{
         self.clear_progress_status()
 
     def current_dvh_curve_names(self) -> List[str]:
-        return [normalize_structure_name(curve.name) for curve in self.dvh_curves]
+        return get_current_dvh_curve_names_helper(self.dvh_curves)
 
     def refresh_visible_structure_goal_evaluations(
         self,
