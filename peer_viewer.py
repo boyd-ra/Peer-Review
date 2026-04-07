@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import gc
-import hashlib
 import html
-import inspect
 import json
 import logging
 import math
@@ -47,14 +45,29 @@ from peer_helpers import (
     volume_cc_at_dose_gy,
     volume_pct_at_dose_gy,
 )
+from peer_cache import (
+    callable_signature_hash,
+    get_ct_geometry_signature as compute_ct_geometry_signature,
+    get_derived_array_cache_path as compute_derived_array_cache_path,
+    get_derived_array_cache_signature as compute_derived_array_cache_signature,
+    get_derived_cache_structures as select_derived_cache_structures,
+    get_dvh_cache_path as compute_dvh_cache_path,
+    load_derived_array_cache as load_derived_array_cache_file,
+    save_derived_array_cache as save_derived_array_cache_file,
+    write_json_atomic,
+)
 from peer_io import (
     get_constraints_workbook_path,
     list_constraints_workbook_sheets,
     load_combined_rtdose,
-    load_ct_series_and_discover_patient_files,
     load_rtdose,
     load_rtstruct,
     load_structure_constraints_sheet,
+)
+from peer_loader import (
+    build_load_timing_report_text,
+    load_patient_scan_and_discovery,
+    resample_dose_to_ct_volume,
 )
 from peer_models import (
     CTVolume,
@@ -83,14 +96,6 @@ NO_CONSTRAINTS_SHEET_LABEL = "------"
 MAX_TISSUE_ROW_LABEL = "Max Tissue"
 MAX_TISSUE_ROW_NAME = normalize_structure_name(MAX_TISSUE_ROW_LABEL)
 logger = logging.getLogger(__name__)
-
-
-def _callable_signature_hash(func) -> str:
-    try:
-        source = inspect.getsource(func)
-    except (OSError, TypeError):
-        source = repr(func)
-    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
 
 
 class RectZoomViewBox(pg.ViewBox):
@@ -895,14 +900,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_plot.scene().sigMouseClicked.connect(self.on_dvh_plot_clicked)
 
     def clear_viewer_image_items(self):
-        empty_plane = np.zeros((1, 1), dtype=np.float32)
+        empty_plane = np.zeros((1, 1), dtype=np.uint8)
         empty_rgba = np.zeros((1, 1, 4), dtype=np.uint8)
 
-        self.ct_item.setImage(empty_plane, autoLevels=False)
+        self.ct_item.setImage(empty_plane, autoLevels=False, levels=(0, 255))
         self.dose_item.setImage(empty_rgba, autoLevels=False)
-        self.sagittal_ct_item.setImage(empty_plane, autoLevels=False)
+        self.sagittal_ct_item.setImage(empty_plane, autoLevels=False, levels=(0, 255))
         self.sagittal_dose_item.setImage(empty_rgba, autoLevels=False)
-        self.coronal_ct_item.setImage(empty_plane, autoLevels=False)
+        self.coronal_ct_item.setImage(empty_plane, autoLevels=False, levels=(0, 255))
         self.coronal_dose_item.setImage(empty_rgba, autoLevels=False)
 
         self.clear_overlay_items(self.axial_view, self.axial_contour_items)
@@ -1025,6 +1030,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         rtstruct_path: Optional[str] = None
         rtdose_paths: List[str] = []
         derived_array_cache_loaded = False
+        derived_array_cache_path: Optional[Path] = None
 
         self.set_heavy_view_updates_enabled(False)
         try:
@@ -1034,7 +1040,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.defer_sidebar_summary_metrics = True
 
             stage_start = perf_counter()
-            self.ct, patient_discovery = load_ct_series_and_discover_patient_files(folder)
+            self.ct, patient_discovery = load_patient_scan_and_discovery(folder)
             rtstruct_path = patient_discovery.rtstruct_path
             rtdose_paths = list(patient_discovery.rtdose_paths)
             rtplan_paths = list(patient_discovery.rtplan_paths)
@@ -1117,10 +1123,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 if not derived_array_cache_loaded or self.sampled_dose_volume_ct is None:
                     self.show_progress_status("Resampling dose", pump_events=True)
                     stage_start = perf_counter()
-                    self.sampled_dose_volume_ct = np.stack(
-                        [sample_dose_to_ct_slice(self.ct, self.dose, k) for k in range(self.ct.volume_hu.shape[0])],
-                        axis=0,
-                    )
+                    self.sampled_dose_volume_ct = resample_dose_to_ct_volume(self.ct, self.dose)
                     timing_entries.append(("Resample dose to CT grid", perf_counter() - stage_start))
                 else:
                     timing_entries.append(("Resample dose to CT grid", None))
@@ -1156,9 +1159,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             cache_load_duration: Optional[float] = None
             cache_path = self.get_dvh_cache_path()
             cache_found = cache_path is not None and cache_path.exists()
+            derived_sidecar_only = (
+                not cache_found
+                and derived_array_cache_path is not None
+                and derived_array_cache_path.exists()
+            )
             if dvh_can_start:
                 if cache_found:
                     self.show_progress_status("Found saved JSON cache", pump_events=True)
+                elif derived_sidecar_only:
+                    self.show_progress_status("Found saved derived cache only; no saved JSON review data", pump_events=True)
                 stage_start = perf_counter()
                 cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
                 cache_load_duration = perf_counter() - stage_start if cache_loaded else None
@@ -1178,6 +1188,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 else:
                     if cache_found:
                         self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
+                    elif derived_sidecar_only:
+                        self.show_progress_status("Using derived cache only; recalculating review state", pump_events=True)
                     self.show_progress_status("Computing metrics", pump_events=True)
                     self.populate_structures_list()
                     stage_start = perf_counter()
@@ -1660,88 +1672,45 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         error_message: Optional[str] = None,
     ) -> Optional[Path]:
         report_path = Path(folder) / "peer_load_timing.txt"
-        lines = [
-            "Peer Patient Load Timing Report",
-            f"Generated: {datetime.now().isoformat(sep=' ', timespec='seconds')}",
-            f"Patient folder: {folder}",
-            "",
-            "Summary",
-            f"CT shape: {self.ct.volume_hu.shape if self.ct is not None else 'not loaded'}",
-            f"Constraints file: {Path(csv_path).name if csv_path is not None else 'none'}",
-            f"Constraints sheet: {self.constraints_sheet_name or 'none'}",
-            f"RTSTRUCT file: {Path(rtstruct_path).name if rtstruct_path is not None else 'none'}",
-            f"RTDOSE files: {len(rtdose_paths)}",
-            f"Structures loaded: {len(self.rtstruct.structures) if self.rtstruct is not None else 0}",
-            "",
-            "Stage timings",
-        ]
-
-        for label, duration_s in timing_entries:
-            if duration_s is None:
-                if label == "Compute DVH (background)":
-                    lines.append(f"{label}: pending")
-                else:
-                    lines.append(f"{label}: skipped")
-            else:
-                lines.append(f"{label}: {duration_s * 1000.0:.1f} ms ({duration_s:.3f} s)")
-
-        if error_message:
-            lines.extend(["", f"Error: {error_message}"])
-
         try:
-            report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            report_path.write_text(
+                build_load_timing_report_text(
+                    folder=folder,
+                    timing_entries=timing_entries,
+                    constraints_path=csv_path,
+                    constraints_sheet_name=self.constraints_sheet_name,
+                    rtstruct_path=rtstruct_path,
+                    rtdose_paths=rtdose_paths,
+                    ct=self.ct,
+                    rtstruct=self.rtstruct,
+                    error_message=error_message,
+                ),
+                encoding="utf-8",
+            )
         except OSError:
             return None
 
         return report_path
 
     def get_dvh_cache_path(self) -> Optional[Path]:
-        if self.current_patient_folder is None:
-            return None
-        return Path(self.current_patient_folder) / "peer_dvh_constraints.json"
+        return compute_dvh_cache_path(self.current_patient_folder)
 
     def get_derived_array_cache_path(self, base_path: Optional[Path] = None) -> Optional[Path]:
-        cache_path = base_path if base_path is not None else self.get_dvh_cache_path()
-        if cache_path is None:
-            return None
-        return cache_path.with_name(f"{cache_path.stem}_arrays.npz")
+        return compute_derived_array_cache_path(base_path if base_path is not None else self.get_dvh_cache_path())
 
     def get_ct_geometry_signature(self) -> Optional[str]:
-        if self.ct is None:
-            return None
-        hasher = hashlib.sha256()
-        hasher.update(np.asarray(self.ct.volume_hu.shape, dtype=np.int32).tobytes())
-        hasher.update(np.asarray(self.ct.spacing_xyz_mm, dtype=np.float32).tobytes())
-        hasher.update(np.asarray(self.ct.z_positions_mm, dtype=np.float32).tobytes())
-        return hasher.hexdigest()[:16]
+        return compute_ct_geometry_signature(self.ct)
 
     def get_derived_array_cache_signature(self) -> Dict[str, str]:
-        return {
-            "sample_dose_to_ct_slice": _callable_signature_hash(sample_dose_to_ct_slice),
-            "build_structure_slice_mask": _callable_signature_hash(build_structure_slice_mask),
-            "get_target_structure_slice_masks": _callable_signature_hash(type(self).get_target_structure_slice_masks),
-            "get_ptv_union_slice_masks": _callable_signature_hash(type(self).get_ptv_union_slice_masks),
-        }
+        return compute_derived_array_cache_signature(
+            sample_dose_to_ct_slice_func=sample_dose_to_ct_slice,
+            build_structure_slice_mask_func=build_structure_slice_mask,
+            get_target_structure_slice_masks_func=type(self).get_target_structure_slice_masks,
+            get_ptv_union_slice_masks_func=type(self).get_ptv_union_slice_masks,
+        )
 
     def get_derived_cache_structures(self) -> List[StructureSliceContours]:
-        if self.rtstruct is None:
-            return []
-
-        structures: List[StructureSliceContours] = []
-        seen_names: set[str] = set()
-        for structure in self.rtstruct.structures:
-            normalized_name = normalize_structure_name(structure.name)
-            include = (
-                normalized_name.startswith(("PTV", "GTV", "CTV"))
-                or normalized_name in self.additional_target_subvolume_names
-                or normalized_name == "BRAIN"
-                or (normalized_name.startswith("BRAIN") and "BRAINSTEM" not in normalized_name)
-            )
-            if not include or normalized_name in seen_names:
-                continue
-            structures.append(structure)
-            seen_names.add(normalized_name)
-        return structures
+        return select_derived_cache_structures(self.rtstruct, self.additional_target_subvolume_names)
 
     def update_dvh_cache_button(self):
         self.save_cache_action.setEnabled(
@@ -2160,12 +2129,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def get_target_method_signature(self) -> Dict[str, object]:
         return {
             "dvh_helper_signature": get_dvh_method_signature(),
-            "get_primary_target_context": _callable_signature_hash(type(self).get_primary_target_context),
-            "build_target_table_rows": _callable_signature_hash(type(self).build_target_table_rows),
-            "compute_stereotactic_indices": _callable_signature_hash(type(self).compute_stereotactic_indices),
-            "get_nested_target_structures": _callable_signature_hash(type(self).get_nested_target_structures),
-            "get_max_tissue_dose_goal_lines": _callable_signature_hash(type(self).get_max_tissue_dose_goal_lines),
-            "get_default_stereotactic_dose_text": _callable_signature_hash(
+            "get_primary_target_context": callable_signature_hash(type(self).get_primary_target_context),
+            "build_target_table_rows": callable_signature_hash(type(self).build_target_table_rows),
+            "compute_stereotactic_indices": callable_signature_hash(type(self).compute_stereotactic_indices),
+            "get_nested_target_structures": callable_signature_hash(type(self).get_nested_target_structures),
+            "get_max_tissue_dose_goal_lines": callable_signature_hash(type(self).get_max_tissue_dose_goal_lines),
+            "get_default_stereotactic_dose_text": callable_signature_hash(
                 type(self).get_default_stereotactic_dose_text
             ),
         }
@@ -2461,14 +2430,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if selected_changed or normalized_name not in current_curve_names:
             self.refresh_dvh()
 
-    def save_dvh_cache(self, path: Path):
+    def save_dvh_cache(self, path: Path) -> Optional[str]:
         if self.rtstruct is None:
             raise ValueError("No RTSTRUCT data is loaded.")
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         derived_array_cache_path = self.get_derived_array_cache_path(path)
-        if derived_array_cache_path is not None:
-            self.save_derived_array_cache(derived_array_cache_path)
         payload = {
             "version": 15,
             "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
@@ -2498,7 +2465,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "constraint_notes": self.constraint_notes,
             "target_notes": self.build_target_notes_for_save(target_rows),
         }
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_json_atomic(path, payload)
+
+        if derived_array_cache_path is None:
+            return None
+
+        try:
+            self.save_derived_array_cache(derived_array_cache_path)
+        except Exception as exc:
+            logger.warning("Saved JSON review cache but failed to save derived array cache: %s", exc)
+            return f"Saved review data, but failed to save the derived array cache: {exc}"
+        return None
 
     def build_max_tissue_payload(self) -> Optional[Dict[str, object]]:
         if self.ct is None or self.rtstruct is None or self.sampled_dose_volume_ct is None:
@@ -2525,131 +2502,56 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def save_derived_array_cache(self, path: Path) -> None:
         if self.ct is None or self.rtstruct is None:
             raise ValueError("No CT/RTSTRUCT data is loaded.")
-
-        metadata: Dict[str, object] = {
-            "version": 1,
-            "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
-            "ct_geometry_signature": self.get_ct_geometry_signature(),
-            "rtstruct_fingerprint": build_file_fingerprint(self.rtstruct_path),
-            "rtdose_fingerprints": build_file_fingerprints(self.latest_timing_rtdose_paths),
-            "array_cache_signature": self.get_derived_array_cache_signature(),
-            "structures": [],
+        derived_structures = self.get_derived_cache_structures()
+        structure_order = [normalize_structure_name(structure.name) for structure in derived_structures]
+        structure_volume_masks = {
+            normalize_structure_name(structure.name): self.get_structure_volume_mask(structure)
+            for structure in derived_structures
         }
-
-        arrays: Dict[str, np.ndarray] = {
-            "metadata_json": np.asarray(json.dumps(metadata), dtype=np.str_),
+        structure_geometry_volumes_cc = {
+            normalize_structure_name(structure.name): float(self.get_structure_geometry_volume_cc(structure))
+            for structure in derived_structures
         }
-        if self.sampled_dose_volume_ct is not None:
-            arrays["sampled_dose_volume_ct"] = np.asarray(self.sampled_dose_volume_ct, dtype=np.float32)
-
-        ptv_union_volume_mask = self.get_ptv_union_volume_mask()
-        if ptv_union_volume_mask is not None:
-            arrays["ptv_union_volume_mask"] = np.asarray(ptv_union_volume_mask, dtype=np.uint8)
-
-        structure_entries: List[Dict[str, object]] = []
-        for index, structure in enumerate(self.get_derived_cache_structures()):
-            normalized_name = normalize_structure_name(structure.name)
-            mask_key = f"structure_mask_{index:03d}"
-            arrays[mask_key] = np.asarray(self.get_structure_volume_mask(structure), dtype=np.uint8)
-            structure_entries.append(
-                {
-                    "name": normalized_name,
-                    "mask_key": mask_key,
-                    "geometry_volume_cc": float(self.get_structure_geometry_volume_cc(structure)),
-                }
-            )
-
-        metadata["structures"] = structure_entries
-        arrays["metadata_json"] = np.asarray(json.dumps(metadata), dtype=np.str_)
-        np.savez_compressed(path, **arrays)
+        save_derived_array_cache_file(
+            path,
+            ct=self.ct,
+            rtstruct_path=self.rtstruct_path,
+            rtdose_paths=self.latest_timing_rtdose_paths,
+            array_cache_signature=self.get_derived_array_cache_signature(),
+            sampled_dose_volume_ct=self.sampled_dose_volume_ct,
+            ptv_union_volume_mask=self.get_ptv_union_volume_mask(),
+            structure_order=structure_order,
+            structure_volume_masks=structure_volume_masks,
+            structure_geometry_volumes_cc=structure_geometry_volumes_cc,
+        )
 
     def load_derived_array_cache(self, path: Path) -> bool:
         if self.ct is None or self.rtstruct is None:
             return False
-        try:
-            payload = np.load(path, allow_pickle=False)
-        except (OSError, ValueError):
+        loaded_cache = load_derived_array_cache_file(
+            path,
+            ct=self.ct,
+            rtstruct_path=self.rtstruct_path,
+            rtdose_paths=self.latest_timing_rtdose_paths,
+            array_cache_signature=self.get_derived_array_cache_signature(),
+        )
+        if loaded_cache is None:
             return False
-
-        try:
-            metadata_json = payload["metadata_json"].item()
-            metadata = json.loads(str(metadata_json))
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-            payload.close()
-            return False
-
-        if not isinstance(metadata, dict):
-            payload.close()
-            return False
-        if metadata.get("version") != 1:
-            payload.close()
-            return False
-        if metadata.get("ct_geometry_signature") != self.get_ct_geometry_signature():
-            payload.close()
-            return False
-        if metadata.get("array_cache_signature") != self.get_derived_array_cache_signature():
-            payload.close()
-            return False
-        if not file_fingerprint_matches(metadata.get("rtstruct_fingerprint"), self.rtstruct_path):
-            payload.close()
-            return False
-        if not file_fingerprint_list_matches(metadata.get("rtdose_fingerprints"), self.latest_timing_rtdose_paths):
-            payload.close()
-            return False
-
         loaded_any = False
-        sampled_dose_volume = payload["sampled_dose_volume_ct"] if "sampled_dose_volume_ct" in payload.files else None
-        if sampled_dose_volume is not None:
-            sampled_dose_volume = np.asarray(sampled_dose_volume, dtype=np.float32)
-            if self.ct.volume_hu.shape != sampled_dose_volume.shape:
-                payload.close()
-                return False
-            self.sampled_dose_volume_ct = sampled_dose_volume
+        if loaded_cache.sampled_dose_volume_ct is not None:
+            self.sampled_dose_volume_ct = loaded_cache.sampled_dose_volume_ct
             loaded_any = True
-
-        ptv_union_volume_mask = payload["ptv_union_volume_mask"] if "ptv_union_volume_mask" in payload.files else None
-        if ptv_union_volume_mask is not None:
-            ptv_union_volume_mask = np.asarray(ptv_union_volume_mask, dtype=bool)
-            if self.ct.volume_hu.shape != ptv_union_volume_mask.shape:
-                payload.close()
-                return False
-            self.ptv_union_volume_mask_cache = ptv_union_volume_mask
+        if loaded_cache.ptv_union_volume_mask is not None:
+            self.ptv_union_volume_mask_cache = loaded_cache.ptv_union_volume_mask
             self.ptv_union_slice_mask_cache = None
             loaded_any = True
-
-        structures_payload = metadata.get("structures", [])
-        if not isinstance(structures_payload, list):
-            payload.close()
-            return False
-
-        for structure_entry in structures_payload:
-            if not isinstance(structure_entry, dict):
-                payload.close()
-                return False
-            normalized_name = normalize_structure_name(str(structure_entry.get("name", "")))
-            mask_key = str(structure_entry.get("mask_key", ""))
-            if not normalized_name or not mask_key:
-                payload.close()
-                return False
-            try:
-                cached_mask = np.asarray(payload[mask_key], dtype=bool)
-            except KeyError:
-                payload.close()
-                return False
-            if cached_mask.shape != self.ct.volume_hu.shape:
-                payload.close()
-                return False
+        for normalized_name, cached_mask in loaded_cache.structure_volume_masks.items():
             self.structure_volume_mask_cache[normalized_name] = cached_mask
             self.target_slice_mask_cache.pop(normalized_name, None)
-            try:
-                geometry_volume_cc = float(structure_entry.get("geometry_volume_cc", 0.0))
-            except (TypeError, ValueError):
-                geometry_volume_cc = 0.0
-            if geometry_volume_cc > 0.0:
-                self.structure_geometry_volume_cache[normalized_name] = geometry_volume_cc
             loaded_any = True
-
-        payload.close()
+        for normalized_name, geometry_volume_cc in loaded_cache.structure_geometry_volumes_cc.items():
+            self.structure_geometry_volume_cache[normalized_name] = geometry_volume_cc
+            loaded_any = True
         return loaded_any
 
     def try_load_derived_array_cache(self) -> bool:
@@ -2904,10 +2806,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "No DVH data", "Wait for DVH results before saving.")
             return
         try:
-            self.save_dvh_cache(cache_path)
-        except OSError as exc:
+            save_warning = self.save_dvh_cache(cache_path)
+        except (OSError, TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
             return
+        if save_warning:
+            QtWidgets.QMessageBox.warning(self, "Saved with warning", save_warning)
         self.statusBar().showMessage(f"Saved DVH cache to {cache_path.name}", 4000)
 
     def get_default_report_path(self) -> Path:
