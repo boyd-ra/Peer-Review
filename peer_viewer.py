@@ -79,12 +79,25 @@ from peer_constraints_table import (
 )
 from peer_dvh_controller import (
     build_dvh_readout_state,
+    build_dvh_plot_curve_specs,
+    build_dvh_refresh_request,
+    build_dvh_task_completion_state,
+    build_dvh_visibility_refresh_plan,
+    build_selected_dvh_rtstruct as build_selected_dvh_rtstruct_helper,
+    compute_visible_structure_goal_evaluations,
     find_nearest_dvh_curve_name as find_nearest_dvh_curve_name_helper,
     get_curve_for_name as get_curve_for_name_helper,
     get_current_curve_names as get_current_dvh_curve_names_helper,
+    get_dvh_curve_highlight_width,
+    get_dvh_missing_inputs_status_text,
+    get_dvh_no_selection_status_text,
     get_dvh_plot_arrays as get_dvh_plot_arrays_helper,
+    get_dvh_selection_prompt,
+    get_dvh_task_failed_status_text,
+    get_selected_dvh_structure_names as get_selected_dvh_structure_names_helper,
     get_visible_dvh_curves as get_visible_dvh_curves_helper,
     get_visible_dvh_view_range,
+    resolve_selected_curve_name,
 )
 from peer_io import (
     get_constraints_workbook_path,
@@ -146,7 +159,6 @@ from peer_viewer_support import (
     StructureListManager,
     build_file_fingerprint,
     build_file_fingerprints,
-    evaluate_visible_structure_goals,
     file_fingerprint_list_matches,
     file_fingerprint_matches,
 )
@@ -3162,7 +3174,7 @@ h2 {{
             curve = self.get_curve_for_name(normalized_name)
             if curve is None:
                 continue
-            width = 4 if normalized_name == self.selected_dvh_curve_name else 2
+            width = get_dvh_curve_highlight_width(normalized_name, self.selected_dvh_curve_name)
             item.setPen(pg.mkPen(color=curve.color_rgb, width=width))
 
     def on_dvh_curve_clicked(self, item: pg.PlotDataItem, event):
@@ -3184,9 +3196,7 @@ h2 {{
             curve = self.get_curve_for_name(normalized_name)
             if curve is None:
                 return
-            self.dvh_readout_label.setText(
-                f"Selected {curve.name}. Move the mouse over the DVH plot to inspect dose and volume."
-            )
+            self.dvh_readout_label.setText(get_dvh_selection_prompt(curve.name))
 
     def find_nearest_dvh_curve_name(self, scene_pos: QtCore.QPointF, tolerance_px: float = 16.0) -> Optional[str]:
         return find_nearest_dvh_curve_name_helper(
@@ -3214,9 +3224,7 @@ h2 {{
             self.dvh_curve_marker.setData([], [])
             self.dvh_crosshair_vline.setVisible(False)
             self.dvh_crosshair_hline.setVisible(False)
-            self.dvh_readout_label.setText(
-                f"Selected {curve.name}. Move the mouse over the DVH plot to inspect dose and volume."
-            )
+            self.dvh_readout_label.setText(get_dvh_selection_prompt(curve.name))
             return
 
         self.dvh_curve_marker.setData(
@@ -3261,28 +3269,25 @@ h2 {{
             self.clear_dvh_curve_selection()
             return
 
-        if (
-            self.selected_dvh_curve_name is not None
-            and (
-                self.get_curve_for_name(self.selected_dvh_curve_name) is None
-                or not self.dvh_structure_is_visible(self.selected_dvh_curve_name)
-            )
-        ):
-            self.selected_dvh_curve_name = None
+        self.selected_dvh_curve_name = resolve_selected_curve_name(
+            self.dvh_curves,
+            self.selected_dvh_curve_name,
+            self.dvh_structure_is_visible,
+        )
 
-        for curve in self.dvh_curves:
-            normalized_name = normalize_structure_name(curve.name)
-            if not self.dvh_structure_is_visible(normalized_name):
-                continue
-            plot_dose_bins, plot_volume_pct = self.get_dvh_plot_arrays(curve)
+        for spec in build_dvh_plot_curve_specs(
+            self.dvh_curves,
+            self.dvh_structure_is_visible,
+            self.selected_dvh_curve_name,
+        ):
             item = self.dvh_plot.plot(
-                plot_dose_bins,
-                plot_volume_pct,
-                pen=pg.mkPen(color=curve.color_rgb, width=2),
+                spec.plot_dose_bins,
+                spec.plot_volume_pct,
+                pen=pg.mkPen(color=spec.color_rgb, width=spec.width),
             )
             item.setCurveClickable(True, width=16)
             item.sigClicked.connect(self.on_dvh_curve_clicked)
-            self.dvh_plot_items[normalized_name] = item
+            self.dvh_plot_items[spec.normalized_name] = item
 
         if self.dvh_plot_items:
             if previous_view_range is not None:
@@ -3298,54 +3303,57 @@ h2 {{
     def get_dvh_plot_arrays(self, curve: DVHCurve) -> Tuple[np.ndarray, np.ndarray]:
         return get_dvh_plot_arrays_helper(curve)
 
+    def reset_dvh_refresh_state(
+        self,
+        status_text: str,
+        *,
+        clear_progress_label: Optional[str] = None,
+    ) -> bool:
+        self.dvh_job_manager.invalidate()
+        self.structure_mask_cache = None
+        self.structure_mask_cache_names = []
+        self.dvh_request_structure_names = {}
+        self.dvh_curves = []
+        self.structure_goal_evaluations = {}
+        self.update_structure_list_goal_texts()
+        self.update_dvh_cache_button()
+        self.dvh_status_label.setText(status_text)
+        self.clear_dvh_curve_selection()
+        self.render_dvh_plot()
+        if clear_progress_label is not None:
+            self.clear_progress_status(clear_progress_label)
+        return False
+
     def refresh_dvh(self):
         if self.ct is None or self.dose is None or self.rtstruct is None:
-            self.dvh_job_manager.invalidate()
-            self.structure_mask_cache = None
-            self.structure_mask_cache_names = []
-            self.dvh_request_structure_names = {}
-            self.dvh_curves = []
-            self.structure_goal_evaluations = {}
-            self.update_structure_list_goal_texts()
-            self.update_dvh_cache_button()
-            self.dvh_status_label.setText("Load a patient folder to generate the axial view and filtered DVHs.")
-            self.clear_dvh_curve_selection()
-            self.render_dvh_plot()
-            return False
+            return self.reset_dvh_refresh_state(get_dvh_missing_inputs_status_text())
 
         self.show_progress_status("Computing DVHs")
         selected_names = self.get_selected_dvh_structure_names()
         selected_rtstruct = self.build_selected_dvh_rtstruct(selected_names)
-        if selected_rtstruct is None or not selected_rtstruct.structures:
-            self.dvh_job_manager.invalidate()
-            self.structure_mask_cache = None
-            self.structure_mask_cache_names = []
-            self.dvh_request_structure_names = {}
-            self.dvh_curves = []
-            self.structure_goal_evaluations = {}
-            self.update_structure_list_goal_texts()
-            self.update_dvh_cache_button()
-            self.dvh_status_label.setText("Select structures in the DVH tab to generate DVHs.")
-            self.clear_dvh_curve_selection()
-            self.render_dvh_plot()
-            self.clear_progress_status("Computing DVHs")
-            return False
+        refresh_request = build_dvh_refresh_request(
+            selected_names,
+            selected_rtstruct,
+            self.structure_mask_cache,
+            self.structure_mask_cache_names,
+        )
+        if refresh_request is None:
+            return self.reset_dvh_refresh_state(
+                get_dvh_no_selection_status_text(),
+                clear_progress_label="Computing DVHs",
+            )
 
         self.render_dvh_plot()
-
-        mask_cache = self.structure_mask_cache
-        if mask_cache is not None and self.structure_mask_cache_names != selected_names:
-            mask_cache = None
 
         request_id = self.dvh_job_manager.start(
             self.ct,
             self.dose,
             selected_rtstruct,
             self.sampled_dose_volume_ct,
-            mask_cache,
+            refresh_request.reusable_mask_cache,
             self.get_dvh_mode(),
         )
-        self.dvh_request_structure_names = {request_id: list(selected_names)}
+        self.dvh_request_structure_names = {request_id: list(refresh_request.selected_names)}
         return True
 
     def on_dvh_task_finished(
@@ -3368,12 +3376,17 @@ h2 {{
         self.update_dvh_secondary_metric_caches()
         self.cached_target_table_rows = None
         self.update_structure_list_goal_texts()
-        if self.selected_dvh_curve_name is not None and self.get_curve_for_name(self.selected_dvh_curve_name) is None:
-            self.selected_dvh_curve_name = None
-        if self.dvh_curves:
+        completion_state = build_dvh_task_completion_state(
+            self.dvh_curves,
+            self.selected_dvh_curve_name,
+            self.dvh_structure_is_visible,
+        )
+        self.selected_dvh_curve_name = completion_state.selected_curve_name
+        if completion_state.status_text is None:
             self.dvh_status_label.clear()
         else:
-            self.dvh_status_label.setText("No structures produced DVH data on the current CT grid.")
+            self.dvh_status_label.setText(completion_state.status_text)
+        if completion_state.should_clear_selection:
             self.clear_dvh_curve_selection()
         self.render_dvh_plot()
         self.update_dvh_cache_button()
@@ -3385,7 +3398,7 @@ h2 {{
         if not self.dvh_job_manager.is_current(request_id):
             return
 
-        self.dvh_status_label.setText(f"DVH computation failed: {error_message}")
+        self.dvh_status_label.setText(get_dvh_task_failed_status_text(error_message))
         self.render_dvh_plot()
         self.update_dvh_cache_button()
         self.update_background_dvh_timing_report(duration_s, error_message=error_message)
@@ -3399,57 +3412,33 @@ h2 {{
         precomputed: Optional[Dict[str, List[StructureGoalEvaluation]]] = None,
     ) -> None:
         selected_names = self.get_selected_dvh_structure_names()
-        if not selected_names or not self.dvh_curves:
-            self.structure_goal_evaluations = {}
-            return
-
-        if precomputed is not None:
-            visible_selected_names = {
-                normalize_structure_name(curve.name)
-                for curve in self.dvh_curves
-                if normalize_structure_name(curve.name) in set(selected_names)
-            }
-            self.structure_goal_evaluations = {
-                normalize_structure_name(name): evaluations
-                for name, evaluations in precomputed.items()
-                if normalize_structure_name(name) in visible_selected_names
-            }
-            missing_names = [
-                name
-                for name in visible_selected_names
-                if name not in self.structure_goal_evaluations
-            ]
-            if not missing_names:
-                return
-            visible_selected_names = set(missing_names)
-        else:
-            visible_selected_names = set(selected_names)
-
-        computed = evaluate_visible_structure_goals(
+        self.structure_goal_evaluations = compute_visible_structure_goal_evaluations(
             self.dvh_curves,
             self.structure_goals_by_name,
-            list(visible_selected_names),
+            selected_names,
+            precomputed=precomputed,
         )
-        if precomputed is None:
-            self.structure_goal_evaluations = computed
-        else:
-            self.structure_goal_evaluations.update(computed)
 
     def on_dvh_structure_visibility_changed(self, *_args):
         selected_names = self.get_selected_dvh_structure_names()
-        if not selected_names:
+        refresh_plan = build_dvh_visibility_refresh_plan(
+            selected_names,
+            self.current_dvh_curve_names(),
+            self.dvh_curves,
+        )
+        if refresh_plan.should_refresh_from_scratch:
             self.refresh_dvh()
             return
 
-        current_curve_names = set(self.current_dvh_curve_names())
-        if self.dvh_curves and all(name in current_curve_names for name in selected_names):
+        if refresh_plan.should_invalidate_jobs:
             self.dvh_job_manager.invalidate()
             self.dvh_request_structure_names = {}
             self.refresh_visible_structure_goal_evaluations()
             self.update_dvh_goal_evaluation_cache()
             self.update_structure_list_goal_texts()
             self.render_dvh_plot()
-            self.dvh_status_label.clear()
+            if refresh_plan.should_clear_status:
+                self.dvh_status_label.clear()
             return
 
         self.refresh_dvh()
@@ -5309,29 +5298,12 @@ h2 {{
         self.update_targets_table()
 
     def get_selected_dvh_structure_names(self) -> List[str]:
-        if self.rtstruct is None:
-            return []
-
-        return [
-            normalize_structure_name(structure.name)
-            for structure in self.rtstruct.structures
-            if self.dvh_structure_is_visible(normalize_structure_name(structure.name))
-        ]
+        return get_selected_dvh_structure_names_helper(self.rtstruct, self.dvh_structure_is_visible)
 
     def build_selected_dvh_rtstruct(self, selected_names: Optional[List[str]] = None) -> Optional[RTStructData]:
-        if self.rtstruct is None:
-            return None
-
-        selected_name_set = set(selected_names if selected_names is not None else self.get_selected_dvh_structure_names())
-
-        selected_structures = [
-            structure
-            for structure in self.rtstruct.structures
-            if normalize_structure_name(structure.name) in selected_name_set
-        ]
-        return RTStructData(
-            structures=selected_structures,
-            frame_of_reference_uid=self.rtstruct.frame_of_reference_uid,
+        return build_selected_dvh_rtstruct_helper(
+            self.rtstruct,
+            selected_names if selected_names is not None else self.get_selected_dvh_structure_names(),
         )
 
     def structure_is_visible(self, idx: int) -> bool:
