@@ -3624,9 +3624,14 @@ h2 {{
             normalized_name = normalize_structure_name(curve.name)
             if not self.dvh_structure_is_visible(normalized_name):
                 continue
+            plot_dose_bins = curve.dose_bins_gy
+            plot_volume_pct = curve.volume_pct
+            if plot_dose_bins.size > 1 and float(plot_dose_bins[0]) <= 0.0:
+                plot_dose_bins = plot_dose_bins[1:]
+                plot_volume_pct = plot_volume_pct[1:]
             item = self.dvh_plot.plot(
-                curve.dose_bins_gy,
-                curve.volume_pct,
+                plot_dose_bins,
+                plot_volume_pct,
                 pen=pg.mkPen(color=curve.color_rgb, width=2),
             )
             item.setCurveClickable(True, width=16)
