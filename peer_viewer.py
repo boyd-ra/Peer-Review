@@ -29,16 +29,12 @@ from peer_helpers import (
     dose_at_volume_cc,
     dose_to_rgba,
     estimate_structure_geometry_metrics,
-    evaluate_structure_goal,
     fill_binary_holes_2d,
     get_dvh_method_signature,
     line_intersections_at_col,
     line_intersections_at_row,
     normalize_structure_name,
     orthogonal_row_scale,
-    parse_goal_value,
-    parse_goal_value_range,
-    parse_v_metric_threshold_gy,
     resample_orthogonal_plane,
     sample_dose_to_ct_slice,
     volume_cc_at_dose_gy,
@@ -64,6 +60,22 @@ from peer_cache import (
     serialize_structure_goals as serialize_structure_goals_payload,
     serialize_target_table_rows as serialize_target_table_rows_payload,
     write_json_atomic,
+)
+from peer_constraints_table import (
+    build_constraint_editor_preview_state,
+    build_initial_constraint_editor_state,
+    build_constraints_table_presentation_rows,
+    build_custom_constraint_from_editor as build_custom_constraint_from_editor_helper,
+    compose_constraint_note_text as compose_constraint_note_text_helper,
+    custom_constraint_exists as custom_constraint_exists_helper,
+    get_computed_constraint_note_text as get_computed_constraint_note_text_helper,
+    get_constraint_goal_key as get_constraint_goal_key_helper,
+    get_constraint_evaluations_for_structure as get_constraint_evaluations_for_structure_helper,
+    get_constraints_table_column_widths,
+    get_min_bladder_volume_note_text as get_min_bladder_volume_note_text_helper,
+    parse_constraint_goal_input as parse_constraint_goal_input_helper,
+    prostate_constraint_summary_enabled as prostate_constraint_summary_enabled_helper,
+    refresh_constraints_table,
 )
 from peer_io import (
     get_constraints_workbook_path,
@@ -2093,51 +2105,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         return entries
 
     def parse_constraint_goal_input(self, goal_text: str) -> Optional[Tuple[str, str]]:
-        match = re.match(r"^\s*(<=|>=|<|>|==|=)\s*(.+?)\s*$", goal_text)
-        if match is None:
-            return None
-        comparator = match.group(1).strip()
-        value_text = match.group(2).strip()
-        if not value_text:
-            return None
-        return comparator, value_text
+        return parse_constraint_goal_input_helper(goal_text)
 
     def build_custom_constraint_from_editor(self) -> Optional[Tuple[str, StructureGoal]]:
-        if self.constraint_editor_state is None:
-            return None
-
-        structure_name = self.constraint_editor_state.get("structure_name", "").strip()
-        metric = self.constraint_editor_state.get("metric", "").strip()
-        goal_input = self.constraint_editor_state.get("goal_text", "").strip()
-        if not structure_name or not metric:
-            return None
-
-        parsed_goal = self.parse_constraint_goal_input(goal_input)
-        if parsed_goal is None:
-            return None
-        comparator, value_text = parsed_goal
-        normalized_name = normalize_structure_name(structure_name)
-        return normalized_name, StructureGoal(
-            structure_name=structure_name,
-            metric=metric,
-            comparator=comparator,
-            value_text=value_text,
-        )
+        return build_custom_constraint_from_editor_helper(self.constraint_editor_state)
 
     def get_constraint_goal_key(self, goal: StructureGoal) -> Tuple[str, str, str]:
-        return (
-            goal.metric.strip().upper().replace(" ", ""),
-            goal.comparator.strip(),
-            goal.value_text.strip().upper(),
-        )
+        return get_constraint_goal_key_helper(goal)
 
     def custom_constraint_exists(self, normalized_name: str, goal: StructureGoal) -> bool:
-        goal_key = self.get_constraint_goal_key(goal)
-        for existing_goal in self.structure_goals_by_name.get(normalized_name, []):
-            existing_key = self.get_constraint_goal_key(existing_goal)
-            if existing_key == goal_key:
-                return True
-        return False
+        return custom_constraint_exists_helper(
+            normalized_name,
+            goal,
+            structure_goals_by_name=self.structure_goals_by_name,
+        )
 
     def is_custom_only_constraint(self, normalized_name: str, goal: StructureGoal) -> bool:
         goal_key = self.get_constraint_goal_key(goal)
@@ -2172,11 +2153,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
 
         if self.constraint_editor_state is None:
-            self.constraint_editor_state = {
-                "structure_name": structure_names[0],
-                "metric": "",
-                "goal_text": "",
-            }
+            self.constraint_editor_state = build_initial_constraint_editor_state(structure_names)
             self.update_constraints_table()
         QtCore.QTimer.singleShot(0, self.focus_constraint_editor_metric_edit)
 
@@ -2198,58 +2175,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if not isinstance(result_label, QtWidgets.QLabel) or not isinstance(add_button, QtWidgets.QPushButton):
             return
 
-        if self.constraint_editor_state is None:
-            result_label.clear()
-            add_button.setEnabled(False)
-            return
-
-        structure_name = self.constraint_editor_state.get("structure_name", "").strip()
-        metric_text = self.constraint_editor_state.get("metric", "").strip()
-        goal_input = self.constraint_editor_state.get("goal_text", "").strip()
-
-        if not structure_name or not metric_text or not goal_input:
-            result_label.setStyleSheet("color: #bdbdbd;")
-            result_label.setText("Enter metric and goal.")
-            add_button.setEnabled(False)
-            return
-
-        parsed_goal = self.parse_constraint_goal_input(goal_input)
-        if parsed_goal is None:
-            result_label.setStyleSheet("color: #ffb86b;")
-            result_label.setText("Use goal like <= 30 Gy")
-            add_button.setEnabled(False)
-            return
-
-        normalized_name = normalize_structure_name(structure_name)
-        comparator, value_text = parsed_goal
-        preview_goal = StructureGoal(
-            structure_name=structure_name,
-            metric=metric_text,
-            comparator=comparator,
-            value_text=value_text,
+        preview_state = build_constraint_editor_preview_state(
+            self.constraint_editor_state,
+            structure_goals_by_name=self.structure_goals_by_name,
+            get_curve_for_name=self.get_curve_for_name,
+            dvh_structure_is_visible=self.dvh_structure_is_visible,
+            structure_goal_line_color=self.structure_goal_line_color,
         )
-        if self.custom_constraint_exists(normalized_name, preview_goal):
-            result_label.setStyleSheet("color: #ffb86b;")
-            result_label.setText("Constraint already exists.")
-            add_button.setEnabled(False)
-            return
-
-        curve = self.get_curve_for_name(normalized_name)
-        if curve is None:
-            if self.dvh_structure_is_visible(normalized_name):
-                result_label.setStyleSheet("color: #bdbdbd;")
-                result_label.setText("Will calculate when DVH finishes.")
-            else:
-                result_label.setStyleSheet("color: #bdbdbd;")
-                result_label.setText("Will calculate after adding.")
-            add_button.setEnabled(True)
-            return
-
-        evaluation = evaluate_structure_goal(curve, preview_goal)
-        color_name = self.structure_goal_line_color(evaluation) or "#d9d9d9"
-        result_label.setStyleSheet(f"color: {color_name};")
-        result_label.setText(evaluation.actual_text)
-        add_button.setEnabled(True)
+        result_label.setStyleSheet(f"color: {preview_state.color_name};")
+        result_label.setText(preview_state.text)
+        add_button.setEnabled(preview_state.add_enabled)
 
     def cancel_constraint_editor(self):
         self.constraint_editor_state = None
@@ -3815,140 +3750,6 @@ h2 {{
             return "#ff6b6b"
         return None
 
-    def create_constraint_note_button(
-        self,
-        note_key: str,
-        title: str,
-        background_color: QtGui.QColor,
-    ) -> QtWidgets.QWidget:
-        button = QtWidgets.QPushButton("Note")
-        button.setFixedWidth(56)
-        note_text = self.constraint_notes.get(note_key, "").strip()
-        if note_text:
-            font = button.font()
-            font.setBold(True)
-            button.setFont(font)
-            button.setToolTip(note_text)
-        else:
-            button.setToolTip(f"Add note for {title}")
-        button.setStyleSheet(
-            "QPushButton {"
-            f" background-color: {background_color.lighter(112).name()};"
-            f" border: 1px solid {background_color.lighter(150).name()};"
-            " padding: 2px 6px;"
-            "}"
-        )
-        button.clicked.connect(
-            lambda _checked=False, key=note_key, dialog_title=title: self.edit_constraint_note(key, dialog_title)
-        )
-        container = QtWidgets.QWidget()
-        container.setAutoFillBackground(True)
-        palette = container.palette()
-        palette.setColor(QtGui.QPalette.ColorRole.Window, background_color)
-        container.setPalette(palette)
-        layout = QtWidgets.QHBoxLayout(container)
-        layout.setContentsMargins(2, 0, 2, 0)
-        layout.addStretch(1)
-        layout.addWidget(button)
-        layout.addStretch(1)
-        return container
-
-    def create_constraint_editor_action_widget(self, background_color: QtGui.QColor) -> QtWidgets.QWidget:
-        add_button = QtWidgets.QPushButton("Add")
-        add_button.setFixedWidth(52)
-        add_button.clicked.connect(self.commit_constraint_editor)
-
-        cancel_button = QtWidgets.QPushButton("X")
-        cancel_button.setFixedWidth(28)
-        cancel_button.clicked.connect(self.cancel_constraint_editor)
-
-        button_style = (
-            "QPushButton {"
-            f" background-color: {background_color.lighter(112).name()};"
-            f" border: 1px solid {background_color.lighter(150).name()};"
-            " padding: 2px 6px;"
-            "}"
-        )
-        add_button.setStyleSheet(button_style)
-        cancel_button.setStyleSheet(button_style)
-
-        container = QtWidgets.QWidget()
-        container.setAutoFillBackground(True)
-        palette = container.palette()
-        palette.setColor(QtGui.QPalette.ColorRole.Window, background_color)
-        container.setPalette(palette)
-
-        layout = QtWidgets.QHBoxLayout(container)
-        layout.setContentsMargins(2, 0, 2, 0)
-        layout.setSpacing(4)
-        layout.addStretch(1)
-        layout.addWidget(add_button)
-        layout.addWidget(cancel_button)
-        layout.addStretch(1)
-
-        self.constraint_editor_widgets["add_button"] = add_button
-        return container
-
-    def populate_constraint_editor_row(self, row_index: int):
-        if self.constraint_editor_state is None:
-            return
-
-        background_color = QtGui.QColor(20, 20, 20)
-        structure_names = self.get_listable_structure_names()
-        combo = QtWidgets.QComboBox()
-        combo.addItems(structure_names)
-        current_structure_name = self.constraint_editor_state.get("structure_name", "")
-        if current_structure_name in structure_names:
-            combo.setCurrentText(current_structure_name)
-
-        metric_edit = QtWidgets.QLineEdit(self.constraint_editor_state.get("metric", ""))
-        metric_edit.setPlaceholderText("e.g. V65Gy")
-
-        goal_edit = QtWidgets.QLineEdit(self.constraint_editor_state.get("goal_text", ""))
-        goal_edit.setPlaceholderText("e.g. <= 30 Gy")
-
-        result_label = QtWidgets.QLabel()
-        result_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        result_label.setMargin(4)
-        result_label.setStyleSheet("color: #bdbdbd;")
-
-        for widget in (combo, metric_edit, goal_edit):
-            widget.setStyleSheet(
-                "QComboBox, QLineEdit {"
-                f" background-color: {background_color.lighter(118).name()};"
-                " border: 1px solid #666666;"
-                " padding: 2px 4px;"
-                "}"
-            )
-
-        combo.currentTextChanged.connect(lambda text: self.on_constraint_editor_field_changed("structure_name", text))
-        metric_edit.textChanged.connect(lambda text: self.on_constraint_editor_field_changed("metric", text))
-        goal_edit.textChanged.connect(lambda text: self.on_constraint_editor_field_changed("goal_text", text))
-        goal_edit.returnPressed.connect(self.commit_constraint_editor)
-
-        self.constraint_editor_widgets = {
-            "structure_combo": combo,
-            "metric_edit": metric_edit,
-            "goal_edit": goal_edit,
-            "result_label": result_label,
-        }
-
-        self.constraints_table.setCellWidget(row_index, 0, combo)
-        self.constraints_table.setCellWidget(row_index, 1, metric_edit)
-        self.constraints_table.setCellWidget(row_index, 2, goal_edit)
-        self.constraints_table.setCellWidget(row_index, 3, result_label)
-
-        note_item = QtWidgets.QTableWidgetItem("")
-        note_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-        note_item.setBackground(background_color)
-        self.constraints_table.setItem(row_index, 4, note_item)
-        self.constraints_table.setCellWidget(
-            row_index,
-            5,
-            self.create_constraint_editor_action_widget(background_color),
-        )
-        self.update_constraint_editor_preview()
-
     def edit_constraint_note(self, note_key: str, title: str):
         existing_note = self.constraint_notes.get(note_key, "")
         note_text, accepted = QtWidgets.QInputDialog.getMultiLineText(
@@ -4003,17 +3804,7 @@ h2 {{
         if self.constraints_table.columnCount() != 6:
             return
 
-        viewport_width = max(self.constraints_table.viewport().width(), 1)
-        column_widths = [
-            max(1, int(round(viewport_width * 0.20))),  # OAR
-            max(1, int(round(viewport_width * 0.05))),  # Metric
-            max(1, int(round(viewport_width * 0.09))),  # Goal
-            max(1, int(round(viewport_width * 0.06))),  # Result
-            max(1, int(round(viewport_width * 0.54))),  # Notes
-            max(72, int(round(viewport_width * 0.06))),  # Note button
-        ]
-        width_delta = viewport_width - sum(column_widths)
-        column_widths[4] += width_delta
+        column_widths = get_constraints_table_column_widths(self.constraints_table.viewport().width())
 
         for column_index, width in enumerate(column_widths):
             self.constraints_table.setColumnWidth(column_index, max(1, width))
@@ -5218,95 +5009,34 @@ h2 {{
         self.update_targets_table()
 
     def update_constraints_table(self):
-        self.constraints_table.setRowCount(0)
-        self.constraint_editor_widgets = {}
-
         if self.rtstruct is None:
+            self.constraints_table.setRowCount(0)
+            self.constraint_editor_widgets = {}
             return
 
-        rows: List[Tuple[Tuple[int, int, int], QtGui.QColor, str, str, str, str, str, str, str, str, bool]] = []
-        row_backgrounds = [QtGui.QColor(8, 8, 8), QtGui.QColor(34, 34, 34)]
-        structure_group_index = 0
-        for structure in self.rtstruct.structures:
-            normalized_name = normalize_structure_name(structure.name)
-            goals = self.structure_goals_by_name.get(normalized_name, [])
-            if not goals:
-                continue
-            evaluations = self.get_constraint_evaluations_for_structure(normalized_name, goals)
-            background_color = row_backgrounds[structure_group_index % len(row_backgrounds)]
-            for goal_index, goal in enumerate(goals):
-                evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
-                note_key = self.get_constraint_note_key(normalized_name, goal)
-                note_title = f"{structure.name} | {goal.metric} {goal.comparator} {goal.value_text}"
-                computed_note_text = self.get_computed_constraint_note_text(
-                    normalized_name,
-                    goals,
-                    goal_index,
-                    evaluation,
-                )
-                note_text = self.compose_constraint_note_text(
-                    computed_note_text,
-                    self.constraint_notes.get(note_key, ""),
-                )
-                rows.append(
-                    (
-                        structure.color_rgb,
-                        background_color,
-                        structure.name if goal_index == 0 else "",
-                        goal.metric,
-                        f"{goal.comparator.strip()} {goal.value_text.strip()}".strip(),
-                        evaluation.actual_text if evaluation is not None else "",
-                        evaluation.status if evaluation is not None else "",
-                        note_key,
-                        note_title,
-                        note_text,
-                        self.is_custom_only_constraint(normalized_name, goal),
-                    )
-                )
-            structure_group_index += 1
-
-        row_offset = 1 if self.constraint_editor_state is not None else 0
-        self.constraints_table.setRowCount(len(rows) + row_offset)
-        if row_offset:
-            self.populate_constraint_editor_row(0)
-
-        for row_index, (color_rgb, background_color, oar, metric, goal_text, actual_text, evaluation_status, note_key, note_title, note_text, is_custom_only) in enumerate(rows, start=row_offset):
-            values = [oar, metric, goal_text, actual_text]
-            for column_index, text in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(text)
-                item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-                item.setBackground(background_color)
-                item.setForeground(QtGui.QColor("#f2f2f2"))
-                if column_index == 0 and text:
-                    item.setForeground(QtGui.QColor(255, 255, 255))
-                    font = item.font()
-                    font.setBold(True)
-                    item.setFont(font)
-                elif is_custom_only and column_index in {1, 2}:
-                    item.setForeground(QtGui.QColor("#ffd54a"))
-                elif column_index == 3:
-                    if evaluation_status == "pass":
-                        item.setForeground(QtGui.QColor("#63c174"))
-                        item.setBackground(QtGui.QColor("#18351f"))
-                    elif evaluation_status == "variation":
-                        item.setForeground(QtGui.QColor("#ffd54a"))
-                        item.setBackground(QtGui.QColor("#4a3f10"))
-                    elif evaluation_status == "fail":
-                        item.setForeground(QtGui.QColor("#ff6b6b"))
-                        item.setBackground(QtGui.QColor("#3e1616"))
-                self.constraints_table.setItem(row_index, column_index, item)
-            note_item = QtWidgets.QTableWidgetItem(note_text)
-            note_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
-            note_item.setBackground(background_color)
-            note_item.setForeground(QtGui.QColor("#f2f2f2"))
-            if note_text:
-                note_item.setToolTip(note_text)
-            self.constraints_table.setItem(row_index, 4, note_item)
-            self.constraints_table.setCellWidget(
-                row_index,
-                5,
-                self.create_constraint_note_button(note_key, note_title, background_color),
-            )
+        rows = build_constraints_table_presentation_rows(
+            rtstruct=self.rtstruct,
+            structure_goals_by_name=self.structure_goals_by_name,
+            structure_goal_evaluations=self.structure_goal_evaluations,
+            dvh_structure_goal_evaluation_cache=self.dvh_structure_goal_evaluation_cache,
+            constraint_notes=self.constraint_notes,
+            constraints_sheet_name=self.constraints_sheet_name or "",
+            get_curve_for_name=self.get_curve_for_name,
+            get_constraint_note_key=self.get_constraint_note_key,
+            is_custom_only_constraint=self.is_custom_only_constraint,
+        )
+        self.constraint_editor_widgets = refresh_constraints_table(
+            self.constraints_table,
+            rows,
+            constraint_editor_state=self.constraint_editor_state,
+            structure_names=self.get_listable_structure_names(),
+            on_edit_note=self.edit_constraint_note,
+            on_field_change=self.on_constraint_editor_field_changed,
+            on_commit=self.commit_constraint_editor,
+            on_cancel=self.cancel_constraint_editor,
+        )
+        if self.constraint_editor_state is not None:
+            self.update_constraint_editor_preview()
 
         self.constraints_table.resizeColumnsToContents()
         QtCore.QTimer.singleShot(0, self.update_constraints_table_column_widths)
@@ -5316,73 +5046,26 @@ h2 {{
         normalized_name: str,
         goals: List[StructureGoal],
     ) -> List[StructureGoalEvaluation]:
-        evaluations = self.structure_goal_evaluations.get(normalized_name, [])
-        if evaluations and len(evaluations) >= len(goals):
-            return evaluations
-
-        curve = self.get_curve_for_name(normalized_name)
-        if curve is not None and goals:
-            computed = [evaluate_structure_goal(curve, goal) for goal in goals]
-            self.dvh_structure_goal_evaluation_cache[normalized_name] = list(computed)
-            return computed
-
-        cached = self.dvh_structure_goal_evaluation_cache.get(normalized_name, [])
-        if cached:
-            return cached
-
-        return evaluations
+        return get_constraint_evaluations_for_structure_helper(
+            normalized_name,
+            goals,
+            structure_goal_evaluations=self.structure_goal_evaluations,
+            dvh_structure_goal_evaluation_cache=self.dvh_structure_goal_evaluation_cache,
+            get_curve_for_name=self.get_curve_for_name,
+        )
 
     def compose_constraint_note_text(self, computed_note_text: str, stored_note_text: str) -> str:
-        computed = computed_note_text.strip()
-        stored = stored_note_text.strip()
-        if computed and stored:
-            if stored == computed or stored.startswith(f"{computed}    "):
-                return stored
-            return f"{computed}    {stored}"
-        if computed:
-            return computed
-        return stored
+        return compose_constraint_note_text_helper(computed_note_text, stored_note_text)
 
     def prostate_constraint_summary_enabled(self) -> bool:
-        return "PROSTATE" in normalize_structure_name(self.constraints_sheet_name or "")
+        return prostate_constraint_summary_enabled_helper(self.constraints_sheet_name or "")
 
     def get_min_bladder_volume_note_text(self) -> str:
-        if not self.prostate_constraint_summary_enabled():
-            return ""
-
-        normalized_name = "BLADDER"
-        curve = self.get_curve_for_name(normalized_name)
-        if curve is None or curve.volume_cc <= 0.0:
-            return ""
-
-        goals = self.structure_goals_by_name.get(normalized_name, [])
-        required_volume_cc = 0.0
-        found_percent_volume_constraint = False
-        for goal in goals:
-            metric_key = goal.metric.strip().upper().replace(" ", "")
-            dose_threshold_gy = parse_v_metric_threshold_gy(metric_key)
-            if dose_threshold_gy is None:
-                continue
-            comparator = goal.comparator.strip()
-            if comparator not in {"<", "<=", "=", "=="}:
-                continue
-            goal_value, goal_unit = parse_goal_value(goal.value_text)
-            if goal_value is None:
-                continue
-            actual_volume_cc = float(volume_cc_at_dose_gy(curve, dose_threshold_gy))
-            if goal_unit == "%":
-                goal_fraction = goal_value / 100.0
-                if goal_fraction <= 0.0:
-                    continue
-                required_volume_cc = max(required_volume_cc, actual_volume_cc / goal_fraction)
-                found_percent_volume_constraint = True
-            elif goal_unit == "CC":
-                if actual_volume_cc > goal_value + 1e-6:
-                    return "Min volume n/a"
-
-        if not found_percent_volume_constraint or required_volume_cc <= 0.0:
-            return ""
-        return f"Min volume {int(math.ceil(required_volume_cc - 1e-9))} cc"
+        return get_min_bladder_volume_note_text_helper(
+            constraints_sheet_name=self.constraints_sheet_name or "",
+            structure_goals_by_name=self.structure_goals_by_name,
+            get_curve_for_name=self.get_curve_for_name,
+        )
 
     def get_computed_constraint_note_text(
         self,
@@ -5391,22 +5074,15 @@ h2 {{
         goal_index: int,
         evaluation: Optional[StructureGoalEvaluation] = None,
     ) -> str:
-        notes: List[str] = []
-        if 0 <= goal_index < len(goals):
-            goal = goals[goal_index]
-            variation_start, variation_end, _variation_unit = parse_goal_value_range(goal.value_text)
-            if (
-                variation_start is not None
-                and variation_end is not None
-                and evaluation is not None
-                and evaluation.status == "variation"
-            ):
-                notes.append("Acceptable Variation")
-        if normalized_name == "BLADDER" and goal_index == 0 and goals:
-            bladder_note = self.get_min_bladder_volume_note_text()
-            if bladder_note:
-                notes.append(bladder_note)
-        return "    ".join(notes)
+        return get_computed_constraint_note_text_helper(
+            normalized_name,
+            goals,
+            goal_index,
+            evaluation=evaluation,
+            constraints_sheet_name=self.constraints_sheet_name or "",
+            structure_goals_by_name=self.structure_goals_by_name,
+            get_curve_for_name=self.get_curve_for_name,
+        )
 
     def update_targets_table(self):
         if self.rtstruct is not None and self.ct is not None and self.tabs.currentWidget() is not self.targets_tab:
