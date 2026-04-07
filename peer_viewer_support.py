@@ -305,7 +305,15 @@ class StructureListItemWidget(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Fixed,
             )
             self.checkbox.setStyleSheet(
-                f"QCheckBox {{ color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]}); font-weight: 600; padding: 2px 0px; }}"
+                "QCheckBox { "
+                f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]}); "
+                "font-weight: 600; padding: 2px 0px; } "
+                "QCheckBox::indicator { "
+                "width: 14px; height: 14px; border: 1px solid #7a7a7a; "
+                "border-radius: 3px; background-color: #1c1c1c; } "
+                "QCheckBox::indicator:checked { "
+                "border: 1px solid #79e08f; background-color: #2f9e44; } "
+                "QCheckBox::indicator:hover { border: 1px solid #a0a0a0; }"
             )
             if name_font_point_size is not None:
                 font = self.checkbox.font()

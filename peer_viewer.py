@@ -228,6 +228,20 @@ QTableWidget::item:selected, QListWidget::item:selected {
 QCheckBox {
   color: #f2f2f2;
 }
+QCheckBox::indicator {
+  width: 14px;
+  height: 14px;
+  border: 1px solid #7a7a7a;
+  border-radius: 3px;
+  background-color: #1c1c1c;
+}
+QCheckBox::indicator:checked {
+  border: 1px solid #79e08f;
+  background-color: #2f9e44;
+}
+QCheckBox::indicator:hover {
+  border: 1px solid #a0a0a0;
+}
 QSlider::groove:horizontal {
   border: 1px solid #444444;
   height: 6px;
@@ -2906,7 +2920,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         for structure in self.rtstruct.structures:
             normalized_name = normalize_structure_name(structure.name)
             goals = self.structure_goals_by_name.get(normalized_name, [])
-            evaluations = self.structure_goal_evaluations.get(normalized_name, [])
+            evaluations = self.structure_goal_evaluations.get(normalized_name)
+            if not evaluations:
+                evaluations = self.dvh_structure_goal_evaluation_cache.get(normalized_name, [])
             if not goals:
                 continue
 
@@ -4856,7 +4872,7 @@ h2 {{
             return None, None, None
 
         minimum_dose_gy = float(curve.min_dose_gy)
-        max_dose_gy = float(dose_at_volume_cc(curve, 0.03))
+        max_dose_gy = float(curve.max_dose_gy)
         coverage_pct = float(volume_pct_at_dose_gy(curve, threshold_gy))
         cached_values = (minimum_dose_gy, max_dose_gy, coverage_pct)
         self.target_metrics_cache[cache_key] = cached_values
@@ -5766,10 +5782,22 @@ h2 {{
                 nested_maximum_dose_text = ""
                 nested_coverage_text = f"@ {rx_reference_gy:.2f} Gy"
                 if rx_reference_gy > 0.0:
+                    nested_metric_source_key = source_key
+                    nested_metric_values = self.compute_structure_target_metric_values(
+                        nested_structure,
+                        rx_reference_gy,
+                        source_key=nested_metric_source_key,
+                    )
+                    if (
+                        nested_metric_values[0] is None
+                        and nested_metric_source_key != "combined"
+                        and self.sampled_dose_volume_ct is not None
+                    ):
+                        nested_metric_source_key = "combined"
                     nested_minimum_dose_text, nested_maximum_dose_text, nested_coverage_text = self.compute_structure_target_metrics(
                         nested_structure,
                         rx_reference_gy,
-                        source_key=source_key,
+                        source_key=nested_metric_source_key,
                     )
                 rows.append(
                     {
@@ -5967,9 +5995,9 @@ h2 {{
         for structure in self.rtstruct.structures:
             normalized_name = normalize_structure_name(structure.name)
             goals = self.structure_goals_by_name.get(normalized_name, [])
-            evaluations = self.structure_goal_evaluations.get(normalized_name, [])
             if not goals:
                 continue
+            evaluations = self.get_constraint_evaluations_for_structure(normalized_name, goals)
             background_color = row_backgrounds[structure_group_index % len(row_backgrounds)]
             for goal_index, goal in enumerate(goals):
                 evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
@@ -5979,6 +6007,7 @@ h2 {{
                     normalized_name,
                     goals,
                     goal_index,
+                    evaluation,
                 )
                 note_text = self.compose_constraint_note_text(
                     computed_note_text,
@@ -6047,6 +6076,27 @@ h2 {{
         self.constraints_table.resizeColumnsToContents()
         QtCore.QTimer.singleShot(0, self.update_constraints_table_column_widths)
 
+    def get_constraint_evaluations_for_structure(
+        self,
+        normalized_name: str,
+        goals: List[StructureGoal],
+    ) -> List[StructureGoalEvaluation]:
+        evaluations = self.structure_goal_evaluations.get(normalized_name, [])
+        if evaluations and len(evaluations) >= len(goals):
+            return evaluations
+
+        curve = self.get_curve_for_name(normalized_name)
+        if curve is not None and goals:
+            computed = [evaluate_structure_goal(curve, goal) for goal in goals]
+            self.dvh_structure_goal_evaluation_cache[normalized_name] = list(computed)
+            return computed
+
+        cached = self.dvh_structure_goal_evaluation_cache.get(normalized_name, [])
+        if cached:
+            return cached
+
+        return evaluations
+
     def compose_constraint_note_text(self, computed_note_text: str, stored_note_text: str) -> str:
         computed = computed_note_text.strip()
         stored = stored_note_text.strip()
@@ -6104,12 +6154,18 @@ h2 {{
         normalized_name: str,
         goals: List[StructureGoal],
         goal_index: int,
+        evaluation: Optional[StructureGoalEvaluation] = None,
     ) -> str:
         notes: List[str] = []
         if 0 <= goal_index < len(goals):
             goal = goals[goal_index]
             variation_start, variation_end, _variation_unit = parse_goal_value_range(goal.value_text)
-            if variation_start is not None and variation_end is not None:
+            if (
+                variation_start is not None
+                and variation_end is not None
+                and evaluation is not None
+                and evaluation.status == "variation"
+            ):
                 notes.append("Acceptable Variation")
         if normalized_name == "BLADDER" and goal_index == 0 and goals:
             bladder_note = self.get_min_bladder_volume_note_text()

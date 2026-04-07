@@ -917,11 +917,32 @@ def dose_at_volume_pct(curve: DVHCurve, volume_pct: float) -> float:
     if curve.dose_bins_gy.size == 0 or curve.volume_pct.size == 0:
         return 0.0
     target = float(np.clip(volume_pct, 0.0, 100.0))
+    volume_axis = curve.volume_pct.astype(np.float64)
+    dose_axis = curve.dose_bins_gy.astype(np.float64)
+
+    if target <= 0.0:
+        return float(curve.max_dose_gy)
+    if target >= float(volume_axis[0]):
+        return float(curve.min_dose_gy)
+
+    below_indices = np.flatnonzero(volume_axis < target)
+    if below_indices.size == 0:
+        return float(curve.max_dose_gy)
+
+    upper_index = int(below_indices[0])
+    lower_index = max(upper_index - 1, 0)
+    lower_volume = float(volume_axis[lower_index])
+    upper_volume = float(volume_axis[upper_index])
+    lower_dose = float(dose_axis[lower_index])
+    upper_dose = float(dose_axis[upper_index])
+    if np.isclose(lower_volume, upper_volume):
+        return upper_dose
+
     return float(
         np.interp(
             target,
-            curve.volume_pct[::-1].astype(np.float64),
-            curve.dose_bins_gy[::-1].astype(np.float64),
+            np.array([upper_volume, lower_volume], dtype=np.float64),
+            np.array([upper_dose, lower_dose], dtype=np.float64),
         )
     )
 
@@ -931,11 +952,31 @@ def dose_at_volume_cc(curve: DVHCurve, volume_cc: float) -> float:
         return 0.0
     volume_axis = _volume_cc_axis(curve)
     target = float(np.clip(volume_cc, 0.0, max(float(curve.volume_cc), 0.0)))
+    dose_axis = curve.dose_bins_gy.astype(np.float64)
+
+    if target <= 0.0:
+        return float(curve.max_dose_gy)
+    if target >= float(volume_axis[0]):
+        return float(curve.min_dose_gy)
+
+    below_indices = np.flatnonzero(volume_axis < target)
+    if below_indices.size == 0:
+        return float(curve.max_dose_gy)
+
+    upper_index = int(below_indices[0])
+    lower_index = max(upper_index - 1, 0)
+    lower_volume = float(volume_axis[lower_index])
+    upper_volume = float(volume_axis[upper_index])
+    lower_dose = float(dose_axis[lower_index])
+    upper_dose = float(dose_axis[upper_index])
+    if np.isclose(lower_volume, upper_volume):
+        return upper_dose
+
     return float(
         np.interp(
             target,
-            volume_axis[::-1],
-            curve.dose_bins_gy[::-1].astype(np.float64),
+            np.array([upper_volume, lower_volume], dtype=np.float64),
+            np.array([upper_dose, lower_dose], dtype=np.float64),
         )
     )
 
