@@ -64,7 +64,6 @@ from peer_cache import (
     serialize_goal_evaluations as serialize_goal_evaluations_payload,
     serialize_structure_goals as serialize_structure_goals_payload,
     serialize_target_table_rows as serialize_target_table_rows_payload,
-    write_json_atomic,
 )
 from peer_constraints_table import (
     build_constraint_editor_preview_state,
@@ -3398,11 +3397,13 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def save_dvh_cache(self, path: Path) -> Optional[str]:
         if self.rtstruct is None:
             raise ValueError("No RTSTRUCT data is loaded.")
+        if path.suffix.lower() != ".npz":
+            raise ValueError("Review saves now require a bundle .npz path.")
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
-        derived_array_cache_path = self.get_derived_array_cache_path(path)
-        review_bundle_path = self.get_review_bundle_path()
-        screenshot_path = self.get_review_screenshot_path(path)
+        legacy_cache_path = self.get_dvh_cache_path()
+        derived_array_cache_path = self.get_derived_array_cache_path(legacy_cache_path)
+        screenshot_path = self.get_review_screenshot_path(legacy_cache_path)
         payload = build_review_cache_payload(
             patient_plan_lines=list(self.patient_plan_lines or []),
             selected_constraint_set=selected_constraint_set,
@@ -3413,7 +3414,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             rtstruct_fingerprint=build_file_fingerprint(self.rtstruct_path),
             rtdose_fingerprints=build_file_fingerprints(self.latest_timing_rtdose_paths),
             rtplan_fingerprints=build_file_fingerprints(self.current_rtplan_paths),
-            derived_array_cache_file_name=derived_array_cache_path.name if derived_array_cache_path is not None else None,
+            derived_array_cache_file_name=path.name,
             derived_array_cache_signature=self.get_derived_array_cache_signature(),
             structure_names=[normalize_structure_name(structure.name) for structure in self.rtstruct.structures],
             dvh_structure_names=self.get_selected_dvh_structure_names(),
@@ -3433,42 +3434,33 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             constraint_notes=self.constraint_notes,
             target_notes=self.build_target_notes_for_save(target_rows),
         )
-        write_json_atomic(path, payload)
-
         warnings: List[str] = []
         screenshot_png_bytes, screenshot_capture_warning = self.capture_review_screenshot_png_bytes()
         if screenshot_capture_warning:
             warnings.append(screenshot_capture_warning)
         derived_save_inputs: Optional[Dict[str, object]] = None
-        if derived_array_cache_path is not None or review_bundle_path is not None:
+        if path is not None:
             derived_save_inputs = self.build_derived_array_cache_save_inputs()
 
-        if screenshot_path is not None and screenshot_png_bytes is not None:
-            screenshot_warning = self.save_review_screenshot(
-                screenshot_path,
+        try:
+            self.save_review_bundle(
+                path,
+                review_payload=payload,
                 screenshot_png_bytes=screenshot_png_bytes,
+                save_inputs=derived_save_inputs,
             )
-            if screenshot_warning:
-                warnings.append(screenshot_warning)
+        except Exception as exc:
+            logger.warning("Failed to save the review bundle: %s", exc)
+            raise
 
-        if derived_array_cache_path is not None:
+        for legacy_path in (legacy_cache_path, derived_array_cache_path, screenshot_path):
+            if legacy_path is None or legacy_path == path:
+                continue
             try:
-                self.save_derived_array_cache(derived_array_cache_path, save_inputs=derived_save_inputs)
-            except Exception as exc:
-                logger.warning("Saved JSON review cache but failed to save derived array cache: %s", exc)
-                warnings.append(f"Failed to save the derived array cache: {exc}")
-
-        if review_bundle_path is not None:
-            try:
-                self.save_review_bundle(
-                    review_bundle_path,
-                    review_payload=payload,
-                    screenshot_png_bytes=screenshot_png_bytes,
-                    save_inputs=derived_save_inputs,
-                )
-            except Exception as exc:
-                logger.warning("Saved JSON review cache but failed to save the review bundle: %s", exc)
-                warnings.append(f"Failed to save the review bundle: {exc}")
+                legacy_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning("Saved review bundle but failed to remove legacy cache file %s: %s", legacy_path, exc)
+                warnings.append(f"Failed to remove old cache file {legacy_path.name}: {exc}")
 
         if warnings:
             return "Saved review data, but " + " ".join(warnings)
@@ -3767,21 +3759,21 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         return self.load_saved_dvh_cache(cache_path, refresh_ui=refresh_ui)
 
     def on_save_dvh_cache(self):
-        cache_path = self.get_dvh_cache_path()
-        if cache_path is None:
+        bundle_path = self.get_review_bundle_path()
+        if bundle_path is None:
             QtWidgets.QMessageBox.information(self, "No patient folder", "Load a patient folder before saving DVH data.")
             return
         if not self.dvh_curves:
             QtWidgets.QMessageBox.information(self, "No DVH data", "Wait for DVH results before saving.")
             return
         try:
-            save_warning = self.save_dvh_cache(cache_path)
+            save_warning = self.save_dvh_cache(bundle_path)
         except (OSError, TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(exc))
             return
         if save_warning:
             QtWidgets.QMessageBox.warning(self, "Saved with warning", save_warning)
-        self.statusBar().showMessage(f"Saved DVH cache to {cache_path.name}", 4000)
+        self.statusBar().showMessage(f"Saved review bundle to {bundle_path.name}", 4000)
 
     def get_default_report_path(self) -> Path:
         base_dir = Path(self.current_patient_folder) if self.current_patient_folder else Path.home()
