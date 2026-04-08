@@ -6240,6 +6240,9 @@ h2 {{
         self.update_axial_overlay_positions()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
+        self.dvh_job_manager.cancel_all()
+        self.patient_preload_manager.cancel_all()
+        self.patient_activation_prepare_manager.cancel_all()
         self.stop_patient_transition_overlay_process()
         super().closeEvent(event)
 
@@ -6838,4 +6841,13 @@ def main():
     apply_app_theme(app)
     win = RTPlanReviewWindow()
     win.show()
-    sys.exit(app.exec())
+    exit_code = 0
+    try:
+        exit_code = app.exec()
+    except KeyboardInterrupt:
+        try:
+            win.close()
+        except Exception:
+            pass
+        exit_code = 0
+    sys.exit(exit_code)
