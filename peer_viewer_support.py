@@ -16,7 +16,6 @@ from peer_helpers import (
 )
 from peer_models import CTVolume, DVHCurve, DoseVolume, RTStructData, StructureGoal, StructureGoalEvaluation
 
-
 def build_file_fingerprint(path: Optional[str]) -> Optional[Dict[str, object]]:
     if not path:
         return None
@@ -315,6 +314,7 @@ class StructureListItemWidget(QtWidgets.QWidget):
                 "border: 1px solid #79e08f; background-color: #2f9e44; } "
                 "QCheckBox::indicator:hover { border: 1px solid #a0a0a0; }"
             )
+            self.checkbox.setToolTip(name)
             if name_font_point_size is not None:
                 font = self.checkbox.font()
                 font.setPointSize(name_font_point_size)
@@ -428,6 +428,7 @@ class StructureListItemWidget(QtWidgets.QWidget):
     def update_name_and_color(self, name: str, color_rgb: Tuple[int, int, int]) -> None:
         if self.checkbox is not None:
             self.checkbox.setText(name)
+            self.checkbox.setToolTip(name)
             self.checkbox.setStyleSheet(
                 "QCheckBox { "
                 f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]}); "
