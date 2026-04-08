@@ -110,7 +110,6 @@ from peer_io import (
     load_structure_constraints_sheet,
 )
 from peer_loader import (
-    build_axial_cine_plan,
     build_load_timing_report_text,
     get_review_cache_availability,
     PatientActivationPreparationManager,
@@ -1761,159 +1760,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         axial_rect = QtCore.QRect(axial_top_left, axial_size)
         return overlay_rect, axial_rect
 
-    def write_review_movie_asset(
-        self,
-        path: Path,
-        frames_rgba: List[np.ndarray],
-        interval_ms: int,
-    ) -> None:
-        if not frames_rgba:
-            raise ValueError("No cine frames are available to save.")
-        frames = np.stack(
-            [np.ascontiguousarray(frame, dtype=np.uint8) for frame in frames_rgba],
-            axis=0,
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
-        temp_path = Path(temp_path_str)
-        os.close(fd)
-        try:
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
-            np.savez(
-                temp_path,
-                frames=frames,
-                interval_ms=np.asarray([max(60, int(interval_ms))], dtype=np.int32),
-            )
-            temp_path.replace(path)
-        except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-
-    def get_review_movie_path(self, base_path: Optional[Path] = None) -> Optional[Path]:
-        cache_path = base_path if base_path is not None else self.get_dvh_cache_path()
-        if cache_path is None:
-            return None
-        return cache_path.with_name(f"{cache_path.stem}_movie.npz")
-
-    def save_review_movie(self, path: Path) -> Optional[str]:
-        if self.ct is None:
-            return "failed to save the review movie."
-        cine_indices, cine_interval_ms = build_axial_cine_plan(self.ct, self.rtstruct)
-        if not cine_indices:
-            return "failed to save the review movie."
-        if not hasattr(self, "axial_graphics_widget"):
-            return "failed to save the review movie."
-
-        current_tab = self.tabs.currentWidget()
-        original_slice_index = int(np.clip(self.slice_slider.value(), 0, self.ct.volume_hu.shape[0] - 1))
-        original_view_range = self.axial_view.viewRange()
-        original_readout_visible = self.axial_readout_label.isVisible()
-        original_autoscroll_visible = self.axial_autoscroll_overlay.isVisible()
-        original_crosshair_visible = self.crosshair_text.isVisible()
-        original_marker_visible = self.axial_max_marker.isVisible()
-        was_autoscrolling = self.autoscroll_button.isChecked()
-        ww, wl = self.get_window_level()
-        lo = wl - ww / 2.0
-        hi = wl + ww / 2.0
-        min_dose, max_dose = self.get_dose_display_range()
-        dose_alpha = self.current_dose_alpha()
-        captured_frames: List[np.ndarray] = []
-        try:
-            if was_autoscrolling:
-                self.cancel_autoscroll()
-            self.tabs.setCurrentWidget(self.axial_tab_widget)
-            self.axial_readout_label.hide()
-            self.axial_autoscroll_overlay.hide()
-            self.crosshair_text.hide()
-            self.axial_max_marker.hide()
-            self.pump_viewer_ui()
-
-            for frame_slice_index in cine_indices:
-                frame_state = build_axial_render_state(
-                    self.ct,
-                    self.dose,
-                    self.rtstruct,
-                    self.sampled_dose_volume_ct,
-                    frame_slice_index,
-                    lo,
-                    hi,
-                    dose_alpha,
-                    min_dose,
-                    max_dose,
-                    self.structure_is_visible,
-                )
-                self.apply_precomputed_axial_render_state(
-                    slice_index=frame_slice_index,
-                    axial_state=frame_state,
-                )
-                self.axial_view.setRange(
-                    xRange=(float(original_view_range[0][0]), float(original_view_range[0][1])),
-                    yRange=(float(original_view_range[1][0]), float(original_view_range[1][1])),
-                    padding=0.0,
-                )
-                self.pump_viewer_ui()
-                pixmap = self.axial_graphics_widget.grab()
-                if pixmap.isNull():
-                    raise RuntimeError("failed to capture an axial movie frame")
-                image = pixmap.toImage().convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
-                width = image.width()
-                height = image.height()
-                buffer = image.bits()
-                frame_rgba = np.frombuffer(buffer, dtype=np.uint8, count=height * width * 4).reshape((height, width, 4)).copy()
-                captured_frames.append(frame_rgba)
-
-            self.write_review_movie_asset(path, captured_frames, cine_interval_ms)
-        except Exception as exc:
-            logger.warning("Saved JSON review cache but failed to save review movie: %s", exc)
-            return f"failed to save the review movie: {exc}"
-        finally:
-            restore_state = build_axial_render_state(
-                self.ct,
-                self.dose,
-                self.rtstruct,
-                self.sampled_dose_volume_ct,
-                original_slice_index,
-                lo,
-                hi,
-                dose_alpha,
-                min_dose,
-                max_dose,
-                self.structure_is_visible,
-            )
-            self.apply_precomputed_axial_render_state(
-                slice_index=original_slice_index,
-                axial_state=restore_state,
-            )
-            self.axial_view.setRange(
-                xRange=(float(original_view_range[0][0]), float(original_view_range[0][1])),
-                yRange=(float(original_view_range[1][0]), float(original_view_range[1][1])),
-                padding=0.0,
-            )
-            if original_readout_visible:
-                self.axial_readout_label.show()
-            if original_autoscroll_visible:
-                self.axial_autoscroll_overlay.show()
-            if original_crosshair_visible:
-                self.crosshair_text.show()
-            if original_marker_visible:
-                self.axial_max_marker.show()
-            if current_tab is not None:
-                self.tabs.setCurrentWidget(current_tab)
-            if was_autoscrolling:
-                blocker = QtCore.QSignalBlocker(self.autoscroll_button)
-                self.autoscroll_button.setChecked(True)
-                del blocker
-                self.set_autoscroll_ui_locked(True)
-                self.autoscroll_timer.start()
-            self.pump_viewer_ui()
-        return None
-
     def start_patient_transition_overlay_process(
         self,
         folder: str,
@@ -1923,15 +1769,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         geometry = self.build_patient_transition_overlay_geometry()
         cache_path = compute_dvh_cache_path(folder)
         screenshot_path = self.get_review_screenshot_path(cache_path)
-        saved_movie_path = self.get_review_movie_path(cache_path)
         has_screenshot = screenshot_path is not None and screenshot_path.exists()
-        has_saved_movie = saved_movie_path is not None and saved_movie_path.exists()
-        movie_path: Optional[Path] = saved_movie_path if has_saved_movie else None
 
-        if geometry is None or (not has_screenshot and movie_path is None):
+        if geometry is None or not has_screenshot:
             return False
 
-        overlay_rect, axial_rect = geometry
+        overlay_rect, _axial_rect = geometry
         overlay_script = Path(__file__).with_name("peer_transition_overlay.py")
         command = [
             sys.executable,
@@ -1944,21 +1787,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             str(overlay_rect.width()),
             "--window-height",
             str(overlay_rect.height()),
-            "--axial-x",
-            str(axial_rect.x()),
-            "--axial-y",
-            str(axial_rect.y()),
-            "--axial-width",
-            str(axial_rect.width()),
-            "--axial-height",
-            str(axial_rect.height()),
             "--parent-pid",
             str(os.getpid()),
         ]
         if has_screenshot and screenshot_path is not None:
             command.extend(["--screenshot", str(screenshot_path)])
-        if movie_path is not None:
-            command.extend(["--movie", str(movie_path)])
         try:
             self.patient_transition_overlay_process = subprocess.Popen(
                 command,
@@ -3540,7 +3373,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         derived_array_cache_path = self.get_derived_array_cache_path(path)
         screenshot_path = self.get_review_screenshot_path(path)
-        movie_path = self.get_review_movie_path(path)
         payload = build_review_cache_payload(
             patient_plan_lines=list(self.patient_plan_lines or []),
             selected_constraint_set=selected_constraint_set,
@@ -3579,11 +3411,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             screenshot_warning = self.save_review_screenshot(screenshot_path)
             if screenshot_warning:
                 warnings.append(screenshot_warning)
-
-        if movie_path is not None:
-            movie_warning = self.save_review_movie(movie_path)
-            if movie_warning:
-                warnings.append(movie_warning)
 
         if derived_array_cache_path is not None:
             try:
