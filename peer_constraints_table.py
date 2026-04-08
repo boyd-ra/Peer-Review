@@ -172,12 +172,13 @@ def get_constraint_evaluations_for_structure(
     structure_goal_evaluations: Mapping[str, Sequence[StructureGoalEvaluation]],
     dvh_structure_goal_evaluation_cache: dict[str, list[StructureGoalEvaluation]],
     get_curve_for_name: Callable[[str], Optional[DVHCurve]],
+    allow_curve_computation: bool = True,
 ) -> list[StructureGoalEvaluation]:
     evaluations = list(structure_goal_evaluations.get(normalized_name, []))
     if evaluations and len(evaluations) >= len(goals):
         return evaluations
 
-    curve = get_curve_for_name(normalized_name)
+    curve = get_curve_for_name(normalized_name) if allow_curve_computation else None
     if curve is not None and goals:
         computed = [evaluate_structure_goal(curve, goal) for goal in goals]
         dvh_structure_goal_evaluation_cache[normalized_name] = list(computed)
@@ -211,8 +212,11 @@ def get_min_bladder_volume_note_text(
     constraints_sheet_name: str,
     structure_goals_by_name: Mapping[str, Sequence[StructureGoal]],
     get_curve_for_name: Callable[[str], Optional[DVHCurve]],
+    allow_curve_computation: bool = True,
 ) -> str:
     if not prostate_constraint_summary_enabled(constraints_sheet_name):
+        return ""
+    if not allow_curve_computation:
         return ""
 
     normalized_name = "BLADDER"
@@ -259,6 +263,7 @@ def get_computed_constraint_note_text(
     constraints_sheet_name: str,
     structure_goals_by_name: Mapping[str, Sequence[StructureGoal]],
     get_curve_for_name: Callable[[str], Optional[DVHCurve]],
+    allow_curve_computation: bool = True,
 ) -> str:
     notes: list[str] = []
     if 0 <= goal_index < len(goals):
@@ -276,6 +281,7 @@ def get_computed_constraint_note_text(
             constraints_sheet_name=constraints_sheet_name,
             structure_goals_by_name=structure_goals_by_name,
             get_curve_for_name=get_curve_for_name,
+            allow_curve_computation=allow_curve_computation,
         )
         if bladder_note:
             notes.append(bladder_note)
@@ -293,6 +299,7 @@ def build_constraints_table_presentation_rows(
     get_curve_for_name: Callable[[str], Optional[DVHCurve]],
     get_constraint_note_key: Callable[[str, StructureGoal], str],
     is_custom_only_constraint: Callable[[str, StructureGoal], bool],
+    allow_curve_computation: bool = True,
 ) -> list[ConstraintTablePresentationRow]:
     if rtstruct is None:
         return []
@@ -311,6 +318,7 @@ def build_constraints_table_presentation_rows(
             structure_goal_evaluations=structure_goal_evaluations,
             dvh_structure_goal_evaluation_cache=dvh_structure_goal_evaluation_cache,
             get_curve_for_name=get_curve_for_name,
+            allow_curve_computation=allow_curve_computation,
         )
         background_color = row_backgrounds[structure_group_index % len(row_backgrounds)]
         for goal_index, goal in enumerate(goals):
@@ -325,6 +333,7 @@ def build_constraints_table_presentation_rows(
                 constraints_sheet_name=constraints_sheet_name,
                 structure_goals_by_name=structure_goals_by_name,
                 get_curve_for_name=get_curve_for_name,
+                allow_curve_computation=allow_curve_computation,
             )
             note_text = compose_constraint_note_text(
                 computed_note_text,

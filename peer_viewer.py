@@ -447,8 +447,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_geometry_volume_cache: Dict[str, float] = {}
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
         self.defer_sidebar_summary_metrics: bool = False
+        self.restore_saved_results_without_calculation: bool = False
         self.stereotactic_target_dose_text_by_name: Dict[str, str] = {}
+        self.constraints_table_refresh_pending = False
         self.targets_table_refresh_pending = False
+        self.dvh_plot_refresh_pending = False
         self.constraint_editor_state: Optional[Dict[str, str]] = None
         self.constraint_editor_widgets: Dict[str, QtWidgets.QWidget] = {}
         self.hidden_structure_names: set[str] = set()
@@ -514,6 +517,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         root.addWidget(self.tabs)
 
         constraints_tab = QtWidgets.QWidget()
+        self.constraints_tab = constraints_tab
         constraints_layout = QtWidgets.QVBoxLayout(constraints_tab)
         constraints_top_row = QtWidgets.QHBoxLayout()
         self.add_constraint_button = QtWidgets.QPushButton("Add Constraint")
@@ -886,6 +890,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         axial_layout.addWidget(viewer_widget, 1)
 
         dvh_tab = QtWidgets.QWidget()
+        self.dvh_tab = dvh_tab
         dvh_layout = QtWidgets.QHBoxLayout(dvh_tab)
 
         dvh_sidebar_widget = QtWidgets.QWidget()
@@ -1131,7 +1136,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_geometry_volume_cache = {}
         self.cached_target_table_rows = None
         self.defer_sidebar_summary_metrics = False
+        self.restore_saved_results_without_calculation = False
+        self.constraints_table_refresh_pending = False
         self.targets_table_refresh_pending = False
+        self.dvh_plot_refresh_pending = False
         self.constraint_editor_state = None
         self.constraint_editor_widgets = {}
         self.hidden_structure_names = set()
@@ -1480,11 +1488,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             elif cache_info.derived_sidecar_only:
                 self.show_progress_status("Found saved derived cache only; no saved JSON review data", pump_events=True)
             stage_start = perf_counter()
+            self.restore_saved_results_without_calculation = True
             if preloaded_review_cache_data is not None:
                 cache_loaded = self.load_saved_review_cache_data(preloaded_review_cache_data, refresh_ui=False)
                 used_preloaded_review_cache = cache_loaded
             else:
                 cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
+            if not cache_loaded:
+                self.restore_saved_results_without_calculation = False
             cache_load_duration = perf_counter() - stage_start if cache_loaded else None
         return cache_info, cache_loaded, cache_load_duration, used_preloaded_review_cache
 
@@ -1514,15 +1525,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 else:
                     self.dvh_status_label.setText("Saved DVH cache contained no curves.")
                 self.update_dvh_cache_button()
-                if fast_activate:
-                    self.schedule_deferred_patient_view_refresh(
-                        timing_entries=timing_entries,
-                        folder=patient_folder,
-                    )
-                else:
-                    stage_start = perf_counter()
-                    self.refresh_orthogonal_views_from_controls()
-                    timing_entries.append(("Refresh orthogonal views", perf_counter() - stage_start))
+                self.schedule_deferred_patient_view_refresh(
+                    timing_entries=timing_entries,
+                    folder=patient_folder,
+                )
             else:
                 if cache_info.cache_found:
                     self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
@@ -1535,37 +1541,29 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.apply_image_based_view_ranges()
                 self.render_dvh_plot()
                 timing_entries.append(("Refresh axial view (final)", perf_counter() - stage_start))
-                if fast_activate:
-                    self.schedule_deferred_patient_view_refresh(
-                        timing_entries=timing_entries,
-                        folder=patient_folder,
-                    )
-                else:
-                    stage_start = perf_counter()
-                    self.refresh_orthogonal_views_from_controls()
-                    timing_entries.append(("Refresh orthogonal views", perf_counter() - stage_start))
+                self.schedule_deferred_patient_view_refresh(
+                    timing_entries=timing_entries,
+                    folder=patient_folder,
+                )
         elif self.ct is not None:
             stage_start = perf_counter()
             self.update_display()
             self.apply_image_based_view_ranges()
             timing_entries.append(("Refresh axial view (final)", perf_counter() - stage_start))
-            if fast_activate:
-                self.schedule_deferred_patient_view_refresh(
-                    timing_entries=timing_entries,
-                    folder=patient_folder,
-                )
-            else:
-                stage_start = perf_counter()
-                self.refresh_orthogonal_views_from_controls()
-                timing_entries.append(("Refresh orthogonal views", perf_counter() - stage_start))
+            self.schedule_deferred_patient_view_refresh(
+                timing_entries=timing_entries,
+                folder=patient_folder,
+            )
 
         if cache_loaded:
             if used_preloaded_review_cache:
                 self.show_progress_status("Loaded preloaded saved JSON cache")
             else:
                 self.show_progress_status("Loaded saved JSON cache")
+            self.restore_saved_results_without_calculation = False
         timing_entries.append(("Load saved DVH cache", cache_load_duration))
         if not cache_loaded:
+            self.restore_saved_results_without_calculation = False
             timing_entries.append(("Compute DVH (background)" if cache_info.dvh_can_start else "Compute DVH", None))
         timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
 
@@ -2166,6 +2164,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stop_patient_transition_overlay_process()
         self.set_patient_activation_ui_locked(False)
         self.set_heavy_view_updates_enabled(True)
+        self.restore_saved_results_without_calculation = False
         return False
 
     def _finish_patient_activation_success(
@@ -2222,6 +2221,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stop_patient_transition_overlay_process()
         self.set_patient_activation_ui_locked(False)
         self.set_heavy_view_updates_enabled(True)
+        self.restore_saved_results_without_calculation = False
         return True
 
     def _continue_patient_activation_when_ready(
@@ -2348,6 +2348,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if not self._is_current_patient_activation(activation_token, folder):
             return False
 
+        self.restore_saved_results_without_calculation = bool(activation_preparation.cache_loaded)
         cache_info = get_review_cache_availability(
             dvh_can_start=self.ct is not None and self.dose is not None and self.rtstruct is not None,
             cache_path=self.get_dvh_cache_path(),
@@ -2665,8 +2666,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def on_tab_changed(self, _index: int):
         self.update_constraints_table_column_widths()
         self.update_targets_table_column_widths()
+        if self.constraints_table_refresh_pending and self.tabs.currentWidget() is self.constraints_tab:
+            QtCore.QTimer.singleShot(0, self.update_constraints_table)
         if self.targets_table_refresh_pending and self.tabs.currentWidget() is self.targets_tab:
             QtCore.QTimer.singleShot(0, self.update_targets_table)
+        if self.dvh_plot_refresh_pending and self.tabs.currentWidget() is self.dvh_tab:
+            QtCore.QTimer.singleShot(0, self.render_dvh_plot)
 
     def on_autoscroll_button_pressed(self):
         if self.autoscroll_button.isChecked():
@@ -4331,7 +4336,10 @@ h2 {{
         for curve in self.dvh_curves:
             normalized_name = normalize_structure_name(curve.name)
             structure = self.get_structure_by_normalized_name(normalized_name)
-            if structure is not None:
+            cached_volume_cc = self.structure_geometry_volume_cache.get(normalized_name)
+            if cached_volume_cc is not None:
+                self.dvh_structure_volume_cache[normalized_name] = cached_volume_cc
+            elif structure is not None and not self.restore_saved_results_without_calculation:
                 self.dvh_structure_volume_cache[normalized_name] = self.get_structure_geometry_volume_cc(structure)
             else:
                 self.dvh_structure_volume_cache[normalized_name] = float(curve.volume_cc)
@@ -4465,6 +4473,11 @@ h2 {{
         return "High accuracy"
 
     def render_dvh_plot(self, *, reset_view: bool = False):
+        if self.tabs.currentWidget() is not self.dvh_tab:
+            self.dvh_plot_refresh_pending = True
+            return
+
+        self.dvh_plot_refresh_pending = False
         previous_view_range = None if reset_view else self.get_current_dvh_view_range()
         self.reset_dvh_plot()
         if not self.dvh_curves:
@@ -4614,6 +4627,15 @@ h2 {{
         precomputed: Optional[Dict[str, List[StructureGoalEvaluation]]] = None,
     ) -> None:
         selected_names = self.get_selected_dvh_structure_names()
+        if self.restore_saved_results_without_calculation:
+            selected_name_set = set(selected_names)
+            source = precomputed or {}
+            self.structure_goal_evaluations = {
+                normalize_structure_name(name): list(evaluations)
+                for name, evaluations in source.items()
+                if normalize_structure_name(name) in selected_name_set
+            }
+            return
         self.structure_goal_evaluations = compute_visible_structure_goal_evaluations(
             self.dvh_curves,
             self.structure_goals_by_name,
@@ -6047,6 +6069,8 @@ h2 {{
 
     def get_target_table_rows(self) -> List[Dict[str, object]]:
         if self.cached_target_table_rows is None:
+            if self.restore_saved_results_without_calculation:
+                return []
             progress_message = "Computing SRS metrics" if self.stereotactic_summary_enabled() else "Computing metrics"
             self.show_progress_status(progress_message)
             self.cached_target_table_rows = self.build_target_table_rows()
@@ -6149,8 +6173,14 @@ h2 {{
         if self.rtstruct is None:
             self.constraints_table.setRowCount(0)
             self.constraint_editor_widgets = {}
+            self.constraints_table_refresh_pending = False
             return
 
+        if self.tabs.currentWidget() is not self.constraints_tab:
+            self.constraints_table_refresh_pending = True
+            return
+
+        self.constraints_table_refresh_pending = False
         rows = build_constraints_table_presentation_rows(
             rtstruct=self.rtstruct,
             structure_goals_by_name=self.structure_goals_by_name,
@@ -6161,6 +6191,7 @@ h2 {{
             get_curve_for_name=self.get_curve_for_name,
             get_constraint_note_key=self.get_constraint_note_key,
             is_custom_only_constraint=self.is_custom_only_constraint,
+            allow_curve_computation=not self.restore_saved_results_without_calculation,
         )
         self.constraint_editor_widgets = refresh_constraints_table(
             self.constraints_table,
@@ -6189,6 +6220,7 @@ h2 {{
             structure_goal_evaluations=self.structure_goal_evaluations,
             dvh_structure_goal_evaluation_cache=self.dvh_structure_goal_evaluation_cache,
             get_curve_for_name=self.get_curve_for_name,
+            allow_curve_computation=not self.restore_saved_results_without_calculation,
         )
 
     def compose_constraint_note_text(self, computed_note_text: str, stored_note_text: str) -> str:
@@ -6202,6 +6234,7 @@ h2 {{
             constraints_sheet_name=self.constraints_sheet_name or "",
             structure_goals_by_name=self.structure_goals_by_name,
             get_curve_for_name=self.get_curve_for_name,
+            allow_curve_computation=not self.restore_saved_results_without_calculation,
         )
 
     def get_computed_constraint_note_text(
@@ -6219,6 +6252,7 @@ h2 {{
             constraints_sheet_name=self.constraints_sheet_name or "",
             structure_goals_by_name=self.structure_goals_by_name,
             get_curve_for_name=self.get_curve_for_name,
+            allow_curve_computation=not self.restore_saved_results_without_calculation,
         )
 
     def update_targets_table(self):
@@ -6227,9 +6261,11 @@ h2 {{
             return
 
         self.targets_table_refresh_pending = False
+        self.targets_table.setUpdatesEnabled(False)
         self.targets_table.setRowCount(0)
 
         if self.rtstruct is None or self.ct is None:
+            self.targets_table.setUpdatesEnabled(True)
             return
 
         rows = self.get_target_table_rows()
@@ -6251,12 +6287,10 @@ h2 {{
             on_editing_finished=self.on_stereotactic_dose_editing_finished,
             on_edit_note=self.edit_target_note,
         )
-
-        self.targets_table.resizeColumnsToContents()
-        self.targets_table.resizeRowsToContents()
-        self.update_dvh_secondary_metric_caches()
-        self.dvh_structure_list.update_secondary_texts(self.rtstruct, self.get_dvh_structure_secondary_text)
+        self.targets_table.setUpdatesEnabled(True)
+        self.targets_table.viewport().update()
         QtCore.QTimer.singleShot(0, self.update_targets_table_column_widths)
+        QtCore.QTimer.singleShot(0, self.targets_table.resizeRowsToContents)
 
     def resizeEvent(self, event: QtGui.QResizeEvent):
         super().resizeEvent(event)
@@ -6301,9 +6335,13 @@ h2 {{
         volume_cc = self.dvh_structure_volume_cache.get(normalized_name)
         if volume_cc is None:
             structure = self.get_structure_by_normalized_name(normalized_name)
-            if structure is not None:
+            if structure is not None and not self.restore_saved_results_without_calculation:
                 volume_cc = self.get_structure_geometry_volume_cc(structure)
                 self.dvh_structure_volume_cache[normalized_name] = volume_cc
+            else:
+                curve = self.get_curve_for_name(normalized_name)
+                if curve is not None:
+                    volume_cc = float(curve.volume_cc)
         if volume_cc is not None:
             parts.append(f"Vol {volume_cc:.2f} cc")
 
@@ -6334,7 +6372,7 @@ h2 {{
         if cached_coverage_text:
             return [(f"Coverage {cached_coverage_text}", None)]
 
-        if self.defer_sidebar_summary_metrics:
+        if self.defer_sidebar_summary_metrics or self.restore_saved_results_without_calculation:
             return []
 
         structure = self.get_structure_by_normalized_name(normalized_name)
@@ -6368,7 +6406,9 @@ h2 {{
         if self.ct is None or self.rtstruct is None or self.sampled_dose_volume_ct is None:
             return []
 
-        if self.max_tissue_dose_gy_cache is None and self.defer_sidebar_summary_metrics:
+        if self.max_tissue_dose_gy_cache is None and (
+            self.defer_sidebar_summary_metrics or self.restore_saved_results_without_calculation
+        ):
             return []
 
         if self.max_tissue_dose_gy_cache is None:

@@ -72,6 +72,45 @@ class AxialOverlayPositions:
     readout_pos: Tuple[int, int]
 
 
+def rotate_plane_180(plane: np.ndarray) -> np.ndarray:
+    if plane.size == 0:
+        return plane
+    return np.flip(plane, axis=(0, 1)).copy()
+
+
+def rotate_polyline_specs_180(
+    specs: Sequence[PolylineSpec],
+    *,
+    width: int,
+    height: int,
+) -> List[PolylineSpec]:
+    if width <= 0 or height <= 0:
+        return list(specs)
+    rotated_specs: List[PolylineSpec] = []
+    width_max = float(width - 1)
+    height_max = float(height - 1)
+    for spec in specs:
+        rotated_specs.append(
+            PolylineSpec(
+                x=np.asarray(width_max - spec.x, dtype=np.float32),
+                y=np.asarray(height_max - spec.y, dtype=np.float32),
+                color_rgb=spec.color_rgb,
+            )
+        )
+    return rotated_specs
+
+
+def rotate_point_180(
+    point: Optional[Tuple[float, float]],
+    *,
+    width: int,
+    height: int,
+) -> Optional[Tuple[float, float]]:
+    if point is None or width <= 0 or height <= 0:
+        return point
+    return (float(width - 1) - float(point[0]), float(height - 1) - float(point[1]))
+
+
 def build_closed_contour_spec(contour_rc: np.ndarray, color_rgb: Tuple[int, int, int]) -> Optional[PolylineSpec]:
     rr = np.asarray(contour_rc[:, 0], dtype=np.float32)
     cc = np.asarray(contour_rc[:, 1], dtype=np.float32)
@@ -208,6 +247,27 @@ def build_orthogonal_render_state(
         sagittal_scale,
         coronal_scale,
         structure_visibility_resolver,
+    )
+
+    sagittal_height, sagittal_width = sagittal_plane.shape[:2]
+    coronal_height, coronal_width = coronal_plane.shape[:2]
+    sagittal_plane = rotate_plane_180(sagittal_plane)
+    coronal_plane = rotate_plane_180(coronal_plane)
+    sagittal_dose_rgba = rotate_plane_180(sagittal_dose_rgba)
+    coronal_dose_rgba = rotate_plane_180(coronal_dose_rgba)
+    if sagittal_dose_plane is not None:
+        sagittal_dose_plane = rotate_plane_180(sagittal_dose_plane)
+    if coronal_dose_plane is not None:
+        coronal_dose_plane = rotate_plane_180(coronal_dose_plane)
+    sagittal_contours = rotate_polyline_specs_180(
+        sagittal_contours,
+        width=sagittal_width,
+        height=sagittal_height,
+    )
+    coronal_contours = rotate_polyline_specs_180(
+        coronal_contours,
+        width=coronal_width,
+        height=coronal_height,
     )
 
     return OrthogonalRenderState(
@@ -350,6 +410,16 @@ def get_orthogonal_scales(ct: CTVolume) -> Tuple[float, float]:
     return orthogonal_row_scale(sz, sy), orthogonal_row_scale(sz, sx)
 
 
+def get_orthogonal_display_sizes(ct: CTVolume) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    sagittal_scale, coronal_scale = get_orthogonal_scales(ct)
+    depth = int(ct.volume_hu.shape[0])
+    sagittal_height = max(1, int(round(depth * sagittal_scale)))
+    coronal_height = max(1, int(round(depth * coronal_scale)))
+    sagittal_width = int(ct.rows)
+    coronal_width = int(ct.cols)
+    return (sagittal_width, sagittal_height), (coronal_width, coronal_height)
+
+
 def build_active_isodose_levels(
     texts: Sequence[str],
     colors: Sequence[Tuple[int, int, int]],
@@ -400,17 +470,26 @@ def build_max_dose_marker_state(
 
     k, r, c = max_dose_index_zyx
     sagittal_scale, coronal_scale = get_orthogonal_scales(ct)
+    (sagittal_width, sagittal_height), (coronal_width, coronal_height) = get_orthogonal_display_sizes(ct)
 
     axial_point = (float(c), float(r)) if slice_index == k else None
-    sagittal_point = (
-        (float(r), float(k) * sagittal_scale)
-        if int(np.clip(current_col, 0, ct.cols - 1)) == c
-        else None
+    sagittal_point = rotate_point_180(
+        (
+            (float(r), float(k) * sagittal_scale)
+            if int(np.clip(current_col, 0, ct.cols - 1)) == c
+            else None
+        ),
+        width=sagittal_width,
+        height=sagittal_height,
     )
-    coronal_point = (
-        (float(c), float(k) * coronal_scale)
-        if int(np.clip(current_row, 0, ct.rows - 1)) == r
-        else None
+    coronal_point = rotate_point_180(
+        (
+            (float(c), float(k) * coronal_scale)
+            if int(np.clip(current_row, 0, ct.rows - 1)) == r
+            else None
+        ),
+        width=coronal_width,
+        height=coronal_height,
     )
     return MaxDoseMarkerState(axial_point, sagittal_point, coronal_point)
 
@@ -423,10 +502,19 @@ def build_max_dose_center_points(
         return None
     k, r, c = max_dose_index_zyx
     sagittal_scale, coronal_scale = get_orthogonal_scales(ct)
+    (sagittal_width, sagittal_height), (coronal_width, coronal_height) = get_orthogonal_display_sizes(ct)
     return MaxDoseCenterPoints(
         axial_point=(float(c), float(r)),
-        sagittal_point=(float(r), float(k) * sagittal_scale),
-        coronal_point=(float(c), float(k) * coronal_scale),
+        sagittal_point=rotate_point_180(
+            (float(r), float(k) * sagittal_scale),
+            width=sagittal_width,
+            height=sagittal_height,
+        ),
+        coronal_point=rotate_point_180(
+            (float(c), float(k) * coronal_scale),
+            width=coronal_width,
+            height=coronal_height,
+        ),
     )
 
 
