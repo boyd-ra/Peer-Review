@@ -15,6 +15,7 @@ import numpy as np
 from peer_helpers import normalize_structure_name
 from peer_models import (
     CTVolume,
+    DoseVolume,
     DVHCurve,
     RTStructData,
     StructureGoal,
@@ -82,6 +83,8 @@ def get_derived_array_cache_signature(
     build_structure_slice_mask_func: Callable[..., object],
     get_target_structure_slice_masks_func: Callable[..., object],
     get_ptv_union_slice_masks_func: Callable[..., object],
+    load_ct_series_from_paths_func: Callable[..., object],
+    load_combined_rtdose_func: Callable[..., object],
     load_rtstruct_func: Callable[..., object],
 ) -> Dict[str, str]:
     return {
@@ -89,6 +92,8 @@ def get_derived_array_cache_signature(
         "build_structure_slice_mask": callable_signature_hash(build_structure_slice_mask_func),
         "get_target_structure_slice_masks": callable_signature_hash(get_target_structure_slice_masks_func),
         "get_ptv_union_slice_masks": callable_signature_hash(get_ptv_union_slice_masks_func),
+        "load_ct_series_from_paths": callable_signature_hash(load_ct_series_from_paths_func),
+        "load_combined_rtdose": callable_signature_hash(load_combined_rtdose_func),
         "load_rtstruct": callable_signature_hash(load_rtstruct_func),
     }
 
@@ -126,6 +131,8 @@ def default_is_base_listable_structure_name(normalized_name: str) -> bool:
 
 @dataclass(slots=True)
 class DerivedArrayCacheData:
+    ct: Optional[CTVolume]
+    dose: Optional[DoseVolume]
     rtstruct: Optional[RTStructData]
     sampled_dose_volume_ct: Optional[np.ndarray]
     ptv_union_volume_mask: Optional[np.ndarray]
@@ -277,6 +284,129 @@ def _deserialize_rtstruct_geometry(
     return RTStructData(
         structures=structures,
         frame_of_reference_uid=str(payload.get("frame_of_reference_uid", "")),
+    )
+
+
+def _serialize_ct_geometry(
+    ct: Optional[CTVolume],
+    arrays: Dict[str, np.ndarray],
+) -> Dict[str, object]:
+    if ct is None:
+        return {}
+
+    arrays["ct_volume_hu"] = np.asarray(ct.volume_hu, dtype=np.float32)
+    arrays["ct_slice_origins_xyz_mm"] = np.asarray(ct.slice_origins_xyz_mm, dtype=np.float32)
+    arrays["ct_z_positions_mm"] = np.asarray(ct.z_positions_mm, dtype=np.float32)
+    arrays["ct_spacing_xyz_mm"] = np.asarray(ct.spacing_xyz_mm, dtype=np.float32)
+    arrays["ct_image_orientation_patient"] = np.asarray(ct.image_orientation_patient, dtype=np.float32)
+    return {
+        "study_uid": ct.study_uid,
+        "frame_of_reference_uid": ct.frame_of_reference_uid,
+        "rows": int(ct.rows),
+        "cols": int(ct.cols),
+    }
+
+
+def _deserialize_ct_geometry(
+    payload: Mapping[str, object],
+    arrays: Any,
+) -> Optional[CTVolume]:
+    try:
+        volume_hu = np.asarray(arrays["ct_volume_hu"], dtype=np.float32)
+        slice_origins_xyz_mm = np.asarray(arrays["ct_slice_origins_xyz_mm"], dtype=np.float32)
+        z_positions_mm = np.asarray(arrays["ct_z_positions_mm"], dtype=np.float32)
+        spacing_xyz_mm = np.asarray(arrays["ct_spacing_xyz_mm"], dtype=np.float32)
+        image_orientation_patient = np.asarray(arrays["ct_image_orientation_patient"], dtype=np.float32)
+    except KeyError:
+        return None
+
+    if volume_hu.ndim != 3:
+        return None
+    if slice_origins_xyz_mm.shape != (volume_hu.shape[0], 3):
+        return None
+    if z_positions_mm.shape != (volume_hu.shape[0],):
+        return None
+    if spacing_xyz_mm.shape != (3,):
+        return None
+    if image_orientation_patient.shape != (6,):
+        return None
+
+    try:
+        rows = int(payload.get("rows", volume_hu.shape[1]))
+        cols = int(payload.get("cols", volume_hu.shape[2]))
+    except (TypeError, ValueError):
+        return None
+    if rows != volume_hu.shape[1] or cols != volume_hu.shape[2]:
+        return None
+
+    return CTVolume(
+        volume_hu=volume_hu.copy(),
+        slice_origins_xyz_mm=slice_origins_xyz_mm.copy(),
+        z_positions_mm=z_positions_mm.copy(),
+        spacing_xyz_mm=spacing_xyz_mm.copy(),
+        image_orientation_patient=image_orientation_patient.copy(),
+        study_uid=str(payload.get("study_uid", "")),
+        frame_of_reference_uid=str(payload.get("frame_of_reference_uid", "")),
+        rows=rows,
+        cols=cols,
+    )
+
+
+def _serialize_dose_geometry(
+    dose: Optional[DoseVolume],
+    arrays: Dict[str, np.ndarray],
+) -> Dict[str, object]:
+    if dose is None:
+        return {}
+
+    arrays["dose_dose_gy"] = np.asarray(dose.dose_gy, dtype=np.float32)
+    arrays["dose_slice_origins_xyz_mm"] = np.asarray(dose.slice_origins_xyz_mm, dtype=np.float32)
+    arrays["dose_z_positions_mm"] = np.asarray(dose.z_positions_mm, dtype=np.float32)
+    arrays["dose_origin_xyz_mm"] = np.asarray(dose.origin_xyz_mm, dtype=np.float32)
+    arrays["dose_spacing_xyz_mm"] = np.asarray(dose.spacing_xyz_mm, dtype=np.float32)
+    arrays["dose_image_orientation_patient"] = np.asarray(dose.image_orientation_patient, dtype=np.float32)
+    return {
+        "frame_of_reference_uid": dose.frame_of_reference_uid,
+        "dose_units": dose.dose_units,
+    }
+
+
+def _deserialize_dose_geometry(
+    payload: Mapping[str, object],
+    arrays: Any,
+) -> Optional[DoseVolume]:
+    try:
+        dose_gy = np.asarray(arrays["dose_dose_gy"], dtype=np.float32)
+        slice_origins_xyz_mm = np.asarray(arrays["dose_slice_origins_xyz_mm"], dtype=np.float32)
+        z_positions_mm = np.asarray(arrays["dose_z_positions_mm"], dtype=np.float32)
+        origin_xyz_mm = np.asarray(arrays["dose_origin_xyz_mm"], dtype=np.float32)
+        spacing_xyz_mm = np.asarray(arrays["dose_spacing_xyz_mm"], dtype=np.float32)
+        image_orientation_patient = np.asarray(arrays["dose_image_orientation_patient"], dtype=np.float32)
+    except KeyError:
+        return None
+
+    if dose_gy.ndim != 3:
+        return None
+    if slice_origins_xyz_mm.shape != (dose_gy.shape[0], 3):
+        return None
+    if z_positions_mm.shape != (dose_gy.shape[0],):
+        return None
+    if origin_xyz_mm.shape != (3,):
+        return None
+    if spacing_xyz_mm.shape != (3,):
+        return None
+    if image_orientation_patient.shape != (6,):
+        return None
+
+    return DoseVolume(
+        dose_gy=dose_gy.copy(),
+        slice_origins_xyz_mm=slice_origins_xyz_mm.copy(),
+        z_positions_mm=z_positions_mm.copy(),
+        origin_xyz_mm=origin_xyz_mm.copy(),
+        spacing_xyz_mm=spacing_xyz_mm.copy(),
+        image_orientation_patient=image_orientation_patient.copy(),
+        frame_of_reference_uid=str(payload.get("frame_of_reference_uid", "")),
+        dose_units=str(payload.get("dose_units", "")),
     )
 
 
@@ -795,6 +925,8 @@ def save_derived_array_cache(
     path: Path,
     *,
     ct: CTVolume,
+    ct_paths: Sequence[str],
+    dose: Optional[DoseVolume],
     rtstruct: Optional[RTStructData],
     rtstruct_path: Optional[str],
     rtdose_paths: Sequence[str],
@@ -806,19 +938,24 @@ def save_derived_array_cache(
     structure_geometry_volumes_cc: Dict[str, float],
 ) -> None:
     metadata: Dict[str, object] = {
-        "version": 2,
+        "version": 4,
         "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
         "ct_geometry_signature": get_ct_geometry_signature(ct),
+        "ct_fingerprints": build_file_fingerprints(list(ct_paths)),
         "rtstruct_fingerprint": build_file_fingerprint(rtstruct_path),
         "rtdose_fingerprints": build_file_fingerprints(list(rtdose_paths)),
         "array_cache_signature": array_cache_signature,
         "structures": [],
+        "ct_geometry": {},
+        "dose_geometry": {},
         "rtstruct_geometry": {},
     }
 
     arrays: Dict[str, np.ndarray] = {
         "metadata_json": np.asarray(json.dumps(metadata), dtype=np.str_),
     }
+    metadata["ct_geometry"] = _serialize_ct_geometry(ct, arrays)
+    metadata["dose_geometry"] = _serialize_dose_geometry(dose, arrays)
     metadata["rtstruct_geometry"] = _serialize_rtstruct_geometry(rtstruct, arrays)
     if sampled_dose_volume_ct is not None:
         arrays["sampled_dose_volume_ct"] = np.asarray(sampled_dose_volume_ct, dtype=np.float32)
@@ -862,7 +999,8 @@ def save_derived_array_cache(
 def load_derived_array_cache(
     path: Path,
     *,
-    ct: CTVolume,
+    ct: Optional[CTVolume],
+    ct_paths: Sequence[str],
     rtstruct_path: Optional[str],
     rtdose_paths: Sequence[str],
     array_cache_signature: Dict[str, str],
@@ -883,15 +1021,16 @@ def load_derived_array_cache(
         payload.close()
         return None
     cache_version = metadata.get("version")
-    if cache_version not in {1, 2}:
-        payload.close()
-        return None
-    if metadata.get("ct_geometry_signature") != get_ct_geometry_signature(ct):
+    if cache_version not in {1, 2, 3, 4}:
         payload.close()
         return None
     if metadata.get("array_cache_signature") != array_cache_signature:
         payload.close()
         return None
+    if cache_version >= 3:
+        if not file_fingerprint_list_matches(metadata.get("ct_fingerprints"), list(ct_paths)):
+            payload.close()
+            return None
     if not file_fingerprint_matches(metadata.get("rtstruct_fingerprint"), rtstruct_path):
         payload.close()
         return None
@@ -899,17 +1038,51 @@ def load_derived_array_cache(
         payload.close()
         return None
 
+    loaded_ct = ct
+    if cache_version >= 3:
+        ct_geometry_payload = metadata.get("ct_geometry")
+        if ct_geometry_payload not in (None, {}):
+            if not isinstance(ct_geometry_payload, dict):
+                payload.close()
+                return None
+            loaded_ct = _deserialize_ct_geometry(ct_geometry_payload, payload)
+            if loaded_ct is None:
+                payload.close()
+                return None
+
+    if loaded_ct is None:
+        payload.close()
+        return None
+    if metadata.get("ct_geometry_signature") != get_ct_geometry_signature(loaded_ct):
+        payload.close()
+        return None
+    if ct is not None and get_ct_geometry_signature(ct) != get_ct_geometry_signature(loaded_ct):
+        payload.close()
+        return None
+
+    dose: Optional[DoseVolume] = None
+    if cache_version >= 4:
+        dose_geometry_payload = metadata.get("dose_geometry")
+        if dose_geometry_payload not in (None, {}):
+            if not isinstance(dose_geometry_payload, dict):
+                payload.close()
+                return None
+            dose = _deserialize_dose_geometry(dose_geometry_payload, payload)
+            if dose is None:
+                payload.close()
+                return None
+
     sampled_dose_volume_ct: Optional[np.ndarray] = None
     if "sampled_dose_volume_ct" in payload.files:
         sampled_dose_volume_ct = np.asarray(payload["sampled_dose_volume_ct"], dtype=np.float32)
-        if sampled_dose_volume_ct.shape != ct.volume_hu.shape:
+        if sampled_dose_volume_ct.shape != loaded_ct.volume_hu.shape:
             payload.close()
             return None
 
     ptv_union_volume_mask: Optional[np.ndarray] = None
     if "ptv_union_volume_mask" in payload.files:
         ptv_union_volume_mask = np.asarray(payload["ptv_union_volume_mask"], dtype=bool)
-        if ptv_union_volume_mask.shape != ct.volume_hu.shape:
+        if ptv_union_volume_mask.shape != loaded_ct.volume_hu.shape:
             payload.close()
             return None
 
@@ -934,7 +1107,7 @@ def load_derived_array_cache(
         except KeyError:
             payload.close()
             return None
-        if cached_mask.shape != ct.volume_hu.shape:
+        if cached_mask.shape != loaded_ct.volume_hu.shape:
             payload.close()
             return None
         structure_volume_masks[normalized_name] = cached_mask
@@ -959,6 +1132,8 @@ def load_derived_array_cache(
 
     payload.close()
     return DerivedArrayCacheData(
+        ct=loaded_ct,
+        dose=dose,
         rtstruct=rtstruct,
         sampled_dose_volume_ct=sampled_dose_volume_ct,
         ptv_union_volume_mask=ptv_union_volume_mask,

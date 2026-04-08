@@ -105,6 +105,7 @@ from peer_io import (
     get_constraints_workbook_path,
     list_constraints_workbook_sheets,
     load_combined_rtdose,
+    load_ct_series_from_paths,
     load_rtdose,
     load_rtstruct,
     load_structure_constraints_sheet,
@@ -407,6 +408,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_goals_by_name: Dict[str, List[StructureGoal]] = {}
         self.structure_goal_evaluations: Dict[str, List[StructureGoalEvaluation]] = {}
         self.plan_phases: List[RTPlanPhase] = []
+        self.current_ct_paths: List[str] = []
         self.current_rtplan_paths: List[str] = []
         self.constraint_notes: Dict[str, str] = {}
         self.target_notes: Dict[str, str] = {}
@@ -1102,6 +1104,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_goals_by_name = {}
         self.structure_goal_evaluations = {}
         self.plan_phases = []
+        self.current_ct_paths = []
         self.current_rtplan_paths = []
         self.constraint_notes = {}
         self.target_notes = {}
@@ -1575,6 +1578,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     ) -> Tuple[Optional[str], Optional[str], List[str], Optional[Path]]:
         self.ct = payload.ct
         self.plan_phases = list(payload.plan_phases)
+        self.current_ct_paths = list(payload.ct_paths)
         self.current_rtplan_paths = list(payload.rtplan_paths)
         self.set_patient_plan_lines(payload.patient_plan_lines, pump_events=True)
         self.image_view_bounds = payload.image_view_bounds
@@ -2891,6 +2895,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             build_structure_slice_mask_func=build_structure_slice_mask,
             get_target_structure_slice_masks_func=type(self).get_target_structure_slice_masks,
             get_ptv_union_slice_masks_func=type(self).get_ptv_union_slice_masks,
+            load_ct_series_from_paths_func=load_ct_series_from_paths,
+            load_combined_rtdose_func=load_combined_rtdose,
             load_rtstruct_func=load_rtstruct,
         )
 
@@ -3493,6 +3499,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         save_derived_array_cache_file(
             path,
             ct=self.ct,
+            ct_paths=self.current_ct_paths,
+            dose=self.dose,
             rtstruct=self.rtstruct,
             rtstruct_path=self.rtstruct_path,
             rtdose_paths=self.latest_timing_rtdose_paths,
@@ -3505,11 +3513,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
 
     def load_derived_array_cache(self, path: Path) -> bool:
-        if self.ct is None:
+        if self.ct is None and not self.current_ct_paths:
             return False
         loaded_cache = load_derived_array_cache_file(
             path,
             ct=self.ct,
+            ct_paths=self.current_ct_paths,
             rtstruct_path=self.rtstruct_path,
             rtdose_paths=self.latest_timing_rtdose_paths,
             array_cache_signature=self.get_derived_array_cache_signature(),
@@ -3517,6 +3526,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if loaded_cache is None:
             return False
         loaded_any = False
+        if loaded_cache.ct is not None:
+            self.ct = loaded_cache.ct
+            loaded_any = True
+        if loaded_cache.dose is not None:
+            self.dose = loaded_cache.dose
+            loaded_any = True
         if loaded_cache.rtstruct is not None:
             self.rtstruct = loaded_cache.rtstruct
             self.sort_rtstruct_structures_for_display()

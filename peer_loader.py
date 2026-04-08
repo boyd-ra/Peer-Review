@@ -22,7 +22,7 @@ from peer_cache import (
     load_review_cache_file,
 )
 from peer_helpers import compute_image_view_bounds, normalize_structure_name, sample_dose_to_ct_slice
-from peer_io import load_combined_rtdose, load_ct_series_and_discover_patient_files, load_rtstruct
+from peer_io import load_combined_rtdose, load_ct_series_from_paths, load_rtstruct, scan_patient_folder
 from peer_models import CTVolume, DoseVolume, ImageViewBounds, PatientFileDiscovery, RTPlanPhase, RTStructData
 from peer_rendering import (
     AxialRenderState,
@@ -45,6 +45,7 @@ class PatientPreloadPayload:
     folder: str
     ct: CTVolume
     image_view_bounds: ImageViewBounds
+    ct_paths: List[str]
     patient_plan_lines: Optional[List[str]]
     plan_phases: List[RTPlanPhase]
     rtplan_paths: List[str]
@@ -360,8 +361,8 @@ class PatientActivationPreparationManager(QtCore.QObject):
             self.poll_timer.stop()
 
 
-def load_patient_scan_and_discovery(folder: str) -> Tuple[CTVolume, PatientFileDiscovery]:
-    return load_ct_series_and_discover_patient_files(folder)
+def load_patient_discovery(folder: str) -> PatientFileDiscovery:
+    return scan_patient_folder(folder)
 
 
 def resample_dose_to_ct_volume(ct: CTVolume, dose: DoseVolume) -> np.ndarray:
@@ -507,13 +508,42 @@ def prepare_patient_preload_payload(
     timing_entries: List[Tuple[str, Optional[float]]] = []
 
     stage_start = perf_counter()
-    ct, patient_discovery = load_patient_scan_and_discovery(folder)
+    patient_discovery = load_patient_discovery(folder)
+    ct_paths = list(patient_discovery.ct_paths)
     rtstruct_path = patient_discovery.rtstruct_path
     rtdose_paths = list(patient_discovery.rtdose_paths)
     rtplan_paths = list(patient_discovery.rtplan_paths)
-    timing_entries.append(("CT scan/load + file discovery", perf_counter() - stage_start))
+    timing_entries.append(("File discovery", perf_counter() - stage_start))
     if patient_plan_callback is not None:
         patient_plan_callback(patient_discovery.patient_plan_lines)
+
+    ct: Optional[CTVolume] = None
+    derived_array_cache_data: Optional[DerivedArrayCacheData] = None
+    derived_array_cache_load_duration: Optional[float] = None
+    derived_array_cache_path = get_derived_array_cache_path(get_dvh_cache_path(folder))
+    stage_start = perf_counter()
+    if derived_array_cache_path is not None and derived_array_cache_path.exists():
+        derived_array_cache_data = load_derived_array_cache(
+            derived_array_cache_path,
+            ct=None,
+            ct_paths=ct_paths,
+            rtstruct_path=rtstruct_path,
+            rtdose_paths=rtdose_paths,
+            array_cache_signature=array_cache_signature,
+        )
+    if derived_array_cache_data is not None and derived_array_cache_data.ct is not None:
+        ct = derived_array_cache_data.ct
+        derived_array_cache_load_duration = perf_counter() - stage_start
+        timing_entries.append(("Load CT", None))
+    else:
+        if progress_callback is not None:
+            progress_callback("Loading CT")
+        stage_start = perf_counter()
+        ct = load_ct_series_from_paths(ct_paths)
+        timing_entries.append(("Load CT", perf_counter() - stage_start))
+
+    if ct is None:
+        raise ValueError("No CT data could be loaded.")
 
     stage_start = perf_counter()
     image_view_bounds = compute_image_view_bounds(ct)
@@ -521,29 +551,34 @@ def prepare_patient_preload_payload(
 
     dose: Optional[DoseVolume] = None
     sampled_dose_volume_ct: Optional[np.ndarray] = None
-    derived_array_cache_loaded = False
-    derived_array_cache_data: Optional[DerivedArrayCacheData] = None
+    derived_array_cache_loaded = derived_array_cache_data is not None
     review_cache_data: Optional[ReviewCacheFileData] = None
     precomputed_view_state: Optional[PrecomputedPatientViewState] = None
     if rtdose_paths:
-        stage_start = perf_counter()
-        dose = load_combined_rtdose(rtdose_paths)
-        timing_entries.append(("Load/merge RTDOSE", perf_counter() - stage_start))
+        if derived_array_cache_data is not None and derived_array_cache_data.dose is not None:
+            dose = derived_array_cache_data.dose
+            timing_entries.append(("Load/merge RTDOSE", None))
+        else:
+            stage_start = perf_counter()
+            dose = load_combined_rtdose(rtdose_paths)
+            timing_entries.append(("Load/merge RTDOSE", perf_counter() - stage_start))
 
-        derived_array_cache_path = get_derived_array_cache_path(get_dvh_cache_path(folder))
-        stage_start = perf_counter()
-        if derived_array_cache_path is not None and derived_array_cache_path.exists():
+        if derived_array_cache_data is None and derived_array_cache_path is not None and derived_array_cache_path.exists():
+            stage_start = perf_counter()
             derived_array_cache_data = load_derived_array_cache(
                 derived_array_cache_path,
                 ct=ct,
+                ct_paths=ct_paths,
                 rtstruct_path=rtstruct_path,
                 rtdose_paths=rtdose_paths,
                 array_cache_signature=array_cache_signature,
             )
+            if derived_array_cache_data is not None:
+                derived_array_cache_loaded = True
+                derived_array_cache_load_duration = perf_counter() - stage_start
+        timing_entries.append(("Load derived array cache", derived_array_cache_load_duration if derived_array_cache_loaded else None))
         if derived_array_cache_data is not None:
             sampled_dose_volume_ct = derived_array_cache_data.sampled_dose_volume_ct
-            derived_array_cache_loaded = True
-        timing_entries.append(("Load derived array cache", perf_counter() - stage_start if derived_array_cache_loaded else None))
 
         if sampled_dose_volume_ct is None:
             if progress_callback is not None:
@@ -555,7 +590,7 @@ def prepare_patient_preload_payload(
             timing_entries.append(("Resample dose to CT grid", None))
     else:
         timing_entries.append(("Load/merge RTDOSE", None))
-        timing_entries.append(("Load derived array cache", None))
+        timing_entries.append(("Load derived array cache", derived_array_cache_load_duration if derived_array_cache_loaded else None))
         timing_entries.append(("Resample dose to CT grid", None))
 
     rtstruct: Optional[RTStructData] = None
@@ -596,6 +631,7 @@ def prepare_patient_preload_payload(
         folder=folder,
         ct=ct,
         image_view_bounds=image_view_bounds,
+        ct_paths=ct_paths,
         patient_plan_lines=patient_discovery.patient_plan_lines,
         plan_phases=list(patient_discovery.plan_phases),
         rtplan_paths=rtplan_paths,
