@@ -479,16 +479,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_timer.setInterval(120)
         self.autoscroll_timer.setSingleShot(True)
         self.autoscroll_direction = 1
-        self.patient_activation_movie_timer = QtCore.QTimer(self)
-        self.patient_activation_movie_timer.setSingleShot(False)
-        self.patient_activation_movie_timer.timeout.connect(self.advance_patient_activation_movie)
-        self.patient_activation_movie_source_pixmaps: List[QtGui.QPixmap] = []
-        self.patient_activation_movie_display_pixmaps: List[QtGui.QPixmap] = []
-        self.patient_activation_movie_display_size = QtCore.QSize()
-        self.patient_activation_movie_frame_index = 0
-        self.viewer_screenshot_source_pixmap: Optional[QtGui.QPixmap] = None
-        self.viewer_screenshot_display_pixmap: Optional[QtGui.QPixmap] = None
-        self.viewer_screenshot_display_size = QtCore.QSize()
         self.patient_transition_overlay_process: Optional[subprocess.Popen] = None
         self.patient_transition_overlay_temp_dir: Optional[str] = None
         self.isodose_refresh_timer = QtCore.QTimer(self)
@@ -802,18 +792,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         autoscroll_overlay_layout.addWidget(self.autoscroll_speed_label)
 
-        self.viewer_screenshot_overlay = QtWidgets.QLabel(axial_tab)
-        self.viewer_screenshot_overlay.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.viewer_screenshot_overlay.setStyleSheet("QLabel { background-color: black; }")
-        self.viewer_screenshot_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.viewer_screenshot_overlay.hide()
-
-        self.axial_movie_overlay = QtWidgets.QLabel(axial_tab)
-        self.axial_movie_overlay.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.axial_movie_overlay.setStyleSheet("QLabel { background-color: black; }")
-        self.axial_movie_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.axial_movie_overlay.hide()
-
         right_splitter.addWidget(sagittal_widget)
         right_splitter.addWidget(coronal_widget)
         right_splitter.setSizes([1, 1])
@@ -1077,7 +1055,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def clear_patient_session_state(self, *, quick_swap: bool = False):
         self.cancel_autoscroll()
-        self.stop_patient_activation_movie()
+        self.stop_patient_transition_overlay_process()
         self.dvh_job_manager.cancel_all()
         self.patient_activation_prepare_manager.cancel_all()
         self.clear_progress_status()
@@ -1757,23 +1735,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.window_label.setText(axial_state.window_label_text)
         self.update_axial_overlay_positions()
 
-    def rgba_array_to_pixmap(self, rgba: np.ndarray) -> QtGui.QPixmap:
-        frame = np.ascontiguousarray(rgba, dtype=np.uint8)
-        height, width = frame.shape[:2]
-        image = QtGui.QImage(
-            frame.data,
-            width,
-            height,
-            frame.strides[0],
-            QtGui.QImage.Format.Format_RGBA8888,
-        ).copy()
-        return QtGui.QPixmap.fromImage(image)
-
-    def update_patient_activation_overlay_positions(self) -> None:
-        # Patient activation overlays now run in a separate helper process, so
-        # there is no in-app geometry update work to do here.
-        return
-
     def build_patient_transition_overlay_geometry(self) -> Optional[Tuple[QtCore.QRect, QtCore.QRect]]:
         if not hasattr(self, "axial_tab_widget") or not hasattr(self, "axial_graphics_widget"):
             return None
@@ -1847,6 +1808,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         original_autoscroll_visible = self.axial_autoscroll_overlay.isVisible()
         original_crosshair_visible = self.crosshair_text.isVisible()
         original_marker_visible = self.axial_max_marker.isVisible()
+        was_autoscrolling = self.autoscroll_button.isChecked()
         ww, wl = self.get_window_level()
         lo = wl - ww / 2.0
         hi = wl + ww / 2.0
@@ -1854,6 +1816,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dose_alpha = self.current_dose_alpha()
         captured_frames: List[np.ndarray] = []
         try:
+            if was_autoscrolling:
+                self.cancel_autoscroll()
             self.tabs.setCurrentWidget(self.axial_tab_widget)
             self.axial_readout_label.hide()
             self.axial_autoscroll_overlay.hide()
@@ -1932,13 +1896,18 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.axial_max_marker.show()
             if current_tab is not None:
                 self.tabs.setCurrentWidget(current_tab)
+            if was_autoscrolling:
+                blocker = QtCore.QSignalBlocker(self.autoscroll_button)
+                self.autoscroll_button.setChecked(True)
+                del blocker
+                self.set_autoscroll_ui_locked(True)
+                self.autoscroll_timer.start()
             self.pump_viewer_ui()
         return None
 
     def start_patient_transition_overlay_process(
         self,
         folder: str,
-        precomputed_view_state: Optional[PrecomputedPatientViewState] = None,
     ) -> bool:
         self.stop_patient_transition_overlay_process()
 
@@ -2013,41 +1982,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def start_patient_activation_movie(
-        self,
-        folder: str,
-        precomputed_view_state: PrecomputedPatientViewState,
-    ) -> bool:
-        self.stop_patient_activation_movie()
-        return self.start_patient_transition_overlay_process(folder, precomputed_view_state)
-
-    def advance_patient_activation_movie(self) -> None:
-        if self.patient_transition_overlay_process is None:
-            self.patient_activation_movie_timer.stop()
-            return
-        if self.patient_transition_overlay_process.poll() is not None:
-            self.stop_patient_transition_overlay_process()
-            self.patient_activation_movie_timer.stop()
-
-    def stop_patient_activation_movie(self) -> None:
-        self.patient_activation_movie_timer.stop()
-        self.stop_patient_transition_overlay_process()
-        self.patient_activation_movie_source_pixmaps = []
-        self.patient_activation_movie_display_pixmaps = []
-        self.patient_activation_movie_display_size = QtCore.QSize()
-        self.patient_activation_movie_frame_index = 0
-        self.viewer_screenshot_source_pixmap = None
-        self.viewer_screenshot_display_pixmap = None
-        self.viewer_screenshot_display_size = QtCore.QSize()
-        if hasattr(self, "viewer_screenshot_overlay"):
-            self.viewer_screenshot_overlay.hide()
-            self.viewer_screenshot_overlay.clear()
-        if hasattr(self, "axial_movie_overlay"):
-            self.axial_movie_overlay.hide()
-            self.axial_movie_overlay.clear()
-        if hasattr(self, "axial_autoscroll_overlay"):
-            self.axial_autoscroll_overlay.show()
-
     def pump_viewer_ui(self) -> None:
         app = QtWidgets.QApplication.instance()
         if app is not None:
@@ -2100,6 +2034,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     folder,
                     array_cache_signature=self.get_derived_array_cache_signature(),
                     progress_callback=lambda message: self.show_progress_status(message, pump_events=True),
+                    include_precomputed_view_state=False,
                 )
             else:
                 payload = preloaded_payload
@@ -2129,7 +2064,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.show_progress_status("Finalizing preloaded patient...", pump_events=False)
                 self.set_patient_activation_ui_locked(True)
                 if payload.precomputed_view_state is not None:
-                    self.start_patient_activation_movie(folder, payload.precomputed_view_state)
+                    self.start_patient_transition_overlay_process(folder)
                 self.pump_viewer_ui()
                 activation_token = self.patient_activation_token + 1
                 self.patient_activation_token = activation_token
@@ -2213,7 +2148,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             error_message=str(error),
         )
         QtWidgets.QMessageBox.critical(self, "Patient load failed", str(error))
-        self.stop_patient_activation_movie()
+        self.stop_patient_transition_overlay_process()
         self.set_patient_activation_ui_locked(False)
         self.set_heavy_view_updates_enabled(True)
         return False
@@ -2269,7 +2204,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         else:
             self.update_patient_list_controls()
 
-        self.stop_patient_activation_movie()
+        self.stop_patient_transition_overlay_process()
         self.set_patient_activation_ui_locked(False)
         self.set_heavy_view_updates_enabled(True)
         return True
@@ -6239,7 +6174,7 @@ h2 {{
         self.update_axial_overlay_positions()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
-        self.stop_patient_activation_movie()
+        self.stop_patient_transition_overlay_process()
         super().closeEvent(event)
 
     def get_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
@@ -6760,10 +6695,8 @@ h2 {{
             return
         if self.ct is None:
             self.axial_readout_label.hide()
-            self.update_patient_activation_overlay_positions()
             return
         self.axial_readout_label.move(*overlay_positions.readout_pos)
-        self.update_patient_activation_overlay_positions()
 
     def on_mouse_moved(self, pos):
         if self.ct is None or self.autoscroll_button.isChecked():

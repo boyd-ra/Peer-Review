@@ -9,8 +9,7 @@ from time import perf_counter
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-import pyqtgraph.functions as pgfn
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore
 
 from peer_activation_worker import prepare_activation_review_cache_state
 from peer_cache import (
@@ -73,9 +72,6 @@ class PrecomputedPatientViewState:
     dose_max_gy: float
     axial_render_state: AxialRenderState
     orthogonal_render_state: OrthogonalRenderState
-    axial_cine_slice_indices: List[int]
-    axial_cine_frames_rgba: List[np.ndarray]
-    axial_cine_interval_ms: int
 
 
 @dataclass(slots=True)
@@ -120,6 +116,7 @@ class PatientPreloadTask(QtCore.QRunnable):
             payload = prepare_patient_preload_payload(
                 self.folder,
                 array_cache_signature=self.array_cache_signature,
+                include_precomputed_view_state=True,
             )
         except Exception as exc:
             if self._cancelled:
@@ -478,182 +475,6 @@ def build_axial_cine_plan(
     return cine_indices, cine_interval_ms
 
 
-def _compose_axial_movie_frame_rgba(
-    axial_render_state: AxialRenderState,
-    *,
-    lo: float,
-    hi: float,
-) -> np.ndarray:
-    ct_plane = np.asarray(axial_render_state.ct_plane, dtype=np.float32)
-    width = max(hi - lo, 1e-6)
-    ct_norm = np.clip((ct_plane - lo) / width, 0.0, 1.0)
-    base_gray = np.asarray(np.round(ct_norm * 255.0), dtype=np.uint8)
-    base_rgb = np.stack([base_gray, base_gray, base_gray], axis=-1).astype(np.float32)
-
-    dose_rgba = np.asarray(axial_render_state.dose_rgba, dtype=np.uint8)
-    if dose_rgba.ndim == 3 and dose_rgba.shape[-1] == 4:
-        alpha = dose_rgba[..., 3:4].astype(np.float32) / 255.0
-        base_rgb = ((1.0 - alpha) * base_rgb) + (alpha * dose_rgba[..., :3].astype(np.float32))
-
-    frame_rgba = np.empty((*base_gray.shape, 4), dtype=np.uint8)
-    frame_rgba[..., :3] = np.clip(np.round(base_rgb), 0.0, 255.0).astype(np.uint8)
-    frame_rgba[..., 3] = 255
-    return np.ascontiguousarray(frame_rgba)
-
-
-def _rgba_array_to_qimage(frame_rgba: np.ndarray) -> QtGui.QImage:
-    frame = np.ascontiguousarray(frame_rgba, dtype=np.uint8)
-    height, width = frame.shape[:2]
-    return QtGui.QImage(
-        frame.data,
-        width,
-        height,
-        frame.strides[0],
-        QtGui.QImage.Format.Format_RGBA8888,
-    ).copy()
-
-
-def _qimage_to_rgba_array(image: QtGui.QImage) -> np.ndarray:
-    converted = image.convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
-    width = converted.width()
-    height = converted.height()
-    buffer = converted.bits()
-    return np.frombuffer(buffer, dtype=np.uint8, count=height * width * 4).reshape((height, width, 4)).copy()
-
-
-def _draw_polyline_series(
-    painter: QtGui.QPainter,
-    points: List[Tuple[float, float]],
-) -> None:
-    if len(points) < 2:
-        return
-    polygon = QtGui.QPolygonF([QtCore.QPointF(float(x), float(y)) for x, y in points])
-    painter.drawPolyline(polygon)
-
-
-def _get_default_total_rx_dose_gy(
-    rtstruct: Optional[RTStructData],
-    plan_phases: Sequence[RTPlanPhase],
-) -> Optional[float]:
-    available_phase_rx = [
-        float(phase.prescription_dose_gy)
-        for phase in plan_phases
-        if phase.prescription_dose_gy > 0.0 and phase.dose_path
-    ]
-    if available_phase_rx:
-        return float(sum(available_phase_rx))
-    if rtstruct is None:
-        return None
-
-    highest_reference_gy: Optional[float] = None
-    for structure in rtstruct.structures:
-        normalized_name = normalize_structure_name(structure.name)
-        if not normalized_name.startswith("PTV"):
-            continue
-        digits = "".join(ch for ch in normalized_name if ch.isdigit())
-        if not digits:
-            continue
-        reference_gy = float(int(digits)) / 100.0
-        if highest_reference_gy is None or reference_gy > highest_reference_gy:
-            highest_reference_gy = reference_gy
-    return highest_reference_gy
-
-
-def _overlay_axial_movie_guides(
-    frame_rgba: np.ndarray,
-    axial_render_state: AxialRenderState,
-    *,
-    active_isodose_levels: Sequence[Tuple[float, Tuple[int, int, int]]],
-) -> np.ndarray:
-    image = _rgba_array_to_qimage(frame_rgba)
-    painter = QtGui.QPainter(image)
-    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-
-    for spec in axial_render_state.contour_specs:
-        pen = QtGui.QPen(QtGui.QColor(*spec.color_rgb))
-        pen.setWidth(3)
-        painter.setPen(pen)
-        _draw_polyline_series(
-            painter,
-            list(zip(np.asarray(spec.x, dtype=float).tolist(), np.asarray(spec.y, dtype=float).tolist())),
-        )
-
-    dose_plane = axial_render_state.dose_plane
-    if dose_plane is not None and np.isfinite(dose_plane).any():
-        max_dose = float(np.nanmax(dose_plane))
-        for dose_gy, color_rgb in active_isodose_levels:
-            if dose_gy <= 0.0 or dose_gy > max_dose:
-                continue
-            pen = QtGui.QPen(QtGui.QColor(*color_rgb))
-            pen.setWidth(2)
-            pen.setStyle(QtCore.Qt.PenStyle.DashLine)
-            painter.setPen(pen)
-            for path_points in pgfn.isocurve(dose_plane, dose_gy, connected=True):
-                if len(path_points) < 2:
-                    continue
-                _draw_polyline_series(
-                    painter,
-                    [(float(point[1]), float(point[0])) for point in path_points],
-                )
-
-    painter.end()
-    return _qimage_to_rgba_array(image)
-
-
-def _crop_axial_movie_frame_rgba(
-    frame_rgba: np.ndarray,
-    axial_bounds: Optional[Tuple[float, float, float, float]],
-    *,
-    padding_fraction: float = 0.05,
-) -> np.ndarray:
-    if axial_bounds is None:
-        return np.ascontiguousarray(frame_rgba)
-
-    x_min, x_max, y_min, y_max = axial_bounds
-    width = max(float(x_max) - float(x_min), 1.0)
-    height = max(float(y_max) - float(y_min), 1.0)
-    x_pad = width * padding_fraction / 2.0
-    y_pad = height * padding_fraction / 2.0
-
-    row_start = max(int(np.floor(float(y_min) - y_pad)), 0)
-    row_end = min(int(np.ceil(float(y_max) + y_pad)) + 1, frame_rgba.shape[0])
-    col_start = max(int(np.floor(float(x_min) - x_pad)), 0)
-    col_end = min(int(np.ceil(float(x_max) + x_pad)) + 1, frame_rgba.shape[1])
-
-    if row_end <= row_start or col_end <= col_start:
-        return np.ascontiguousarray(frame_rgba)
-    return np.ascontiguousarray(frame_rgba[row_start:row_end, col_start:col_end])
-
-
-def _get_shared_cine_axial_bounds(
-    image_view_bounds: Optional[ImageViewBounds],
-    cine_indices: Sequence[int],
-    *,
-    fallback_slice_index: int,
-) -> Optional[Tuple[float, float, float, float]]:
-    if image_view_bounds is None:
-        return None
-
-    collected_bounds = [
-        image_view_bounds.axial_by_slice[idx]
-        for idx in cine_indices
-        if idx in image_view_bounds.axial_by_slice
-    ]
-    if not collected_bounds:
-        return image_view_bounds.axial_by_slice.get(fallback_slice_index)
-
-    x_mins = [bounds[0] for bounds in collected_bounds]
-    x_maxs = [bounds[1] for bounds in collected_bounds]
-    y_mins = [bounds[2] for bounds in collected_bounds]
-    y_maxs = [bounds[3] for bounds in collected_bounds]
-    return (
-        float(min(x_mins)),
-        float(max(x_maxs)),
-        float(min(y_mins)),
-        float(max(y_maxs)),
-    )
-
-
 def _get_default_colorwash_min_dose_gy(
     rtstruct: Optional[RTStructData],
     plan_phases: Sequence[RTPlanPhase],
@@ -690,10 +511,8 @@ def build_precomputed_patient_view_state(
     rtstruct: Optional[RTStructData],
     sampled_dose_volume_ct: Optional[np.ndarray],
     plan_phases: Sequence[RTPlanPhase],
-    image_view_bounds: Optional[ImageViewBounds] = None,
 ) -> PrecomputedPatientViewState:
     slice_index = _get_default_initial_slice_index(ct, rtstruct)
-    cine_start_idx, cine_end_idx = _get_default_initial_slice_range(ct, rtstruct)
     row_idx = int(ct.rows // 2)
     col_idx = int(ct.cols // 2)
     window_level = 40.0
@@ -732,7 +551,6 @@ def build_precomputed_patient_view_state(
         dose_max_gy,
         lambda idx: _preload_structure_visible(rtstruct, idx),
     )
-    cine_indices, cine_interval_ms = build_axial_cine_plan(ct, rtstruct)
     return PrecomputedPatientViewState(
         slice_index=slice_index,
         row_idx=row_idx,
@@ -744,9 +562,6 @@ def build_precomputed_patient_view_state(
         dose_max_gy=dose_max_gy,
         axial_render_state=axial_render_state,
         orthogonal_render_state=orthogonal_render_state,
-        axial_cine_slice_indices=cine_indices,
-        axial_cine_frames_rgba=[],
-        axial_cine_interval_ms=cine_interval_ms,
     )
 
 
@@ -755,6 +570,7 @@ def prepare_patient_preload_payload(
     *,
     array_cache_signature: Dict[str, str],
     progress_callback: Optional[Callable[[str], None]] = None,
+    include_precomputed_view_state: bool = False,
 ) -> PatientPreloadPayload:
     timing_entries: List[Tuple[str, Optional[float]]] = []
 
@@ -826,16 +642,18 @@ def prepare_patient_preload_payload(
     else:
         timing_entries.append(("Load saved review cache file", None))
 
-    stage_start = perf_counter()
-    precomputed_view_state = build_precomputed_patient_view_state(
-        ct=ct,
-        dose=dose,
-        rtstruct=rtstruct,
-        sampled_dose_volume_ct=sampled_dose_volume_ct,
-        plan_phases=patient_discovery.plan_phases,
-        image_view_bounds=image_view_bounds,
-    )
-    timing_entries.append(("Precompute initial view state", perf_counter() - stage_start))
+    if include_precomputed_view_state:
+        stage_start = perf_counter()
+        precomputed_view_state = build_precomputed_patient_view_state(
+            ct=ct,
+            dose=dose,
+            rtstruct=rtstruct,
+            sampled_dose_volume_ct=sampled_dose_volume_ct,
+            plan_phases=patient_discovery.plan_phases,
+        )
+        timing_entries.append(("Precompute initial view state", perf_counter() - stage_start))
+    else:
+        timing_entries.append(("Precompute initial view state", None))
 
     return PatientPreloadPayload(
         folder=folder,
