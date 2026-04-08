@@ -17,6 +17,8 @@ from peer_models import (
     CTVolume,
     DoseVolume,
     DVHCurve,
+    PatientFileDiscovery,
+    RTPlanPhase,
     RTStructData,
     StructureGoal,
     StructureGoalEvaluation,
@@ -51,6 +53,12 @@ def get_derived_array_cache_path(base_path: Optional[Path]) -> Optional[Path]:
     return base_path.with_name(f"{base_path.stem}_arrays.npz")
 
 
+def get_review_bundle_path(current_patient_folder: Optional[str]) -> Optional[Path]:
+    if current_patient_folder is None:
+        return None
+    return Path(current_patient_folder) / "peer_review_bundle.npz"
+
+
 def write_json_atomic(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
@@ -58,6 +66,22 @@ def write_json_atomic(path: Path, payload: object) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+        temp_path.replace(path)
+    except Exception:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def write_npz_atomic(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
+    os.close(fd)
+    temp_path = Path(temp_path_str)
+    try:
+        np.savez_compressed(temp_path, **arrays)
         temp_path.replace(path)
     except Exception:
         try:
@@ -134,6 +158,7 @@ class DerivedArrayCacheData:
     ct: Optional[CTVolume]
     dose: Optional[DoseVolume]
     rtstruct: Optional[RTStructData]
+    patient_discovery: Optional[PatientFileDiscovery]
     sampled_dose_volume_ct: Optional[np.ndarray]
     ptv_union_volume_mask: Optional[np.ndarray]
     structure_volume_masks: Dict[str, np.ndarray]
@@ -144,6 +169,14 @@ class DerivedArrayCacheData:
 class ReviewCacheFileData:
     payload: Dict[str, object]
     cache_version: int
+    trusted_source: bool = False
+
+
+@dataclass(slots=True)
+class ReviewBundleData:
+    derived_array_cache_data: DerivedArrayCacheData
+    review_cache_data: Optional[ReviewCacheFileData]
+    screenshot_png_bytes: Optional[bytes]
 
 
 @dataclass(slots=True)
@@ -285,6 +318,141 @@ def _deserialize_rtstruct_geometry(
         structures=structures,
         frame_of_reference_uid=str(payload.get("frame_of_reference_uid", "")),
     )
+
+
+def _serialize_patient_discovery(
+    patient_discovery: Optional[PatientFileDiscovery],
+    *,
+    folder: Path,
+) -> Dict[str, object]:
+    if patient_discovery is None:
+        return {}
+
+    def _serialize_path(path: Optional[str]) -> Optional[str]:
+        if not path:
+            return None
+        try:
+            return os.path.relpath(path, folder)
+        except ValueError:
+            return str(path)
+
+    return {
+        "ct_paths": [serialized for path in patient_discovery.ct_paths if (serialized := _serialize_path(path))],
+        "rtstruct_path": _serialize_path(patient_discovery.rtstruct_path),
+        "rtdose_paths": [serialized for path in patient_discovery.rtdose_paths if (serialized := _serialize_path(path))],
+        "rtplan_paths": [serialized for path in patient_discovery.rtplan_paths if (serialized := _serialize_path(path))],
+        "plan_phases": [
+            {
+                "sop_instance_uid": phase.sop_instance_uid,
+                "prescription_dose_gy": float(phase.prescription_dose_gy),
+                "fractions_planned": int(phase.fractions_planned),
+                "dose_path": _serialize_path(phase.dose_path),
+                "target_structure_name": phase.target_structure_name,
+                "plan_label": phase.plan_label,
+                "plan_name": phase.plan_name,
+            }
+            for phase in patient_discovery.plan_phases
+        ],
+        "patient_plan_lines": list(patient_discovery.patient_plan_lines or []),
+    }
+
+
+def _deserialize_patient_discovery(
+    payload: Mapping[str, object],
+    *,
+    folder: Path,
+) -> Optional[PatientFileDiscovery]:
+    def _deserialize_path(path_value: object) -> Optional[str]:
+        if path_value in {None, ""}:
+            return None
+        path_text = str(path_value)
+        return str((folder / path_text).resolve()) if not os.path.isabs(path_text) else path_text
+
+    ct_payload = payload.get("ct_paths")
+    rtdose_payload = payload.get("rtdose_paths")
+    rtplan_payload = payload.get("rtplan_paths")
+    if not isinstance(ct_payload, list) or not isinstance(rtdose_payload, list) or not isinstance(rtplan_payload, list):
+        return None
+
+    plan_phases_payload = payload.get("plan_phases", [])
+    if not isinstance(plan_phases_payload, list):
+        return None
+    plan_phases: List[RTPlanPhase] = []
+    for phase_payload in plan_phases_payload:
+        if not isinstance(phase_payload, dict):
+            return None
+        plan_phases.append(
+            RTPlanPhase(
+                sop_instance_uid=str(phase_payload.get("sop_instance_uid", "")),
+                prescription_dose_gy=float(phase_payload.get("prescription_dose_gy", 0.0) or 0.0),
+                fractions_planned=int(phase_payload.get("fractions_planned", 0) or 0),
+                dose_path=_deserialize_path(phase_payload.get("dose_path")) or "",
+                target_structure_name=str(phase_payload.get("target_structure_name", "")),
+                plan_label=str(phase_payload.get("plan_label", "")),
+                plan_name=str(phase_payload.get("plan_name", "")),
+            )
+        )
+
+    patient_plan_lines_payload = payload.get("patient_plan_lines")
+    patient_plan_lines: Optional[Tuple[str, ...]]
+    if isinstance(patient_plan_lines_payload, list):
+        patient_plan_lines = tuple(str(line).strip() for line in patient_plan_lines_payload if str(line).strip()) or None
+    else:
+        patient_plan_lines = None
+
+    return PatientFileDiscovery(
+        ct_paths=[path for item in ct_payload if (path := _deserialize_path(item))],
+        rtstruct_path=_deserialize_path(payload.get("rtstruct_path")),
+        rtdose_paths=[path for item in rtdose_payload if (path := _deserialize_path(item))],
+        rtplan_paths=[path for item in rtplan_payload if (path := _deserialize_path(item))],
+        plan_phases=plan_phases,
+        patient_plan_lines=patient_plan_lines,
+    )
+
+
+def load_cached_patient_discovery(path: Path, *, folder: str) -> Optional[PatientFileDiscovery]:
+    try:
+        payload = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+
+    try:
+        metadata_json = payload["metadata_json"].item()
+        metadata = json.loads(str(metadata_json))
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        payload.close()
+        return None
+
+    if not isinstance(metadata, dict):
+        payload.close()
+        return None
+
+    cache_version = metadata.get("version")
+    if cache_version not in {5}:
+        payload.close()
+        return None
+
+    patient_discovery_payload = metadata.get("patient_discovery")
+    if not isinstance(patient_discovery_payload, dict):
+        payload.close()
+        return None
+
+    patient_discovery = _deserialize_patient_discovery(patient_discovery_payload, folder=Path(folder))
+    if patient_discovery is None:
+        payload.close()
+        return None
+
+    payload.close()
+
+    if not file_fingerprint_list_matches(metadata.get("ct_fingerprints"), list(patient_discovery.ct_paths)):
+        return None
+    if not file_fingerprint_matches(metadata.get("rtstruct_fingerprint"), patient_discovery.rtstruct_path):
+        return None
+    if not file_fingerprint_list_matches(metadata.get("rtdose_fingerprints"), list(patient_discovery.rtdose_paths)):
+        return None
+    if not file_fingerprint_list_matches(metadata.get("rtplan_fingerprints"), list(patient_discovery.rtplan_paths)):
+        return None
+    return patient_discovery
 
 
 def _serialize_ct_geometry(
@@ -718,6 +886,7 @@ def prepare_review_cache_state(
 ) -> Optional[PreparedReviewCacheState]:
     payload = loaded_cache.payload
     cache_version = loaded_cache.cache_version
+    trusted_source = loaded_cache.trusted_source
 
     expected_names = [normalize_structure_name(name) for name in expected_structure_names]
     expected_name_set = set(expected_names)
@@ -755,37 +924,53 @@ def prepare_review_cache_state(
     else:
         saved_constraints_sheet = str(saved_constraint_set)
 
-    if saved_constraints_sheet is not None and saved_constraints_sheet not in available_constraint_sheet_names:
+    if not trusted_source and saved_constraints_sheet is not None and saved_constraints_sheet not in available_constraint_sheet_names:
         return None
 
     saved_csv_fingerprint = payload.get("constraints_fingerprint", payload.get("csv_fingerprint"))
-    if saved_csv_fingerprint is not None and not file_fingerprint_matches(saved_csv_fingerprint, structure_filter_csv_path):
+    if (
+        not trusted_source
+        and saved_csv_fingerprint is not None
+        and not file_fingerprint_matches(saved_csv_fingerprint, structure_filter_csv_path)
+    ):
         return None
 
     saved_csv_name = payload.get("constraints_file", payload.get("csv_file"))
     current_csv_name = Path(structure_filter_csv_path).name if structure_filter_csv_path else None
-    if saved_csv_fingerprint is None and saved_csv_name not in {None, current_csv_name}:
+    if not trusted_source and saved_csv_fingerprint is None and saved_csv_name not in {None, current_csv_name}:
         return None
 
     saved_rtstruct_fingerprint = payload.get("rtstruct_fingerprint")
-    if saved_rtstruct_fingerprint is not None and not file_fingerprint_matches(saved_rtstruct_fingerprint, rtstruct_path):
+    if (
+        not trusted_source
+        and saved_rtstruct_fingerprint is not None
+        and not file_fingerprint_matches(saved_rtstruct_fingerprint, rtstruct_path)
+    ):
         return None
 
     saved_rtstruct_name = payload.get("rtstruct_file")
     current_rtstruct_name = Path(rtstruct_path).name if rtstruct_path else None
-    if saved_rtstruct_fingerprint is None and saved_rtstruct_name not in {None, current_rtstruct_name}:
+    if not trusted_source and saved_rtstruct_fingerprint is None and saved_rtstruct_name not in {None, current_rtstruct_name}:
         return None
 
     saved_rtdose_fingerprints = payload.get("rtdose_fingerprints")
-    if saved_rtdose_fingerprints is not None and not file_fingerprint_list_matches(saved_rtdose_fingerprints, list(rtdose_paths)):
+    if (
+        not trusted_source
+        and saved_rtdose_fingerprints is not None
+        and not file_fingerprint_list_matches(saved_rtdose_fingerprints, list(rtdose_paths))
+    ):
         return None
 
     saved_rtplan_fingerprints = payload.get("rtplan_fingerprints")
-    if saved_rtplan_fingerprints is not None and not file_fingerprint_list_matches(saved_rtplan_fingerprints, list(rtplan_paths)):
+    if (
+        not trusted_source
+        and saved_rtplan_fingerprints is not None
+        and not file_fingerprint_list_matches(saved_rtplan_fingerprints, list(rtplan_paths))
+    ):
         return None
 
     saved_dvh_mode = payload.get("dvh_mode")
-    if saved_dvh_mode not in {None, dvh_mode}:
+    if not trusted_source and saved_dvh_mode not in {None, dvh_mode}:
         return None
 
     notes_payload = payload.get("constraint_notes", {})
@@ -849,11 +1034,11 @@ def prepare_review_cache_state(
         return None
 
     saved_dvh_signature = payload.get("dvh_method_signature")
-    if saved_dvh_signature is not None and saved_dvh_signature != dvh_method_signature:
+    if not trusted_source and saved_dvh_signature is not None and saved_dvh_signature != dvh_method_signature:
         return None
 
     saved_target_signature = payload.get("target_method_signature")
-    if saved_target_signature is not None and saved_target_signature != target_method_signature:
+    if not trusted_source and saved_target_signature is not None and saved_target_signature != target_method_signature:
         return None
 
     goal_evaluations = deserialize_goal_evaluations(payload.get("goal_evaluations"))
@@ -921,11 +1106,12 @@ def prepare_review_cache_state(
     )
 
 
-def save_derived_array_cache(
-    path: Path,
+def build_derived_array_archive(
     *,
+    folder: Path,
     ct: CTVolume,
     ct_paths: Sequence[str],
+    patient_discovery: Optional[PatientFileDiscovery],
     dose: Optional[DoseVolume],
     rtstruct: Optional[RTStructData],
     rtstruct_path: Optional[str],
@@ -936,24 +1122,28 @@ def save_derived_array_cache(
     structure_order: Sequence[str],
     structure_volume_masks: Dict[str, np.ndarray],
     structure_geometry_volumes_cc: Dict[str, float],
-) -> None:
+    metadata_overrides: Optional[Mapping[str, object]] = None,
+    extra_arrays: Optional[Mapping[str, np.ndarray]] = None,
+) -> Tuple[Dict[str, object], Dict[str, np.ndarray]]:
     metadata: Dict[str, object] = {
-        "version": 4,
+        "version": 5,
         "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
         "ct_geometry_signature": get_ct_geometry_signature(ct),
         "ct_fingerprints": build_file_fingerprints(list(ct_paths)),
         "rtstruct_fingerprint": build_file_fingerprint(rtstruct_path),
         "rtdose_fingerprints": build_file_fingerprints(list(rtdose_paths)),
+        "rtplan_fingerprints": build_file_fingerprints(
+            list(patient_discovery.rtplan_paths if patient_discovery is not None else [])
+        ),
         "array_cache_signature": array_cache_signature,
         "structures": [],
         "ct_geometry": {},
         "dose_geometry": {},
         "rtstruct_geometry": {},
+        "patient_discovery": _serialize_patient_discovery(patient_discovery, folder=folder),
     }
 
-    arrays: Dict[str, np.ndarray] = {
-        "metadata_json": np.asarray(json.dumps(metadata), dtype=np.str_),
-    }
+    arrays: Dict[str, np.ndarray] = {}
     metadata["ct_geometry"] = _serialize_ct_geometry(ct, arrays)
     metadata["dose_geometry"] = _serialize_dose_geometry(dose, arrays)
     metadata["rtstruct_geometry"] = _serialize_rtstruct_geometry(rtstruct, arrays)
@@ -979,21 +1169,159 @@ def save_derived_array_cache(
         structure_entries.append(structure_entry)
 
     metadata["structures"] = structure_entries
-    arrays["metadata_json"] = np.asarray(json.dumps(metadata), dtype=np.str_)
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
-    os.close(fd)
-    temp_path = Path(temp_path_str)
+    if metadata_overrides:
+        metadata.update(dict(metadata_overrides))
+    if extra_arrays:
+        arrays.update(dict(extra_arrays))
+
+    metadata["patient_discovery"] = _serialize_patient_discovery(patient_discovery, folder=folder)
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata), dtype=np.str_)
+    return metadata, arrays
+
+
+def save_derived_array_cache(
+    path: Path,
+    *,
+    ct: CTVolume,
+    ct_paths: Sequence[str],
+    patient_discovery: Optional[PatientFileDiscovery],
+    dose: Optional[DoseVolume],
+    rtstruct: Optional[RTStructData],
+    rtstruct_path: Optional[str],
+    rtdose_paths: Sequence[str],
+    array_cache_signature: Dict[str, str],
+    sampled_dose_volume_ct: Optional[np.ndarray],
+    ptv_union_volume_mask: Optional[np.ndarray],
+    structure_order: Sequence[str],
+    structure_volume_masks: Dict[str, np.ndarray],
+    structure_geometry_volumes_cc: Dict[str, float],
+) -> None:
+    _metadata, arrays = build_derived_array_archive(
+        folder=path.parent,
+        ct=ct,
+        ct_paths=ct_paths,
+        patient_discovery=patient_discovery,
+        dose=dose,
+        rtstruct=rtstruct,
+        rtstruct_path=rtstruct_path,
+        rtdose_paths=rtdose_paths,
+        array_cache_signature=array_cache_signature,
+        sampled_dose_volume_ct=sampled_dose_volume_ct,
+        ptv_union_volume_mask=ptv_union_volume_mask,
+        structure_order=structure_order,
+        structure_volume_masks=structure_volume_masks,
+        structure_geometry_volumes_cc=structure_geometry_volumes_cc,
+    )
+    write_npz_atomic(path, arrays)
+
+
+def save_review_bundle(
+    path: Path,
+    *,
+    review_payload: Mapping[str, object],
+    screenshot_png_bytes: Optional[bytes],
+    ct: CTVolume,
+    ct_paths: Sequence[str],
+    patient_discovery: Optional[PatientFileDiscovery],
+    dose: Optional[DoseVolume],
+    rtstruct: Optional[RTStructData],
+    rtstruct_path: Optional[str],
+    rtdose_paths: Sequence[str],
+    array_cache_signature: Dict[str, str],
+    sampled_dose_volume_ct: Optional[np.ndarray],
+    ptv_union_volume_mask: Optional[np.ndarray],
+    structure_order: Sequence[str],
+    structure_volume_masks: Dict[str, np.ndarray],
+    structure_geometry_volumes_cc: Dict[str, float],
+) -> None:
+    extra_arrays: Dict[str, np.ndarray] = {
+        "review_cache_json": np.asarray(json.dumps(dict(review_payload)), dtype=np.str_),
+    }
+    if screenshot_png_bytes:
+        extra_arrays["screenshot_png_bytes"] = np.frombuffer(screenshot_png_bytes, dtype=np.uint8)
+
+    _metadata, arrays = build_derived_array_archive(
+        folder=path.parent,
+        ct=ct,
+        ct_paths=ct_paths,
+        patient_discovery=patient_discovery,
+        dose=dose,
+        rtstruct=rtstruct,
+        rtstruct_path=rtstruct_path,
+        rtdose_paths=rtdose_paths,
+        array_cache_signature=array_cache_signature,
+        sampled_dose_volume_ct=sampled_dose_volume_ct,
+        ptv_union_volume_mask=ptv_union_volume_mask,
+        structure_order=structure_order,
+        structure_volume_masks=structure_volume_masks,
+        structure_geometry_volumes_cc=structure_geometry_volumes_cc,
+        metadata_overrides={
+            "cache_kind": "peer_review_bundle",
+            "bundle_version": 1,
+            "review_cache_version": int(review_payload.get("version", 0) or 0),
+        },
+        extra_arrays=extra_arrays,
+    )
+    write_npz_atomic(path, arrays)
+
+
+def load_review_bundle_review_cache_file(path: Path) -> Optional[ReviewCacheFileData]:
     try:
-        np.savez_compressed(temp_path, **arrays)
-        temp_path.replace(path)
-    except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+        payload = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+
+    try:
+        metadata_json = payload["metadata_json"].item()
+        metadata = json.loads(str(metadata_json))
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        payload.close()
+        return None
+
+    if not isinstance(metadata, dict) or metadata.get("cache_kind") != "peer_review_bundle":
+        payload.close()
+        return None
+
+    try:
+        review_cache_json = payload["review_cache_json"].item()
+        review_payload = json.loads(str(review_cache_json))
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        payload.close()
+        return None
+    finally:
+        payload.close()
+
+    if not isinstance(review_payload, dict):
+        return None
+    try:
+        cache_version = int(review_payload.get("version", metadata.get("review_cache_version", 0)))
+    except (TypeError, ValueError):
+        cache_version = 0
+    return ReviewCacheFileData(
+        payload=review_payload,
+        cache_version=cache_version,
+        trusted_source=True,
+    )
+
+
+def load_review_bundle_screenshot_bytes(path: Path) -> Optional[bytes]:
+    try:
+        payload = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    try:
+        metadata_json = payload["metadata_json"].item()
+        metadata = json.loads(str(metadata_json))
+        if not isinstance(metadata, dict) or metadata.get("cache_kind") != "peer_review_bundle":
+            return None
+        if "screenshot_png_bytes" not in payload.files:
+            return None
+        return bytes(np.asarray(payload["screenshot_png_bytes"], dtype=np.uint8).tobytes())
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    finally:
+        payload.close()
 
 
 def load_derived_array_cache(
@@ -1021,7 +1349,7 @@ def load_derived_array_cache(
         payload.close()
         return None
     cache_version = metadata.get("version")
-    if cache_version not in {1, 2, 3, 4}:
+    if cache_version not in {1, 2, 3, 4, 5}:
         payload.close()
         return None
     if metadata.get("array_cache_signature") != array_cache_signature:
@@ -1130,13 +1458,157 @@ def load_derived_array_cache(
                 payload.close()
                 return None
 
+    patient_discovery: Optional[PatientFileDiscovery] = None
+    if cache_version >= 5:
+        patient_discovery_payload = metadata.get("patient_discovery")
+        if patient_discovery_payload not in (None, {}):
+            if not isinstance(patient_discovery_payload, dict):
+                payload.close()
+                return None
+            patient_discovery = _deserialize_patient_discovery(patient_discovery_payload, folder=path.parent)
+            if patient_discovery is None:
+                payload.close()
+                return None
+
     payload.close()
     return DerivedArrayCacheData(
         ct=loaded_ct,
         dose=dose,
         rtstruct=rtstruct,
+        patient_discovery=patient_discovery,
         sampled_dose_volume_ct=sampled_dose_volume_ct,
         ptv_union_volume_mask=ptv_union_volume_mask,
         structure_volume_masks=structure_volume_masks,
         structure_geometry_volumes_cc=structure_geometry_volumes_cc,
+    )
+
+
+def load_review_bundle(path: Path) -> Optional[ReviewBundleData]:
+    try:
+        payload = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+
+    try:
+        metadata_json = payload["metadata_json"].item()
+        metadata = json.loads(str(metadata_json))
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        payload.close()
+        return None
+
+    if not isinstance(metadata, dict):
+        payload.close()
+        return None
+    if metadata.get("cache_kind") != "peer_review_bundle":
+        payload.close()
+        return None
+    if metadata.get("bundle_version") not in {1}:
+        payload.close()
+        return None
+
+    ct_geometry_payload = metadata.get("ct_geometry")
+    if not isinstance(ct_geometry_payload, dict):
+        payload.close()
+        return None
+    loaded_ct = _deserialize_ct_geometry(ct_geometry_payload, payload)
+    if loaded_ct is None:
+        payload.close()
+        return None
+
+    dose: Optional[DoseVolume] = None
+    dose_geometry_payload = metadata.get("dose_geometry")
+    if dose_geometry_payload not in (None, {}):
+        if not isinstance(dose_geometry_payload, dict):
+            payload.close()
+            return None
+        dose = _deserialize_dose_geometry(dose_geometry_payload, payload)
+        if dose is None:
+            payload.close()
+            return None
+
+    sampled_dose_volume_ct: Optional[np.ndarray] = None
+    if "sampled_dose_volume_ct" in payload.files:
+        sampled_dose_volume_ct = np.asarray(payload["sampled_dose_volume_ct"], dtype=np.float32)
+        if sampled_dose_volume_ct.shape != loaded_ct.volume_hu.shape:
+            payload.close()
+            return None
+
+    ptv_union_volume_mask: Optional[np.ndarray] = None
+    if "ptv_union_volume_mask" in payload.files:
+        ptv_union_volume_mask = np.asarray(payload["ptv_union_volume_mask"], dtype=bool)
+        if ptv_union_volume_mask.shape != loaded_ct.volume_hu.shape:
+            payload.close()
+            return None
+
+    structures_payload = metadata.get("structures", [])
+    if not isinstance(structures_payload, list):
+        payload.close()
+        return None
+
+    structure_volume_masks: Dict[str, np.ndarray] = {}
+    structure_geometry_volumes_cc: Dict[str, float] = {}
+    for structure_entry in structures_payload:
+        if not isinstance(structure_entry, dict):
+            payload.close()
+            return None
+        normalized_name = normalize_structure_name(str(structure_entry.get("name", "")))
+        mask_key = str(structure_entry.get("mask_key", ""))
+        if not normalized_name or not mask_key:
+            payload.close()
+            return None
+        try:
+            cached_mask = np.asarray(payload[mask_key], dtype=bool)
+        except KeyError:
+            payload.close()
+            return None
+        if cached_mask.shape != loaded_ct.volume_hu.shape:
+            payload.close()
+            return None
+        structure_volume_masks[normalized_name] = cached_mask
+        try:
+            geometry_volume_cc = float(structure_entry.get("geometry_volume_cc", 0.0))
+        except (TypeError, ValueError):
+            geometry_volume_cc = 0.0
+        if geometry_volume_cc > 0.0:
+            structure_geometry_volumes_cc[normalized_name] = geometry_volume_cc
+
+    rtstruct: Optional[RTStructData] = None
+    rtstruct_geometry_payload = metadata.get("rtstruct_geometry")
+    if rtstruct_geometry_payload not in (None, {}):
+        if not isinstance(rtstruct_geometry_payload, dict):
+            payload.close()
+            return None
+        rtstruct = _deserialize_rtstruct_geometry(rtstruct_geometry_payload, payload)
+        if rtstruct is None:
+            payload.close()
+            return None
+
+    patient_discovery: Optional[PatientFileDiscovery] = None
+    patient_discovery_payload = metadata.get("patient_discovery")
+    if patient_discovery_payload not in (None, {}):
+        if not isinstance(patient_discovery_payload, dict):
+            payload.close()
+            return None
+        patient_discovery = _deserialize_patient_discovery(patient_discovery_payload, folder=path.parent)
+        if patient_discovery is None:
+            payload.close()
+            return None
+
+    review_cache_data = load_review_bundle_review_cache_file(path)
+    screenshot_png_bytes = load_review_bundle_screenshot_bytes(path)
+    payload.close()
+
+    return ReviewBundleData(
+        derived_array_cache_data=DerivedArrayCacheData(
+            ct=loaded_ct,
+            dose=dose,
+            rtstruct=rtstruct,
+            patient_discovery=patient_discovery,
+            sampled_dose_volume_ct=sampled_dose_volume_ct,
+            ptv_union_volume_mask=ptv_union_volume_mask,
+            structure_volume_masks=structure_volume_masks,
+            structure_geometry_volumes_cc=structure_geometry_volumes_cc,
+        ),
+        review_cache_data=review_cache_data,
+        screenshot_png_bytes=screenshot_png_bytes,
     )

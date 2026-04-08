@@ -18,7 +18,10 @@ from peer_cache import (
     ReviewCacheFileData,
     get_derived_array_cache_path,
     get_dvh_cache_path,
+    get_review_bundle_path,
+    load_cached_patient_discovery,
     load_derived_array_cache,
+    load_review_bundle,
     load_review_cache_file,
 )
 from peer_helpers import compute_image_view_bounds, normalize_structure_name, sample_dose_to_ct_slice
@@ -507,8 +510,84 @@ def prepare_patient_preload_payload(
 ) -> PatientPreloadPayload:
     timing_entries: List[Tuple[str, Optional[float]]] = []
 
+    review_bundle_path = get_review_bundle_path(folder)
+    if review_bundle_path is not None and review_bundle_path.exists():
+        stage_start = perf_counter()
+        bundle_data = load_review_bundle(review_bundle_path)
+        bundle_load_duration = perf_counter() - stage_start if bundle_data is not None else None
+        if bundle_data is not None:
+            derived_array_cache_data = bundle_data.derived_array_cache_data
+            ct = derived_array_cache_data.ct
+            if ct is None:
+                raise ValueError("Saved review bundle did not contain CT data.")
+
+            patient_discovery = derived_array_cache_data.patient_discovery or PatientFileDiscovery(
+                ct_paths=[],
+                rtstruct_path=None,
+                rtdose_paths=[],
+                rtplan_paths=[],
+            )
+            ct_paths = list(patient_discovery.ct_paths)
+            rtstruct_path = patient_discovery.rtstruct_path
+            rtdose_paths = list(patient_discovery.rtdose_paths)
+            rtplan_paths = list(patient_discovery.rtplan_paths)
+            if patient_plan_callback is not None:
+                patient_plan_callback(patient_discovery.patient_plan_lines)
+
+            timing_entries.append(("File discovery", None))
+            timing_entries.append(("Load review bundle", bundle_load_duration))
+
+            stage_start = perf_counter()
+            image_view_bounds = compute_image_view_bounds(ct)
+            timing_entries.append(("Compute image bounds", perf_counter() - stage_start))
+            timing_entries.append(("Load CT", None))
+            timing_entries.append(("Load/merge RTDOSE", None))
+            timing_entries.append(("Load derived array cache", None))
+            timing_entries.append(("Resample dose to CT grid", None))
+            timing_entries.append(("Load RTSTRUCT", None))
+            timing_entries.append(("Load saved review cache file", None))
+
+            precomputed_view_state: Optional[PrecomputedPatientViewState] = None
+            if include_precomputed_view_state:
+                stage_start = perf_counter()
+                precomputed_view_state = build_precomputed_patient_view_state(
+                    ct=ct,
+                    dose=derived_array_cache_data.dose,
+                    rtstruct=derived_array_cache_data.rtstruct,
+                    sampled_dose_volume_ct=derived_array_cache_data.sampled_dose_volume_ct,
+                    plan_phases=patient_discovery.plan_phases,
+                )
+                timing_entries.append(("Precompute initial view state", perf_counter() - stage_start))
+            else:
+                timing_entries.append(("Precompute initial view state", None))
+
+            return PatientPreloadPayload(
+                folder=folder,
+                ct=ct,
+                image_view_bounds=image_view_bounds,
+                ct_paths=ct_paths,
+                patient_plan_lines=patient_discovery.patient_plan_lines,
+                plan_phases=list(patient_discovery.plan_phases),
+                rtplan_paths=rtplan_paths,
+                rtstruct_path=rtstruct_path,
+                rtstruct=derived_array_cache_data.rtstruct,
+                rtdose_paths=rtdose_paths,
+                dose=derived_array_cache_data.dose,
+                sampled_dose_volume_ct=derived_array_cache_data.sampled_dose_volume_ct,
+                derived_array_cache_loaded=True,
+                derived_array_cache_data=derived_array_cache_data,
+                review_cache_data=bundle_data.review_cache_data,
+                precomputed_view_state=precomputed_view_state,
+                timing_entries=timing_entries,
+            )
+
     stage_start = perf_counter()
-    patient_discovery = load_patient_discovery(folder)
+    patient_discovery: Optional[PatientFileDiscovery] = None
+    derived_array_cache_path = get_derived_array_cache_path(get_dvh_cache_path(folder))
+    if derived_array_cache_path is not None and derived_array_cache_path.exists():
+        patient_discovery = load_cached_patient_discovery(derived_array_cache_path, folder=folder)
+    if patient_discovery is None:
+        patient_discovery = load_patient_discovery(folder)
     ct_paths = list(patient_discovery.ct_paths)
     rtstruct_path = patient_discovery.rtstruct_path
     rtdose_paths = list(patient_discovery.rtdose_paths)
@@ -520,7 +599,6 @@ def prepare_patient_preload_payload(
     ct: Optional[CTVolume] = None
     derived_array_cache_data: Optional[DerivedArrayCacheData] = None
     derived_array_cache_load_duration: Optional[float] = None
-    derived_array_cache_path = get_derived_array_cache_path(get_dvh_cache_path(folder))
     stage_start = perf_counter()
     if derived_array_cache_path is not None and derived_array_cache_path.exists():
         derived_array_cache_data = load_derived_array_cache(

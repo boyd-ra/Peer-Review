@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -51,12 +51,15 @@ from peer_cache import (
     get_derived_array_cache_signature as compute_derived_array_cache_signature,
     get_derived_cache_structures as select_derived_cache_structures,
     get_dvh_cache_path as compute_dvh_cache_path,
+    get_review_bundle_path as compute_review_bundle_path,
     load_derived_array_cache as load_derived_array_cache_file,
+    load_review_bundle_review_cache_file,
     load_review_cache_file,
     prepare_review_cache_state,
     PreparedReviewCacheState,
     ReviewCacheFileData,
     save_derived_array_cache as save_derived_array_cache_file,
+    save_review_bundle as save_review_bundle_file,
     serialize_dvh_curve as serialize_dvh_curve_payload,
     serialize_goal_evaluations as serialize_goal_evaluations_payload,
     serialize_structure_goals as serialize_structure_goals_payload,
@@ -139,6 +142,7 @@ from peer_models import (
     DVHCurve,
     DoseVolume,
     ImageViewBounds,
+    PatientFileDiscovery,
     RTPlanPhase,
     RTStructData,
     StructureGoal,
@@ -1484,8 +1488,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         cache_load_duration: Optional[float] = None
         used_preloaded_review_cache = False
         if cache_info.dvh_can_start:
+            cache_label = "saved review bundle" if preloaded_review_cache_data is not None and preloaded_review_cache_data.trusted_source else "saved JSON cache"
             if preloaded_review_cache_data is not None:
-                self.show_progress_status("Using preloaded saved JSON cache", pump_events=True)
+                self.show_progress_status(f"Using preloaded {cache_label}", pump_events=True)
             elif cache_info.cache_found:
                 self.show_progress_status("Found saved JSON cache", pump_events=True)
             elif cache_info.derived_sidecar_only:
@@ -1560,7 +1565,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         if cache_loaded:
             if used_preloaded_review_cache:
-                self.show_progress_status("Loaded preloaded saved JSON cache")
+                self.show_progress_status("Loaded preloaded saved review cache")
             else:
                 self.show_progress_status("Loaded saved JSON cache")
             self.restore_saved_results_without_calculation = False
@@ -1772,10 +1777,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         geometry = self.build_patient_transition_overlay_geometry()
         cache_path = compute_dvh_cache_path(folder)
+        bundle_path = compute_review_bundle_path(folder)
         screenshot_path = self.get_review_screenshot_path(cache_path)
+        has_bundle = bundle_path is not None and bundle_path.exists()
         has_screenshot = screenshot_path is not None and screenshot_path.exists()
 
-        if geometry is None or not has_screenshot:
+        if geometry is None or not (has_bundle or has_screenshot):
             return False
 
         overlay_rect, _axial_rect = geometry
@@ -1794,7 +1801,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "--parent-pid",
             str(os.getpid()),
         ]
-        if has_screenshot and screenshot_path is not None:
+        if has_bundle and bundle_path is not None:
+            command.extend(["--bundle", str(bundle_path)])
+        elif has_screenshot and screenshot_path is not None:
             command.extend(["--screenshot", str(screenshot_path)])
         try:
             self.patient_transition_overlay_process = subprocess.Popen(
@@ -2883,6 +2892,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def get_dvh_cache_path(self) -> Optional[Path]:
         return compute_dvh_cache_path(self.current_patient_folder)
 
+    def get_review_bundle_path(self, folder: Optional[str] = None) -> Optional[Path]:
+        return compute_review_bundle_path(folder if folder is not None else self.current_patient_folder)
+
     def get_derived_array_cache_path(self, base_path: Optional[Path] = None) -> Optional[Path]:
         return compute_derived_array_cache_path(base_path if base_path is not None else self.get_dvh_cache_path())
 
@@ -2994,6 +3006,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.update_patient_plan_label(pump_events=pump_events)
 
     def try_stage_patient_plan_lines_from_cache(self, folder: str, *, pump_events: bool = False) -> bool:
+        bundle_path = compute_review_bundle_path(folder)
+        if bundle_path is not None and bundle_path.exists():
+            loaded_bundle_cache = load_review_bundle_review_cache_file(bundle_path)
+            if loaded_bundle_cache is not None:
+                patient_plan_lines_payload = loaded_bundle_cache.payload.get("patient_plan_lines")
+                if isinstance(patient_plan_lines_payload, list):
+                    patient_plan_lines = [str(line).strip() for line in patient_plan_lines_payload if str(line).strip()]
+                    if patient_plan_lines:
+                        self.set_patient_plan_lines(patient_plan_lines, pump_events=pump_events)
+                        return True
+
         cache_path = compute_dvh_cache_path(folder)
         if cache_path is None or not cache_path.exists():
             return False
@@ -3378,6 +3401,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         derived_array_cache_path = self.get_derived_array_cache_path(path)
+        review_bundle_path = self.get_review_bundle_path()
         screenshot_path = self.get_review_screenshot_path(path)
         payload = build_review_cache_payload(
             patient_plan_lines=list(self.patient_plan_lines or []),
@@ -3412,18 +3436,39 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         write_json_atomic(path, payload)
 
         warnings: List[str] = []
+        screenshot_png_bytes, screenshot_capture_warning = self.capture_review_screenshot_png_bytes()
+        if screenshot_capture_warning:
+            warnings.append(screenshot_capture_warning)
+        derived_save_inputs: Optional[Dict[str, object]] = None
+        if derived_array_cache_path is not None or review_bundle_path is not None:
+            derived_save_inputs = self.build_derived_array_cache_save_inputs()
 
-        if screenshot_path is not None:
-            screenshot_warning = self.save_review_screenshot(screenshot_path)
+        if screenshot_path is not None and screenshot_png_bytes is not None:
+            screenshot_warning = self.save_review_screenshot(
+                screenshot_path,
+                screenshot_png_bytes=screenshot_png_bytes,
+            )
             if screenshot_warning:
                 warnings.append(screenshot_warning)
 
         if derived_array_cache_path is not None:
             try:
-                self.save_derived_array_cache(derived_array_cache_path)
+                self.save_derived_array_cache(derived_array_cache_path, save_inputs=derived_save_inputs)
             except Exception as exc:
                 logger.warning("Saved JSON review cache but failed to save derived array cache: %s", exc)
                 warnings.append(f"Failed to save the derived array cache: {exc}")
+
+        if review_bundle_path is not None:
+            try:
+                self.save_review_bundle(
+                    review_bundle_path,
+                    review_payload=payload,
+                    screenshot_png_bytes=screenshot_png_bytes,
+                    save_inputs=derived_save_inputs,
+                )
+            except Exception as exc:
+                logger.warning("Saved JSON review cache but failed to save the review bundle: %s", exc)
+                warnings.append(f"Failed to save the review bundle: {exc}")
 
         if warnings:
             return "Saved review data, but " + " ".join(warnings)
@@ -3435,11 +3480,29 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return None
         return cache_path.with_name(f"{cache_path.stem}_screenshot.png")
 
-    def save_review_screenshot(self, path: Path) -> Optional[str]:
+    def capture_review_screenshot_png_bytes(self) -> Tuple[Optional[bytes], Optional[str]]:
         self.pump_viewer_ui()
         source_widget = getattr(self, "axial_tab_widget", getattr(self, "viewer_widget", self))
         pixmap = source_widget.grab()
         if pixmap.isNull():
+            return None, "failed to save the review screenshot."
+        png_buffer = QtCore.QBuffer()
+        png_buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+        try:
+            if not pixmap.save(png_buffer, "PNG"):
+                return None, "failed to save the review screenshot."
+            png_bytes = bytes(png_buffer.data())
+        finally:
+            png_buffer.close()
+        return png_bytes, None
+
+    def save_review_screenshot(self, path: Path, *, screenshot_png_bytes: Optional[bytes] = None) -> Optional[str]:
+        png_bytes = screenshot_png_bytes
+        if png_bytes is None:
+            png_bytes, capture_warning = self.capture_review_screenshot_png_bytes()
+            if capture_warning is not None:
+                return capture_warning
+        if not png_bytes:
             return "failed to save the review screenshot."
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
@@ -3449,9 +3512,21 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 Path(temp_path).unlink()
             except OSError:
                 pass
-            if not pixmap.save(str(temp_path), "PNG"):
-                return "failed to save the review screenshot."
-            temp_path.replace(path)
+            temp_path.write_bytes(png_bytes)
+            replace_error: Optional[Exception] = None
+            for _attempt in range(6):
+                try:
+                    temp_path.replace(path)
+                    replace_error = None
+                    break
+                except PermissionError as exc:
+                    replace_error = exc
+                    if os.name != "nt":
+                        break
+                    self.pump_viewer_ui()
+                    QtCore.QThread.msleep(100)
+            if replace_error is not None:
+                raise replace_error
         except Exception as exc:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -3460,6 +3535,42 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             logger.warning("Saved JSON review cache but failed to save screenshot: %s", exc)
             return f"failed to save the review screenshot: {exc}"
         return None
+
+    def build_derived_array_cache_save_inputs(self) -> Dict[str, object]:
+        if self.ct is None or self.rtstruct is None:
+            raise ValueError("No CT/RTSTRUCT data is loaded.")
+        derived_structures = self.get_derived_cache_structures()
+        structure_order = [normalize_structure_name(structure.name) for structure in derived_structures]
+        structure_volume_masks = {
+            normalize_structure_name(structure.name): self.get_structure_volume_mask(structure)
+            for structure in derived_structures
+        }
+        structure_geometry_volumes_cc = {
+            normalize_structure_name(structure.name): float(self.get_structure_geometry_volume_cc(structure))
+            for structure in derived_structures
+        }
+        return {
+            "ct": self.ct,
+            "ct_paths": self.current_ct_paths,
+            "patient_discovery": PatientFileDiscovery(
+                ct_paths=list(self.current_ct_paths),
+                rtstruct_path=self.rtstruct_path,
+                rtdose_paths=list(self.latest_timing_rtdose_paths),
+                rtplan_paths=list(self.current_rtplan_paths),
+                plan_phases=list(self.plan_phases),
+                patient_plan_lines=self.patient_plan_lines,
+            ),
+            "dose": self.dose,
+            "rtstruct": self.rtstruct,
+            "rtstruct_path": self.rtstruct_path,
+            "rtdose_paths": self.latest_timing_rtdose_paths,
+            "array_cache_signature": self.get_derived_array_cache_signature(),
+            "sampled_dose_volume_ct": self.sampled_dose_volume_ct,
+            "ptv_union_volume_mask": self.get_ptv_union_volume_mask(),
+            "structure_order": structure_order,
+            "structure_volume_masks": structure_volume_masks,
+            "structure_geometry_volumes_cc": structure_geometry_volumes_cc,
+        }
 
     def build_max_tissue_payload(self) -> Optional[Dict[str, object]]:
         if self.ct is None or self.rtstruct is None or self.sampled_dose_volume_ct is None:
@@ -3483,33 +3594,25 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             payload["index_zyx"] = [int(value) for value in self.max_tissue_index_zyx]
         return payload
 
-    def save_derived_array_cache(self, path: Path) -> None:
-        if self.ct is None or self.rtstruct is None:
-            raise ValueError("No CT/RTSTRUCT data is loaded.")
-        derived_structures = self.get_derived_cache_structures()
-        structure_order = [normalize_structure_name(structure.name) for structure in derived_structures]
-        structure_volume_masks = {
-            normalize_structure_name(structure.name): self.get_structure_volume_mask(structure)
-            for structure in derived_structures
-        }
-        structure_geometry_volumes_cc = {
-            normalize_structure_name(structure.name): float(self.get_structure_geometry_volume_cc(structure))
-            for structure in derived_structures
-        }
+    def save_derived_array_cache(self, path: Path, *, save_inputs: Optional[Dict[str, object]] = None) -> None:
         save_derived_array_cache_file(
             path,
-            ct=self.ct,
-            ct_paths=self.current_ct_paths,
-            dose=self.dose,
-            rtstruct=self.rtstruct,
-            rtstruct_path=self.rtstruct_path,
-            rtdose_paths=self.latest_timing_rtdose_paths,
-            array_cache_signature=self.get_derived_array_cache_signature(),
-            sampled_dose_volume_ct=self.sampled_dose_volume_ct,
-            ptv_union_volume_mask=self.get_ptv_union_volume_mask(),
-            structure_order=structure_order,
-            structure_volume_masks=structure_volume_masks,
-            structure_geometry_volumes_cc=structure_geometry_volumes_cc,
+            **(save_inputs or self.build_derived_array_cache_save_inputs()),
+        )
+
+    def save_review_bundle(
+        self,
+        path: Path,
+        *,
+        review_payload: Mapping[str, object],
+        screenshot_png_bytes: Optional[bytes],
+        save_inputs: Optional[Dict[str, object]] = None,
+    ) -> None:
+        save_review_bundle_file(
+            path,
+            review_payload=review_payload,
+            screenshot_png_bytes=screenshot_png_bytes,
+            **(save_inputs or self.build_derived_array_cache_save_inputs()),
         )
 
     def load_derived_array_cache(self, path: Path) -> bool:

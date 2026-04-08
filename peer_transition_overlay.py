@@ -8,6 +8,8 @@ from typing import List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from peer_cache import load_review_bundle_screenshot_bytes
+
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Peer review transition overlay")
@@ -15,6 +17,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--window-y", type=int, required=True)
     parser.add_argument("--window-width", type=int, required=True)
     parser.add_argument("--window-height", type=int, required=True)
+    parser.add_argument("--bundle", type=str, default=None)
     parser.add_argument("--screenshot", type=str, default=None)
     parser.add_argument("--parent-pid", type=int, default=0)
     return parser.parse_args(argv)
@@ -25,6 +28,7 @@ class TransitionOverlayWindow(QtWidgets.QWidget):
         self,
         *,
         window_rect: QtCore.QRect,
+        bundle_path: Optional[Path],
         screenshot_path: Optional[Path],
         parent_pid: int,
     ) -> None:
@@ -48,10 +52,17 @@ class TransitionOverlayWindow(QtWidgets.QWidget):
         self.screenshot_label.setStyleSheet("QLabel { background-color: black; }")
         self.screenshot_label.setGeometry(self.rect())
 
-        if screenshot_path is not None and screenshot_path.exists():
-            pixmap = QtGui.QPixmap(str(screenshot_path))
-            if not pixmap.isNull():
-                self.screenshot_source_pixmap = pixmap
+        screenshot_bytes = b""
+        if bundle_path is not None and bundle_path.exists():
+            screenshot_bytes = load_review_bundle_screenshot_bytes(bundle_path) or b""
+        if not screenshot_bytes and screenshot_path is not None and screenshot_path.exists():
+            try:
+                screenshot_bytes = screenshot_path.read_bytes()
+            except OSError:
+                screenshot_bytes = b""
+        pixmap = QtGui.QPixmap()
+        if screenshot_bytes and pixmap.loadFromData(screenshot_bytes):
+            self.screenshot_source_pixmap = pixmap
 
         self.parent_watch_timer = QtCore.QTimer(self)
         self.parent_watch_timer.setInterval(1000)
@@ -100,6 +111,7 @@ def main(argv: List[str]) -> int:
             args.window_width,
             args.window_height,
         ),
+        bundle_path=Path(args.bundle) if args.bundle else None,
         screenshot_path=Path(args.screenshot) if args.screenshot else None,
         parent_pid=args.parent_pid,
     )
