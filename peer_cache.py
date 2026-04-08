@@ -21,6 +21,7 @@ from peer_models import (
     StructureGoalEvaluation,
     StructureSliceContours,
 )
+from peer_targets import target_table_rows_require_recompute
 from peer_viewer_support import (
     build_file_fingerprint,
     build_file_fingerprints,
@@ -114,6 +115,13 @@ def get_derived_cache_structures(
     return structures
 
 
+def default_is_base_listable_structure_name(normalized_name: str) -> bool:
+    excluded_fragments = ("COUCH", "RAIL", "BB")
+    return not normalized_name.startswith("Z") and not any(
+        fragment in normalized_name for fragment in excluded_fragments
+    )
+
+
 @dataclass(slots=True)
 class DerivedArrayCacheData:
     sampled_dose_volume_ct: Optional[np.ndarray]
@@ -126,6 +134,24 @@ class DerivedArrayCacheData:
 class ReviewCacheFileData:
     payload: Dict[str, object]
     cache_version: int
+
+
+@dataclass(slots=True)
+class PreparedReviewCacheState:
+    selected_constraint_sheet: Optional[str]
+    custom_constraints: Dict[str, List[StructureGoal]]
+    stereotactic_target_doses: Dict[str, str]
+    hidden_structure_names: set[str]
+    additional_target_subvolume_names: set[str]
+    constraint_notes: Dict[str, str]
+    target_notes_payload: Dict[str, str]
+    target_table_rows: List[Dict[str, object]]
+    cached_target_table_rows: Optional[List[Dict[str, object]]]
+    goal_evaluations: Dict[str, List[StructureGoalEvaluation]]
+    curves: List[DVHCurve]
+    max_tissue_dose_gy: Optional[float]
+    max_tissue_index_zyx: Optional[Tuple[int, int, int]]
+    saved_selected_names: Optional[List[str]]
 
 
 def json_safe_metadata_value(value: object) -> object:
@@ -404,6 +430,206 @@ def load_review_cache_file(path: Path) -> Optional[ReviewCacheFileData]:
     except (TypeError, ValueError):
         cache_version = 0
     return ReviewCacheFileData(payload=payload, cache_version=cache_version)
+
+
+def prepare_review_cache_state(
+    loaded_cache: ReviewCacheFileData,
+    *,
+    expected_structure_names: Sequence[str],
+    available_constraint_sheet_names: Sequence[str],
+    no_constraints_sheet_label: str,
+    constraints_sheet_name: Optional[str],
+    structure_filter_csv_path: Optional[str],
+    rtstruct_path: Optional[str],
+    rtdose_paths: Sequence[str],
+    rtplan_paths: Sequence[str],
+    dvh_mode: str,
+    dvh_method_signature: str,
+    target_method_signature: Dict[str, object],
+    has_ct: bool,
+    has_dose: bool,
+    is_base_listable_structure_name: Callable[[str], bool],
+) -> Optional[PreparedReviewCacheState]:
+    payload = loaded_cache.payload
+    cache_version = loaded_cache.cache_version
+
+    expected_names = [normalize_structure_name(name) for name in expected_structure_names]
+    expected_name_set = set(expected_names)
+    saved_names = [normalize_structure_name(str(name)) for name in payload.get("structure_names", [])]
+    saved_name_set = set(saved_names)
+    saved_selected_names = [
+        normalize_structure_name(str(name))
+        for name in payload.get("dvh_structure_names", [])
+    ]
+    saved_selected_name_set = set(saved_selected_names)
+    if not saved_selected_names:
+        saved_selected_names = [
+            normalize_structure_name(str(curve_payload.get("name", "")))
+            for curve_payload in payload.get("curves", [])
+            if isinstance(curve_payload, dict)
+        ]
+        saved_selected_name_set = set(saved_selected_names)
+
+    if saved_names:
+        if saved_name_set == expected_name_set:
+            pass
+        elif saved_name_set == saved_selected_name_set and saved_name_set.issubset(expected_name_set):
+            pass
+        else:
+            return None
+
+    if not saved_selected_name_set.issubset(expected_name_set):
+        return None
+
+    saved_constraint_set = payload.get("selected_constraint_set", payload.get("constraints_sheet"))
+    if saved_constraint_set == no_constraints_sheet_label:
+        saved_constraints_sheet = None
+    elif saved_constraint_set in {None, ""}:
+        saved_constraints_sheet = payload.get("constraints_sheet")
+    else:
+        saved_constraints_sheet = str(saved_constraint_set)
+
+    if saved_constraints_sheet is not None and saved_constraints_sheet not in available_constraint_sheet_names:
+        return None
+
+    saved_csv_fingerprint = payload.get("constraints_fingerprint", payload.get("csv_fingerprint"))
+    if saved_csv_fingerprint is not None and not file_fingerprint_matches(saved_csv_fingerprint, structure_filter_csv_path):
+        return None
+
+    saved_csv_name = payload.get("constraints_file", payload.get("csv_file"))
+    current_csv_name = Path(structure_filter_csv_path).name if structure_filter_csv_path else None
+    if saved_csv_fingerprint is None and saved_csv_name not in {None, current_csv_name}:
+        return None
+
+    saved_rtstruct_fingerprint = payload.get("rtstruct_fingerprint")
+    if saved_rtstruct_fingerprint is not None and not file_fingerprint_matches(saved_rtstruct_fingerprint, rtstruct_path):
+        return None
+
+    saved_rtstruct_name = payload.get("rtstruct_file")
+    current_rtstruct_name = Path(rtstruct_path).name if rtstruct_path else None
+    if saved_rtstruct_fingerprint is None and saved_rtstruct_name not in {None, current_rtstruct_name}:
+        return None
+
+    saved_rtdose_fingerprints = payload.get("rtdose_fingerprints")
+    if saved_rtdose_fingerprints is not None and not file_fingerprint_list_matches(saved_rtdose_fingerprints, list(rtdose_paths)):
+        return None
+
+    saved_rtplan_fingerprints = payload.get("rtplan_fingerprints")
+    if saved_rtplan_fingerprints is not None and not file_fingerprint_list_matches(saved_rtplan_fingerprints, list(rtplan_paths)):
+        return None
+
+    saved_dvh_mode = payload.get("dvh_mode")
+    if saved_dvh_mode not in {None, dvh_mode}:
+        return None
+
+    notes_payload = payload.get("constraint_notes", {})
+    if not isinstance(notes_payload, dict):
+        return None
+    target_notes_payload = payload.get("target_notes", {})
+    if target_notes_payload is None:
+        target_notes_payload = {}
+    if not isinstance(target_notes_payload, dict):
+        return None
+
+    custom_constraints = deserialize_structure_goals(payload.get("custom_constraints"))
+    if custom_constraints is None:
+        return None
+
+    stereotactic_dose_payload = payload.get("stereotactic_target_doses", {})
+    if stereotactic_dose_payload is None:
+        stereotactic_dose_payload = {}
+    if not isinstance(stereotactic_dose_payload, dict):
+        return None
+
+    hidden_structure_payload = payload.get("hidden_structure_names", [])
+    if hidden_structure_payload is None:
+        hidden_structure_payload = []
+    if not isinstance(hidden_structure_payload, list):
+        return None
+
+    additional_target_subvolume_payload = payload.get("additional_target_subvolume_names", [])
+    if additional_target_subvolume_payload is None:
+        additional_target_subvolume_payload = []
+    if not isinstance(additional_target_subvolume_payload, list):
+        return None
+
+    target_table_rows = deserialize_target_table_rows(payload.get("target_table_rows"))
+    if target_table_rows is None:
+        return None
+
+    max_tissue_payload = payload.get("max_tissue")
+    if max_tissue_payload is not None and not isinstance(max_tissue_payload, dict):
+        return None
+
+    saved_dvh_signature = payload.get("dvh_method_signature")
+    if saved_dvh_signature is not None and saved_dvh_signature != dvh_method_signature:
+        return None
+
+    saved_target_signature = payload.get("target_method_signature")
+    if saved_target_signature is not None and saved_target_signature != target_method_signature:
+        return None
+
+    goal_evaluations = deserialize_goal_evaluations(payload.get("goal_evaluations"))
+    if goal_evaluations is None:
+        return None
+
+    try:
+        curves = [deserialize_dvh_curve(curve_payload) for curve_payload in payload.get("curves", [])]
+    except (TypeError, ValueError):
+        return None
+
+    max_tissue_dose_gy: Optional[float] = None
+    max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
+    if isinstance(max_tissue_payload, dict):
+        dose_value = max_tissue_payload.get("dose_gy")
+        try:
+            max_tissue_dose_gy = float(dose_value) if dose_value is not None else None
+        except (TypeError, ValueError):
+            max_tissue_dose_gy = None
+        index_payload = max_tissue_payload.get("index_zyx")
+        if isinstance(index_payload, list) and len(index_payload) == 3:
+            try:
+                max_tissue_index_zyx = tuple(int(value) for value in index_payload)
+            except (TypeError, ValueError):
+                max_tissue_index_zyx = None
+
+    target_signature_matches = saved_target_signature is not None or cache_version >= 11
+    use_cached_target_rows = target_signature_matches and not target_table_rows_require_recompute(
+        target_table_rows,
+        has_ct=has_ct,
+        has_dose=has_dose,
+        stereotactic_summary_enabled=normalize_structure_name(constraints_sheet_name or "") == "SRS FSRT",
+    )
+
+    return PreparedReviewCacheState(
+        selected_constraint_sheet=saved_constraints_sheet,
+        custom_constraints=custom_constraints,
+        stereotactic_target_doses={
+            normalize_structure_name(str(name)): str(value).strip()
+            for name, value in stereotactic_dose_payload.items()
+            if normalize_structure_name(str(name))
+        },
+        hidden_structure_names={
+            normalize_structure_name(str(name))
+            for name in hidden_structure_payload
+            if is_base_listable_structure_name(normalize_structure_name(str(name)))
+        },
+        additional_target_subvolume_names={
+            normalize_structure_name(str(name))
+            for name in additional_target_subvolume_payload
+            if is_base_listable_structure_name(normalize_structure_name(str(name)))
+            and not normalize_structure_name(str(name)).startswith("PTV")
+        },
+        constraint_notes={str(key): str(value) for key, value in notes_payload.items() if str(value).strip()},
+        target_notes_payload={str(key): str(value) for key, value in target_notes_payload.items() if str(value).strip()},
+        target_table_rows=target_table_rows,
+        cached_target_table_rows=target_table_rows if use_cached_target_rows else None,
+        goal_evaluations=goal_evaluations or {},
+        curves=curves,
+        max_tissue_dose_gy=max_tissue_dose_gy,
+        max_tissue_index_zyx=max_tissue_index_zyx,
+        saved_selected_names=list(saved_selected_names) if saved_selected_names else None,
+    )
 
 
 def save_derived_array_cache(

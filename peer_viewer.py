@@ -4,16 +4,20 @@ import gc
 import html
 import logging
 import math
+import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
+import pyqtgraph.functions as pgfn
 from pyqtgraph.exporters import ImageExporter
 from PySide6 import QtCore, QtGui, QtPrintSupport, QtWidgets
 try:
@@ -46,8 +50,11 @@ from peer_cache import (
     get_derived_array_cache_signature as compute_derived_array_cache_signature,
     get_derived_cache_structures as select_derived_cache_structures,
     get_dvh_cache_path as compute_dvh_cache_path,
-    load_review_cache_file,
     load_derived_array_cache as load_derived_array_cache_file,
+    load_review_cache_file,
+    prepare_review_cache_state,
+    PreparedReviewCacheState,
+    ReviewCacheFileData,
     save_derived_array_cache as save_derived_array_cache_file,
     serialize_dvh_curve as serialize_dvh_curve_payload,
     serialize_goal_evaluations as serialize_goal_evaluations_payload,
@@ -102,10 +109,15 @@ from peer_io import (
     load_structure_constraints_sheet,
 )
 from peer_loader import (
+    build_axial_cine_plan,
     build_load_timing_report_text,
     get_review_cache_availability,
-    load_patient_scan_and_discovery,
-    resample_dose_to_ct_volume,
+    PatientActivationPreparationManager,
+    PatientActivationPreparationPayload,
+    PatientPreloadManager,
+    PatientPreloadPayload,
+    PrecomputedPatientViewState,
+    prepare_patient_preload_payload,
     ReviewCacheAvailability,
 )
 from peer_rendering import (
@@ -371,6 +383,21 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.rtstruct: Optional[RTStructData] = None
         self.rtstruct_path: Optional[str] = None
         self.current_patient_folder: Optional[str] = None
+        self.patient_list_root_folder: Optional[str] = None
+        self.patient_list_folders: List[str] = []
+        self.current_patient_list_index: Optional[int] = None
+        self.pending_patient_preload_index: Optional[int] = None
+        self.pending_patient_preload_request_id: Optional[int] = None
+        self.preloaded_patient_index: Optional[int] = None
+        self.preloaded_patient_payload: Optional[PatientPreloadPayload] = None
+        self.preloaded_patient_error: Optional[str] = None
+        self.deferred_patient_view_refresh_token = 0
+        self.patient_activation_ui_locked = False
+        self.patient_activation_token = 0
+        self.pending_patient_activation_prepare_request_id: Optional[int] = None
+        self.pending_patient_activation_prepare_token: Optional[int] = None
+        self.pending_patient_activation_prepare_result: Optional[PatientActivationPreparationPayload] = None
+        self.pending_patient_activation_prepare_error: Optional[str] = None
         self.structure_filter_csv_path: Optional[str] = None
         self.constraints_sheet_name: Optional[str] = None
         self.available_constraint_sheet_names: List[str] = []
@@ -452,6 +479,18 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_timer.setInterval(120)
         self.autoscroll_timer.setSingleShot(True)
         self.autoscroll_direction = 1
+        self.patient_activation_movie_timer = QtCore.QTimer(self)
+        self.patient_activation_movie_timer.setSingleShot(False)
+        self.patient_activation_movie_timer.timeout.connect(self.advance_patient_activation_movie)
+        self.patient_activation_movie_source_pixmaps: List[QtGui.QPixmap] = []
+        self.patient_activation_movie_display_pixmaps: List[QtGui.QPixmap] = []
+        self.patient_activation_movie_display_size = QtCore.QSize()
+        self.patient_activation_movie_frame_index = 0
+        self.viewer_screenshot_source_pixmap: Optional[QtGui.QPixmap] = None
+        self.viewer_screenshot_display_pixmap: Optional[QtGui.QPixmap] = None
+        self.viewer_screenshot_display_size = QtCore.QSize()
+        self.patient_transition_overlay_process: Optional[subprocess.Popen] = None
+        self.patient_transition_overlay_temp_dir: Optional[str] = None
         self.isodose_refresh_timer = QtCore.QTimer(self)
         self.isodose_refresh_timer.setSingleShot(True)
         self.isodose_refresh_timer.timeout.connect(self.refresh_all_views)
@@ -460,6 +499,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.axial_structure_list = StructureListManager([("axial", self.structures_list)])
         self.dvh_structure_list = StructureListManager([("dvh", self.dvh_structures_list)])
         self.dvh_job_manager = DVHComputationManager()
+        self.patient_preload_manager = PatientPreloadManager()
+        self.patient_activation_prepare_manager = PatientActivationPreparationManager()
         self._connect_signals()
         self.refresh_constraint_sheet_combo()
         self.update_dose_range_controls()
@@ -552,6 +593,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         targets_layout.addWidget(self.targets_table, 1)
 
         axial_tab = QtWidgets.QWidget()
+        self.axial_tab_widget = axial_tab
         axial_layout = QtWidgets.QHBoxLayout(axial_tab)
 
         sidebar_widget = QtWidgets.QWidget()
@@ -675,6 +717,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         axial_layout.addWidget(sidebar_widget, 0)
 
         viewer_widget = QtWidgets.QWidget()
+        self.viewer_widget = viewer_widget
         viewer_layout = QtWidgets.QVBoxLayout(viewer_widget)
         viewer_layout.setContentsMargins(0, 0, 0, 0)
         viewer_layout.setSpacing(12)
@@ -758,6 +801,18 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
         autoscroll_overlay_layout.addWidget(self.autoscroll_speed_label)
+
+        self.viewer_screenshot_overlay = QtWidgets.QLabel(axial_tab)
+        self.viewer_screenshot_overlay.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.viewer_screenshot_overlay.setStyleSheet("QLabel { background-color: black; }")
+        self.viewer_screenshot_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.viewer_screenshot_overlay.hide()
+
+        self.axial_movie_overlay = QtWidgets.QLabel(axial_tab)
+        self.axial_movie_overlay.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.axial_movie_overlay.setStyleSheet("QLabel { background-color: black; }")
+        self.axial_movie_overlay.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.axial_movie_overlay.hide()
 
         right_splitter.addWidget(sagittal_widget)
         right_splitter.addWidget(coronal_widget)
@@ -899,6 +954,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def _create_actions(self):
         self.load_patient_action = QtGui.QAction("Load Patient Folder", self)
+        self.load_patient_list_action = QtGui.QAction("Load Patient List Folder", self)
         self.reset_view_action = QtGui.QAction("Reset View", self)
         self.clear_patient_action = QtGui.QAction("Clear", self)
         self.save_cache_action = QtGui.QAction("Save", self)
@@ -912,6 +968,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         tb = self.addToolBar("Main")
         self.main_toolbar = tb
         tb.addAction(self.load_patient_action)
+        tb.addAction(self.load_patient_list_action)
+        self.patient_list_combo = QtWidgets.QComboBox(tb)
+        self.patient_list_combo.setMinimumWidth(240)
+        self.patient_list_combo.setEnabled(False)
+        self.patient_list_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        tb.addWidget(self.patient_list_combo)
+        self.next_patient_button = QtWidgets.QPushButton("Next", tb)
+        self.next_patient_button.setEnabled(False)
+        tb.addWidget(self.next_patient_button)
         tb.addSeparator()
         tb.addAction(self.reset_view_action)
         tb.addAction(self.clear_patient_action)
@@ -927,11 +992,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         self.load_patient_action.triggered.connect(self.on_load_patient_folder)
+        self.load_patient_list_action.triggered.connect(self.on_load_patient_list_folder)
         self.reset_view_action.triggered.connect(self.on_reset_view)
         self.clear_patient_action.triggered.connect(self.on_clear_patient_session)
         self.save_cache_action.triggered.connect(self.on_save_dvh_cache)
         self.print_report_action.triggered.connect(self.on_print_report)
         self.structure_filter_action.triggered.connect(self.on_show_structure_filter_popup)
+        self.patient_list_combo.activated.connect(self.on_patient_list_combo_activated)
+        self.next_patient_button.clicked.connect(self.on_next_patient_clicked)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
         self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
         self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
@@ -966,6 +1034,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_structure_list.visibilityChanged.connect(self.on_dvh_structure_visibility_changed)
         self.dvh_job_manager.finished.connect(self.on_dvh_task_finished)
         self.dvh_job_manager.failed.connect(self.on_dvh_task_failed)
+        self.patient_preload_manager.finished.connect(self.on_patient_preload_finished)
+        self.patient_preload_manager.failed.connect(self.on_patient_preload_failed)
+        self.patient_activation_prepare_manager.finished.connect(self.on_patient_activation_prepare_finished)
+        self.patient_activation_prepare_manager.failed.connect(self.on_patient_activation_prepare_failed)
         self.tabs.currentChanged.connect(self.axial_structure_list.refresh_layout)
         self.tabs.currentChanged.connect(self.dvh_structure_list.refresh_layout)
         self.tabs.currentChanged.connect(self.on_tab_changed)
@@ -1003,10 +1075,18 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.axial_readout_label.hide()
         self.update_axial_overlay_positions()
 
-    def clear_patient_session_state(self):
+    def clear_patient_session_state(self, *, quick_swap: bool = False):
         self.cancel_autoscroll()
+        self.stop_patient_activation_movie()
         self.dvh_job_manager.cancel_all()
+        self.patient_activation_prepare_manager.cancel_all()
         self.clear_progress_status()
+        self.deferred_patient_view_refresh_token += 1
+        self.patient_activation_token += 1
+        self.pending_patient_activation_prepare_request_id = None
+        self.pending_patient_activation_prepare_token = None
+        self.pending_patient_activation_prepare_result = None
+        self.pending_patient_activation_prepare_error = None
 
         self.current_patient_folder = None
         self.latest_timing_entries = []
@@ -1077,6 +1157,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.current_row = 0
         self.current_col = 0
 
+        if quick_swap:
+            return
+
         self.slice_slider.setRange(0, 0)
         self.slice_slider.setValue(0)
         self.slice_label.setText("Slice: -/-")
@@ -1098,11 +1181,301 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.clear_viewer_image_items()
         gc.collect()
 
+    def clear_patient_queue_state(self) -> None:
+        self.patient_preload_manager.cancel_all()
+        self.patient_activation_prepare_manager.cancel_all()
+        self.deferred_patient_view_refresh_token += 1
+        self.patient_activation_token += 1
+        self.patient_list_root_folder = None
+        self.patient_list_folders = []
+        self.current_patient_list_index = None
+        self.pending_patient_preload_index = None
+        self.pending_patient_preload_request_id = None
+        self.pending_patient_activation_prepare_request_id = None
+        self.pending_patient_activation_prepare_token = None
+        self.pending_patient_activation_prepare_result = None
+        self.pending_patient_activation_prepare_error = None
+        self.preloaded_patient_index = None
+        self.preloaded_patient_payload = None
+        self.preloaded_patient_error = None
+        blocker = QtCore.QSignalBlocker(self.patient_list_combo)
+        self.patient_list_combo.clear()
+        self.patient_list_combo.setEnabled(False)
+        del blocker
+        self.next_patient_button.setEnabled(False)
+
+    def schedule_deferred_patient_view_refresh(
+        self,
+        *,
+        timing_entries: Optional[List[Tuple[str, Optional[float]]]] = None,
+        folder: Optional[str] = None,
+    ) -> None:
+        self.deferred_patient_view_refresh_token += 1
+        refresh_token = self.deferred_patient_view_refresh_token
+
+        def _run() -> None:
+            if refresh_token != self.deferred_patient_view_refresh_token:
+                return
+            if folder is not None and self.current_patient_folder != folder:
+                return
+            if self.ct is None:
+                return
+            stage_start = perf_counter()
+            self.refresh_orthogonal_views_from_controls()
+            duration_s = perf_counter() - stage_start
+            if timing_entries is not None:
+                timing_entries.append(("Refresh orthogonal views (deferred)", duration_s))
+                if self.latest_timing_folder == folder:
+                    self.latest_timing_entries = list(timing_entries)
+                    self.write_latest_timing_report()
+
+        QtCore.QTimer.singleShot(0, _run)
+
+    def get_patient_list_folder_entries(self, root_folder: str) -> List[str]:
+        root_path = Path(root_folder)
+        folders = [
+            str(path)
+            for path in sorted(root_path.iterdir(), key=lambda entry: entry.name.lower())
+            if path.is_dir() and not path.name.startswith(".")
+        ]
+        return folders
+
+    def populate_patient_list_combo(self) -> None:
+        blocker = QtCore.QSignalBlocker(self.patient_list_combo)
+        self.patient_list_combo.clear()
+        for folder in self.patient_list_folders:
+            folder_path = Path(folder)
+            self.patient_list_combo.addItem(folder_path.name, folder)
+        if self.current_patient_list_index is not None and 0 <= self.current_patient_list_index < self.patient_list_combo.count():
+            self.patient_list_combo.setCurrentIndex(self.current_patient_list_index)
+        self.patient_list_combo.setEnabled(bool(self.patient_list_folders))
+        del blocker
+        self.next_patient_button.setEnabled(self.preload_matches_next_patient())
+
+    def can_advance_patient_queue(self) -> bool:
+        return (
+            self.current_patient_list_index is not None
+            and (self.current_patient_list_index + 1) < len(self.patient_list_folders)
+        )
+
+    def get_next_patient_queue_index(self) -> Optional[int]:
+        if not self.can_advance_patient_queue():
+            return None
+        assert self.current_patient_list_index is not None
+        return self.current_patient_list_index + 1
+
+    def preload_matches_next_patient(self) -> bool:
+        next_index = self.get_next_patient_queue_index()
+        return (
+            next_index is not None
+            and self.preloaded_patient_index == next_index
+            and self.preloaded_patient_payload is not None
+        )
+
+    def update_patient_list_controls(self) -> None:
+        self.patient_list_combo.setEnabled(bool(self.patient_list_folders))
+        self.next_patient_button.setEnabled(self.preload_matches_next_patient())
+
+    def start_background_preload_for_index(self, index: Optional[int]) -> None:
+        self.patient_preload_manager.invalidate()
+        self.pending_patient_preload_request_id = None
+        self.pending_patient_preload_index = None
+        self.preloaded_patient_index = None
+        self.preloaded_patient_payload = None
+        self.preloaded_patient_error = None
+        if index is None or not (0 <= index < len(self.patient_list_folders)):
+            self.update_patient_list_controls()
+            return
+
+        folder = self.patient_list_folders[index]
+        self.pending_patient_preload_index = index
+        self.pending_patient_preload_request_id = self.patient_preload_manager.start(
+            folder,
+            array_cache_signature=self.get_derived_array_cache_signature(),
+        )
+        self.statusBar().showMessage(f"Preloading next patient: {Path(folder).name}", 4000)
+        self.update_patient_list_controls()
+
+    def on_patient_preload_finished(
+        self,
+        request_id: int,
+        folder: str,
+        payload: object,
+        duration_s: float,
+    ) -> None:
+        if not self.patient_preload_manager.is_current(request_id):
+            return
+        if not isinstance(payload, PatientPreloadPayload):
+            return
+        self.pending_patient_preload_request_id = None
+        self.preloaded_patient_index = self.pending_patient_preload_index
+        self.pending_patient_preload_index = None
+        self.preloaded_patient_payload = payload
+        self.preloaded_patient_error = None
+        self.statusBar().showMessage(
+            f"Next patient ready: {Path(folder).name} ({duration_s:.1f} s)",
+            4000,
+        )
+        self.update_patient_list_controls()
+
+    def on_patient_preload_failed(
+        self,
+        request_id: int,
+        folder: str,
+        error_message: str,
+        duration_s: float,
+    ) -> None:
+        if not self.patient_preload_manager.is_current(request_id):
+            return
+        self.pending_patient_preload_request_id = None
+        self.preloaded_patient_index = None
+        self.pending_patient_preload_index = None
+        self.preloaded_patient_payload = None
+        self.preloaded_patient_error = error_message
+        self.statusBar().showMessage(
+            f"Background preload failed for {Path(folder).name}: {error_message}",
+            8000,
+        )
+        self.update_patient_list_controls()
+
+    def start_background_patient_activation_preparation(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        payload: PatientPreloadPayload,
+    ) -> None:
+        self.patient_activation_prepare_manager.cancel_all()
+        self.pending_patient_activation_prepare_request_id = None
+        self.pending_patient_activation_prepare_token = activation_token
+        self.pending_patient_activation_prepare_result = None
+        self.pending_patient_activation_prepare_error = None
+
+        if payload.review_cache_data is None or self.rtstruct is None:
+            self.pending_patient_activation_prepare_result = PatientActivationPreparationPayload(
+                prepared_review_cache_state=None,
+                cache_loaded=False,
+                cache_load_duration=None,
+                used_preloaded_review_cache=False,
+            )
+            return
+
+        request_id = self.patient_activation_prepare_manager.start(
+            folder,
+            review_cache_data=payload.review_cache_data,
+            expected_structure_names=[structure.name for structure in self.rtstruct.structures],
+            available_constraint_sheet_names=self.available_constraint_sheet_names,
+            no_constraints_sheet_label=NO_CONSTRAINTS_SHEET_LABEL,
+            constraints_sheet_name=self.constraints_sheet_name,
+            structure_filter_csv_path=self.structure_filter_csv_path,
+            rtstruct_path=self.rtstruct_path,
+            rtdose_paths=list(self.latest_timing_rtdose_paths),
+            rtplan_paths=list(self.current_rtplan_paths),
+            dvh_mode=self.get_dvh_mode(),
+            dvh_method_signature=get_dvh_method_signature(),
+            target_method_signature=self.get_target_method_signature(),
+            has_ct=self.ct is not None,
+            has_dose=self.dose is not None,
+        )
+        self.pending_patient_activation_prepare_request_id = request_id
+
+    def on_patient_activation_prepare_finished(
+        self,
+        request_id: int,
+        folder: str,
+        payload: object,
+        duration_s: float,
+    ) -> None:
+        if request_id != self.pending_patient_activation_prepare_request_id:
+            return
+        if self.current_patient_folder != folder:
+            return
+        if not isinstance(payload, PatientActivationPreparationPayload):
+            return
+        self.pending_patient_activation_prepare_request_id = None
+        self.pending_patient_activation_prepare_result = payload
+        self.pending_patient_activation_prepare_error = None
+        self.statusBar().showMessage(
+            f"Prepared final review state for {Path(folder).name} ({duration_s:.1f} s)",
+            2000,
+        )
+
+    def on_patient_activation_prepare_failed(
+        self,
+        request_id: int,
+        folder: str,
+        error_message: str,
+        _duration_s: float,
+    ) -> None:
+        if request_id != self.pending_patient_activation_prepare_request_id:
+            return
+        if self.current_patient_folder != folder:
+            return
+        self.pending_patient_activation_prepare_request_id = None
+        self.pending_patient_activation_prepare_result = None
+        self.pending_patient_activation_prepare_error = error_message
+
+    def on_load_patient_list_folder(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Patient List Folder")
+        if not folder:
+            return
+        self.load_patient_list_folder(folder)
+
+    def load_patient_list_folder(self, folder: str) -> None:
+        patient_folders = self.get_patient_list_folder_entries(folder)
+        if not patient_folders:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No patient folders",
+                "The selected folder did not contain any patient subfolders.",
+            )
+            return
+        self.clear_patient_queue_state()
+        self.patient_list_root_folder = folder
+        self.patient_list_folders = patient_folders
+        self.current_patient_list_index = 0
+        self.populate_patient_list_combo()
+        self.load_patient_folder_path(patient_folders[0], patient_list_index=0)
+
+    def on_patient_list_combo_activated(self, index: int) -> None:
+        if not (0 <= index < len(self.patient_list_folders)):
+            return
+        payload = self.preloaded_patient_payload if self.preloaded_patient_index == index else None
+        self.load_patient_folder_path(
+            self.patient_list_folders[index],
+            patient_list_index=index,
+            preloaded_payload=payload,
+        )
+
+    def on_next_patient_clicked(self) -> None:
+        next_index = self.get_next_patient_queue_index()
+        if next_index is None:
+            return
+        payload = self.preloaded_patient_payload if self.preloaded_patient_index == next_index else None
+        if payload is None and self.pending_patient_preload_index == next_index:
+            self.statusBar().showMessage(
+                f"Next patient is still loading: {Path(self.patient_list_folders[next_index]).name}",
+                4000,
+            )
+            return
+        if payload is None:
+            self.statusBar().showMessage(
+                f"Next patient is not ready yet: {Path(self.patient_list_folders[next_index]).name}",
+                4000,
+            )
+            return
+        self.load_patient_folder_path(
+            self.patient_list_folders[next_index],
+            patient_list_index=next_index,
+            preloaded_payload=payload,
+        )
+
     def _load_saved_review_cache_if_available(
         self,
         *,
         derived_array_cache_path: Optional[Path],
-    ) -> Tuple[ReviewCacheAvailability, bool, Optional[float]]:
+        preloaded_review_cache_data: Optional[ReviewCacheFileData] = None,
+    ) -> Tuple[ReviewCacheAvailability, bool, Optional[float], bool]:
         cache_info = get_review_cache_availability(
             dvh_can_start=self.ct is not None and self.dose is not None and self.rtstruct is not None,
             cache_path=self.get_dvh_cache_path(),
@@ -1110,15 +1483,22 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         cache_loaded = False
         cache_load_duration: Optional[float] = None
+        used_preloaded_review_cache = False
         if cache_info.dvh_can_start:
-            if cache_info.cache_found:
+            if preloaded_review_cache_data is not None:
+                self.show_progress_status("Using preloaded saved JSON cache", pump_events=True)
+            elif cache_info.cache_found:
                 self.show_progress_status("Found saved JSON cache", pump_events=True)
             elif cache_info.derived_sidecar_only:
                 self.show_progress_status("Found saved derived cache only; no saved JSON review data", pump_events=True)
             stage_start = perf_counter()
-            cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
+            if preloaded_review_cache_data is not None:
+                cache_loaded = self.load_saved_review_cache_data(preloaded_review_cache_data, refresh_ui=False)
+                used_preloaded_review_cache = cache_loaded
+            else:
+                cache_loaded = self.try_load_saved_dvh_cache(refresh_ui=False)
             cache_load_duration = perf_counter() - stage_start if cache_loaded else None
-        return cache_info, cache_loaded, cache_load_duration
+        return cache_info, cache_loaded, cache_load_duration, used_preloaded_review_cache
 
     def _finalize_patient_load_interactive_state(
         self,
@@ -1126,6 +1506,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         cache_info: ReviewCacheAvailability,
         cache_loaded: bool,
         cache_load_duration: Optional[float],
+        used_preloaded_review_cache: bool,
+        fast_activate: bool,
+        patient_folder: Optional[str],
         timing_entries: List[Tuple[str, Optional[float]]],
         overall_start: float,
     ) -> None:
@@ -1134,14 +1517,24 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             if cache_loaded:
                 self.populate_structures_list()
                 stage_start = perf_counter()
-                self.refresh_all_views()
-                timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+                self.update_display()
+                self.apply_image_based_view_ranges()
+                timing_entries.append(("Refresh axial view (final)", perf_counter() - stage_start))
                 self.render_dvh_plot()
                 if self.dvh_curves:
                     self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
                 else:
                     self.dvh_status_label.setText("Saved DVH cache contained no curves.")
                 self.update_dvh_cache_button()
+                if fast_activate:
+                    self.schedule_deferred_patient_view_refresh(
+                        timing_entries=timing_entries,
+                        folder=patient_folder,
+                    )
+                else:
+                    stage_start = perf_counter()
+                    self.refresh_orthogonal_views_from_controls()
+                    timing_entries.append(("Refresh orthogonal views", perf_counter() - stage_start))
             else:
                 if cache_info.cache_found:
                     self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=True)
@@ -1150,193 +1543,630 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.show_progress_status("Computing metrics", pump_events=True)
                 self.populate_structures_list()
                 stage_start = perf_counter()
-                self.refresh_all_views()
-                timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+                self.update_display()
+                self.apply_image_based_view_ranges()
+                self.render_dvh_plot()
+                timing_entries.append(("Refresh axial view (final)", perf_counter() - stage_start))
+                if fast_activate:
+                    self.schedule_deferred_patient_view_refresh(
+                        timing_entries=timing_entries,
+                        folder=patient_folder,
+                    )
+                else:
+                    stage_start = perf_counter()
+                    self.refresh_orthogonal_views_from_controls()
+                    timing_entries.append(("Refresh orthogonal views", perf_counter() - stage_start))
         elif self.ct is not None:
             stage_start = perf_counter()
-            self.refresh_orthogonal_views_from_controls()
-            timing_entries.append(("Refresh full views", perf_counter() - stage_start))
+            self.update_display()
+            self.apply_image_based_view_ranges()
+            timing_entries.append(("Refresh axial view (final)", perf_counter() - stage_start))
+            if fast_activate:
+                self.schedule_deferred_patient_view_refresh(
+                    timing_entries=timing_entries,
+                    folder=patient_folder,
+                )
+            else:
+                stage_start = perf_counter()
+                self.refresh_orthogonal_views_from_controls()
+                timing_entries.append(("Refresh orthogonal views", perf_counter() - stage_start))
 
         if cache_loaded:
-            self.show_progress_status("Loaded saved JSON cache")
+            if used_preloaded_review_cache:
+                self.show_progress_status("Loaded preloaded saved JSON cache")
+            else:
+                self.show_progress_status("Loaded saved JSON cache")
         timing_entries.append(("Load saved DVH cache", cache_load_duration))
         if not cache_loaded:
             timing_entries.append(("Compute DVH (background)" if cache_info.dvh_can_start else "Compute DVH", None))
         timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
 
-    def on_load_patient_folder(self):
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Patient Folder")
-        if not folder:
-            return
+    def _apply_patient_preload_payload(
+        self,
+        payload: PatientPreloadPayload,
+        *,
+        timing_entries: List[Tuple[str, Optional[float]]],
+    ) -> Tuple[Optional[str], Optional[str], List[str], Optional[Path]]:
+        self.ct = payload.ct
+        self.plan_phases = list(payload.plan_phases)
+        self.current_rtplan_paths = list(payload.rtplan_paths)
+        self.patient_plan_lines = tuple(payload.patient_plan_lines) if payload.patient_plan_lines is not None else None
+        self.image_view_bounds = payload.image_view_bounds
+        self.rtstruct_path = payload.rtstruct_path
+        self.rtstruct = payload.rtstruct
+        self.dose = payload.dose
+        self.sampled_dose_volume_ct = payload.sampled_dose_volume_ct
+        self.latest_timing_rtdose_paths = list(payload.rtdose_paths)
+        self.update_patient_plan_label(pump_events=True)
 
+        self.displayed_dose_plane = None
+        self.structure_mask_cache = None
+        self.structure_mask_cache_names = []
+        self.max_dose_index_zyx = None
+        self.current_row = self.ct.rows // 2
+        self.current_col = self.ct.cols // 2
+        self.slice_slider.setRange(0, self.ct.volume_hu.shape[0] - 1)
+        self.slice_slider.setValue(self.ct.volume_hu.shape[0] // 2)
+        self.update_autoscroll_speed_label()
+
+        self.refresh_constraint_sheet_combo(preferred_sheet_name=None)
+        constraints_path = self.structure_filter_csv_path
+        if constraints_path is not None and self.constraints_sheet_name is not None:
+            stage_start = perf_counter()
+            (
+                _,
+                self.csv_structure_goals_by_name,
+                self.structure_csv_order,
+            ) = load_structure_constraints_sheet(
+                constraints_path,
+                self.constraints_sheet_name,
+                self.plan_phases,
+            )
+            self.rebuild_structure_goals_by_name()
+            timing_entries.append(("Load constraints workbook", perf_counter() - stage_start))
+        else:
+            self.csv_structure_goals_by_name = {}
+            self.structure_csv_order = []
+            self.rebuild_structure_goals_by_name()
+            timing_entries.append(("Load constraints workbook", None))
+
+        if self.rtstruct is not None:
+            self.sort_rtstruct_structures_for_display()
+            visible_range = self.get_visible_structure_slice_range()
+            if visible_range is not None:
+                start_idx, end_idx = visible_range
+                self.slice_slider.setValue((start_idx + end_idx) // 2)
+        else:
+            self.populate_structures_list()
+            self.populate_isodose_controls()
+
+        if payload.derived_array_cache_data is not None:
+            self.ptv_union_volume_mask_cache = payload.derived_array_cache_data.ptv_union_volume_mask
+            self.structure_volume_mask_cache = dict(payload.derived_array_cache_data.structure_volume_masks)
+            self.structure_geometry_volume_cache = dict(payload.derived_array_cache_data.structure_geometry_volumes_cc)
+
+        if self.dose is not None:
+            self.target_curve_cache = {}
+            self.target_metrics_cache = {}
+            self.stereotactic_metrics_cache = {}
+            self.stereotactic_volume_context_cache = {}
+            self.max_tissue_dose_gy_cache = None
+            self.max_tissue_index_zyx = None
+            self.cached_target_table_rows = None
+            self.apply_default_dose_range()
+        if self.rtstruct is not None:
+            self.populate_isodose_controls()
+
+        timing_entries.extend(payload.timing_entries)
+        derived_array_cache_path = self.get_derived_array_cache_path()
+        return constraints_path, self.rtstruct_path, list(payload.rtdose_paths), derived_array_cache_path
+
+    def apply_precomputed_initial_view_state(
+        self,
+        precomputed_view_state: PrecomputedPatientViewState,
+    ) -> None:
+        blocker = QtCore.QSignalBlocker(self.slice_slider)
+        self.slice_slider.setValue(precomputed_view_state.slice_index)
+        del blocker
+        self.current_row = precomputed_view_state.row_idx
+        self.current_col = precomputed_view_state.col_idx
+
+        ww = precomputed_view_state.window_width
+        wl = precomputed_view_state.window_level
+        lo = wl - ww / 2.0
+        hi = wl + ww / 2.0
+        blocker = QtCore.QSignalBlocker(self.window_level_slider)
+        self.window_level_slider.setWindowLevel(int(round(ww)), int(round(wl)))
+        del blocker
+        self.window_label.setText(f"WL/WW: {int(round(wl))} / {int(round(ww))}")
+
+        if self.dose is not None:
+            self.dose_overlay_enabled = precomputed_view_state.dose_alpha > 0.0
+            blocker = QtCore.QSignalBlocker(self.dose_toggle_button)
+            self.dose_toggle_button.setChecked(self.dose_overlay_enabled)
+            del blocker
+            self.dose_toggle_button.setText("On" if self.dose_overlay_enabled else "Off")
+            blocker = QtCore.QSignalBlocker(self.dose_opacity_slider)
+            self.dose_opacity_slider.setValue(int(round(precomputed_view_state.dose_alpha * 100.0)))
+            del blocker
+            lower_value = self.dose_gy_to_slider_value(precomputed_view_state.dose_min_gy)
+            upper_value = self.dose_gy_to_slider_value(precomputed_view_state.dose_max_gy)
+            blocker = QtCore.QSignalBlocker(self.dose_range_slider)
+            self.dose_range_slider.setValues(lower_value, upper_value)
+            del blocker
+
+        axial_state = precomputed_view_state.axial_render_state
+        self.ct_item.setImage(axial_state.ct_plane, levels=(lo, hi), autoLevels=False)
+        self.displayed_dose_plane = axial_state.dose_plane
+        self.dose_item.setImage(axial_state.dose_rgba, autoLevels=False)
+        if axial_state.dose_plane is not None:
+            self.add_isodose_items(self.axial_view, self.axial_isodose_items, axial_state.dose_plane)
+        else:
+            self.clear_overlay_items(self.axial_view, self.axial_isodose_items)
+        self.clear_overlay_items(self.axial_view, self.axial_contour_items)
+        apply_polyline_specs(self.axial_view, self.axial_contour_items, axial_state.contour_specs)
+        self.slice_label.setText(axial_state.slice_label_text)
+        self.z_label.setText(axial_state.z_label_text)
+
+        orth_state = precomputed_view_state.orthogonal_render_state
+        self.sagittal_ct_item.setImage(orth_state.sagittal_plane, levels=(lo, hi), autoLevels=False)
+        self.coronal_ct_item.setImage(orth_state.coronal_plane, levels=(lo, hi), autoLevels=False)
+        self.sagittal_dose_item.setImage(orth_state.sagittal_dose_rgba, autoLevels=False)
+        self.coronal_dose_item.setImage(orth_state.coronal_dose_rgba, autoLevels=False)
+        if orth_state.sagittal_dose_plane is not None and orth_state.coronal_dose_plane is not None:
+            self.add_isodose_items(self.sagittal_view, self.sagittal_isodose_items, orth_state.sagittal_dose_plane)
+            self.add_isodose_items(self.coronal_view, self.coronal_isodose_items, orth_state.coronal_dose_plane)
+        else:
+            self.clear_overlay_items(self.sagittal_view, self.sagittal_isodose_items)
+            self.clear_overlay_items(self.coronal_view, self.coronal_isodose_items)
+        self.clear_overlay_items(self.sagittal_view, self.sagittal_contour_items)
+        self.clear_overlay_items(self.coronal_view, self.coronal_contour_items)
+        apply_polyline_specs(self.sagittal_view, self.sagittal_contour_items, orth_state.sagittal_contours)
+        apply_polyline_specs(self.coronal_view, self.coronal_contour_items, orth_state.coronal_contours)
+
+        self.update_dose_range_controls()
+        self.update_max_dose_markers()
+        self.update_axial_overlay_positions()
+        self.apply_image_based_view_ranges()
+
+    def apply_precomputed_axial_render_state(
+        self,
+        *,
+        slice_index: int,
+        axial_state: object,
+    ) -> None:
+        if self.ct is None:
+            return
+        ww, wl = self.get_window_level()
+        lo = wl - ww / 2.0
+        hi = wl + ww / 2.0
+        blocker = QtCore.QSignalBlocker(self.slice_slider)
+        self.slice_slider.setValue(slice_index)
+        del blocker
+        self.ct_item.setImage(axial_state.ct_plane, levels=(lo, hi), autoLevels=False)
+        self.displayed_dose_plane = axial_state.dose_plane
+        self.dose_item.setImage(axial_state.dose_rgba, autoLevels=False)
+        if axial_state.dose_plane is not None:
+            self.add_isodose_items(self.axial_view, self.axial_isodose_items, axial_state.dose_plane)
+        else:
+            self.clear_overlay_items(self.axial_view, self.axial_isodose_items)
+        self.clear_overlay_items(self.axial_view, self.axial_contour_items)
+        apply_polyline_specs(self.axial_view, self.axial_contour_items, axial_state.contour_specs)
+        self.slice_label.setText(axial_state.slice_label_text)
+        self.z_label.setText(axial_state.z_label_text)
+        self.window_label.setText(axial_state.window_label_text)
+        self.update_axial_overlay_positions()
+
+    def rgba_array_to_pixmap(self, rgba: np.ndarray) -> QtGui.QPixmap:
+        frame = np.ascontiguousarray(rgba, dtype=np.uint8)
+        height, width = frame.shape[:2]
+        image = QtGui.QImage(
+            frame.data,
+            width,
+            height,
+            frame.strides[0],
+            QtGui.QImage.Format.Format_RGBA8888,
+        ).copy()
+        return QtGui.QPixmap.fromImage(image)
+
+    def update_patient_activation_overlay_positions(self) -> None:
+        # Patient activation overlays now run in a separate helper process, so
+        # there is no in-app geometry update work to do here.
+        return
+
+    def build_patient_transition_overlay_geometry(self) -> Optional[Tuple[QtCore.QRect, QtCore.QRect]]:
+        if not hasattr(self, "axial_tab_widget") or not hasattr(self, "axial_graphics_widget"):
+            return None
+        overlay_widget = self.axial_tab_widget
+        axial_widget = self.axial_graphics_widget
+        overlay_size = overlay_widget.size()
+        axial_size = axial_widget.size()
+        if overlay_size.width() <= 0 or overlay_size.height() <= 0:
+            return None
+        if axial_size.width() <= 0 or axial_size.height() <= 0:
+            return None
+        overlay_top_left = overlay_widget.mapToGlobal(QtCore.QPoint(0, 0))
+        overlay_rect = QtCore.QRect(overlay_top_left, overlay_size)
+        axial_top_left = axial_widget.mapTo(overlay_widget, QtCore.QPoint(0, 0))
+        axial_rect = QtCore.QRect(axial_top_left, axial_size)
+        return overlay_rect, axial_rect
+
+    def write_review_movie_asset(
+        self,
+        path: Path,
+        frames_rgba: List[np.ndarray],
+        interval_ms: int,
+    ) -> None:
+        if not frames_rgba:
+            raise ValueError("No cine frames are available to save.")
+        frames = np.stack(
+            [np.ascontiguousarray(frame, dtype=np.uint8) for frame in frames_rgba],
+            axis=0,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
+        temp_path = Path(temp_path_str)
+        os.close(fd)
+        try:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            np.savez(
+                temp_path,
+                frames=frames,
+                interval_ms=np.asarray([max(60, int(interval_ms))], dtype=np.int32),
+            )
+            temp_path.replace(path)
+        except Exception:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+    def get_review_movie_path(self, base_path: Optional[Path] = None) -> Optional[Path]:
+        cache_path = base_path if base_path is not None else self.get_dvh_cache_path()
+        if cache_path is None:
+            return None
+        return cache_path.with_name(f"{cache_path.stem}_movie.npz")
+
+    def save_review_movie(self, path: Path) -> Optional[str]:
+        if self.ct is None:
+            return "failed to save the review movie."
+        cine_indices, cine_interval_ms = build_axial_cine_plan(self.ct, self.rtstruct)
+        if not cine_indices:
+            return "failed to save the review movie."
+        if not hasattr(self, "axial_graphics_widget"):
+            return "failed to save the review movie."
+
+        current_tab = self.tabs.currentWidget()
+        original_slice_index = int(np.clip(self.slice_slider.value(), 0, self.ct.volume_hu.shape[0] - 1))
+        original_view_range = self.axial_view.viewRange()
+        original_readout_visible = self.axial_readout_label.isVisible()
+        original_autoscroll_visible = self.axial_autoscroll_overlay.isVisible()
+        original_crosshair_visible = self.crosshair_text.isVisible()
+        original_marker_visible = self.axial_max_marker.isVisible()
+        ww, wl = self.get_window_level()
+        lo = wl - ww / 2.0
+        hi = wl + ww / 2.0
+        min_dose, max_dose = self.get_dose_display_range()
+        dose_alpha = self.current_dose_alpha()
+        captured_frames: List[np.ndarray] = []
+        try:
+            self.tabs.setCurrentWidget(self.axial_tab_widget)
+            self.axial_readout_label.hide()
+            self.axial_autoscroll_overlay.hide()
+            self.crosshair_text.hide()
+            self.axial_max_marker.hide()
+            self.pump_viewer_ui()
+
+            for frame_slice_index in cine_indices:
+                frame_state = build_axial_render_state(
+                    self.ct,
+                    self.dose,
+                    self.rtstruct,
+                    self.sampled_dose_volume_ct,
+                    frame_slice_index,
+                    lo,
+                    hi,
+                    dose_alpha,
+                    min_dose,
+                    max_dose,
+                    self.structure_is_visible,
+                )
+                self.apply_precomputed_axial_render_state(
+                    slice_index=frame_slice_index,
+                    axial_state=frame_state,
+                )
+                self.axial_view.setRange(
+                    xRange=(float(original_view_range[0][0]), float(original_view_range[0][1])),
+                    yRange=(float(original_view_range[1][0]), float(original_view_range[1][1])),
+                    padding=0.0,
+                )
+                self.pump_viewer_ui()
+                pixmap = self.axial_graphics_widget.grab()
+                if pixmap.isNull():
+                    raise RuntimeError("failed to capture an axial movie frame")
+                image = pixmap.toImage().convertToFormat(QtGui.QImage.Format.Format_RGBA8888)
+                width = image.width()
+                height = image.height()
+                buffer = image.bits()
+                frame_rgba = np.frombuffer(buffer, dtype=np.uint8, count=height * width * 4).reshape((height, width, 4)).copy()
+                captured_frames.append(frame_rgba)
+
+            self.write_review_movie_asset(path, captured_frames, cine_interval_ms)
+        except Exception as exc:
+            logger.warning("Saved JSON review cache but failed to save review movie: %s", exc)
+            return f"failed to save the review movie: {exc}"
+        finally:
+            restore_state = build_axial_render_state(
+                self.ct,
+                self.dose,
+                self.rtstruct,
+                self.sampled_dose_volume_ct,
+                original_slice_index,
+                lo,
+                hi,
+                dose_alpha,
+                min_dose,
+                max_dose,
+                self.structure_is_visible,
+            )
+            self.apply_precomputed_axial_render_state(
+                slice_index=original_slice_index,
+                axial_state=restore_state,
+            )
+            self.axial_view.setRange(
+                xRange=(float(original_view_range[0][0]), float(original_view_range[0][1])),
+                yRange=(float(original_view_range[1][0]), float(original_view_range[1][1])),
+                padding=0.0,
+            )
+            if original_readout_visible:
+                self.axial_readout_label.show()
+            if original_autoscroll_visible:
+                self.axial_autoscroll_overlay.show()
+            if original_crosshair_visible:
+                self.crosshair_text.show()
+            if original_marker_visible:
+                self.axial_max_marker.show()
+            if current_tab is not None:
+                self.tabs.setCurrentWidget(current_tab)
+            self.pump_viewer_ui()
+        return None
+
+    def start_patient_transition_overlay_process(
+        self,
+        folder: str,
+        precomputed_view_state: Optional[PrecomputedPatientViewState] = None,
+    ) -> bool:
+        self.stop_patient_transition_overlay_process()
+
+        geometry = self.build_patient_transition_overlay_geometry()
+        cache_path = compute_dvh_cache_path(folder)
+        screenshot_path = self.get_review_screenshot_path(cache_path)
+        saved_movie_path = self.get_review_movie_path(cache_path)
+        has_screenshot = screenshot_path is not None and screenshot_path.exists()
+        has_saved_movie = saved_movie_path is not None and saved_movie_path.exists()
+        movie_path: Optional[Path] = saved_movie_path if has_saved_movie else None
+
+        if geometry is None or (not has_screenshot and movie_path is None):
+            return False
+
+        overlay_rect, axial_rect = geometry
+        overlay_script = Path(__file__).with_name("peer_transition_overlay.py")
+        command = [
+            sys.executable,
+            str(overlay_script),
+            "--window-x",
+            str(overlay_rect.x()),
+            "--window-y",
+            str(overlay_rect.y()),
+            "--window-width",
+            str(overlay_rect.width()),
+            "--window-height",
+            str(overlay_rect.height()),
+            "--axial-x",
+            str(axial_rect.x()),
+            "--axial-y",
+            str(axial_rect.y()),
+            "--axial-width",
+            str(axial_rect.width()),
+            "--axial-height",
+            str(axial_rect.height()),
+            "--parent-pid",
+            str(os.getpid()),
+        ]
+        if has_screenshot and screenshot_path is not None:
+            command.extend(["--screenshot", str(screenshot_path)])
+        if movie_path is not None:
+            command.extend(["--movie", str(movie_path)])
+        try:
+            self.patient_transition_overlay_process = subprocess.Popen(
+                command,
+                cwd=str(overlay_script.parent),
+                stdin=subprocess.DEVNULL,
+            )
+            self.patient_transition_overlay_temp_dir = None
+        except Exception:
+            self.patient_transition_overlay_process = None
+            self.patient_transition_overlay_temp_dir = None
+            return False
+        return True
+
+    def stop_patient_transition_overlay_process(self) -> None:
+        process = self.patient_transition_overlay_process
+        self.patient_transition_overlay_process = None
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=0.75)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=0.5)
+            except Exception:
+                pass
+        temp_dir = self.patient_transition_overlay_temp_dir
+        self.patient_transition_overlay_temp_dir = None
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def start_patient_activation_movie(
+        self,
+        folder: str,
+        precomputed_view_state: PrecomputedPatientViewState,
+    ) -> bool:
+        self.stop_patient_activation_movie()
+        return self.start_patient_transition_overlay_process(folder, precomputed_view_state)
+
+    def advance_patient_activation_movie(self) -> None:
+        if self.patient_transition_overlay_process is None:
+            self.patient_activation_movie_timer.stop()
+            return
+        if self.patient_transition_overlay_process.poll() is not None:
+            self.stop_patient_transition_overlay_process()
+            self.patient_activation_movie_timer.stop()
+
+    def stop_patient_activation_movie(self) -> None:
+        self.patient_activation_movie_timer.stop()
+        self.stop_patient_transition_overlay_process()
+        self.patient_activation_movie_source_pixmaps = []
+        self.patient_activation_movie_display_pixmaps = []
+        self.patient_activation_movie_display_size = QtCore.QSize()
+        self.patient_activation_movie_frame_index = 0
+        self.viewer_screenshot_source_pixmap = None
+        self.viewer_screenshot_display_pixmap = None
+        self.viewer_screenshot_display_size = QtCore.QSize()
+        if hasattr(self, "viewer_screenshot_overlay"):
+            self.viewer_screenshot_overlay.hide()
+            self.viewer_screenshot_overlay.clear()
+        if hasattr(self, "axial_movie_overlay"):
+            self.axial_movie_overlay.hide()
+            self.axial_movie_overlay.clear()
+        if hasattr(self, "axial_autoscroll_overlay"):
+            self.axial_autoscroll_overlay.show()
+
+    def pump_viewer_ui(self) -> None:
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+    def get_patient_activation_midstage_delay_ms(self) -> int:
+        return max(900, int(self.autoscroll_timer.interval()) * 6)
+
+    def get_patient_activation_step_delay_ms(self) -> int:
+        return max(90, int(self.autoscroll_timer.interval()))
+
+    def load_patient_folder_path(
+        self,
+        folder: str,
+        *,
+        patient_list_index: Optional[int] = None,
+        preloaded_payload: Optional[PatientPreloadPayload] = None,
+    ) -> bool:
         timing_entries: List[Tuple[str, Optional[float]]] = []
         overall_start = perf_counter()
+        fast_activate = preloaded_payload is not None and patient_list_index is not None
         constraints_path: Optional[str] = None
         rtstruct_path: Optional[str] = None
         rtdose_paths: List[str] = []
-        derived_array_cache_loaded = False
         derived_array_cache_path: Optional[Path] = None
 
-        self.set_heavy_view_updates_enabled(False)
+        self.patient_preload_manager.invalidate()
+        self.pending_patient_preload_request_id = None
+        self.pending_patient_preload_index = None
+        self.preloaded_patient_index = None
+        self.preloaded_patient_payload = None
+        self.preloaded_patient_error = None
+
+        self.set_heavy_view_updates_enabled(fast_activate)
         try:
-            self.show_progress_status("Scanning patient folder...", pump_events=True)
-            self.clear_patient_session_state()
+            self.show_progress_status(
+                "Activating preloaded patient..." if preloaded_payload is not None else "Scanning patient folder...",
+                pump_events=True,
+            )
+            self.clear_patient_session_state(quick_swap=fast_activate)
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
+            if preloaded_payload is None:
+                self.tabs.setCurrentWidget(self.axial_tab_widget)
+                self.start_patient_transition_overlay_process(folder)
+                self.pump_viewer_ui()
+
+            if preloaded_payload is None:
+                payload = prepare_patient_preload_payload(
+                    folder,
+                    array_cache_signature=self.get_derived_array_cache_signature(),
+                    progress_callback=lambda message: self.show_progress_status(message, pump_events=True),
+                )
+            else:
+                payload = preloaded_payload
+
+            constraints_path, rtstruct_path, rtdose_paths, derived_array_cache_path = self._apply_patient_preload_payload(
+                payload,
+                timing_entries=timing_entries,
+            )
 
             stage_start = perf_counter()
-            self.ct, patient_discovery = load_patient_scan_and_discovery(folder)
-            rtstruct_path = patient_discovery.rtstruct_path
-            rtdose_paths = list(patient_discovery.rtdose_paths)
-            rtplan_paths = list(patient_discovery.rtplan_paths)
-            timing_entries.append(("CT scan/load + file discovery", perf_counter() - stage_start))
-
-            self.plan_phases = list(patient_discovery.plan_phases)
-            self.current_rtplan_paths = list(rtplan_paths)
-            self.patient_plan_lines = patient_discovery.patient_plan_lines
-            self.latest_timing_rtdose_paths = list(rtdose_paths)
-            self.update_patient_plan_label(pump_events=True)
-
-            stage_start = perf_counter()
-            self.image_view_bounds = compute_image_view_bounds(self.ct)
-            timing_entries.append(("Compute image bounds", perf_counter() - stage_start))
-            self.displayed_dose_plane = None
-            self.sampled_dose_volume_ct = None
-            self.structure_mask_cache = None
-            self.structure_mask_cache_names = []
-            self.max_dose_index_zyx = None
-            self.current_row = self.ct.rows // 2
-            self.current_col = self.ct.cols // 2
-            self.slice_slider.setRange(0, self.ct.volume_hu.shape[0] - 1)
-            self.slice_slider.setValue(self.ct.volume_hu.shape[0] // 2)
-            self.update_autoscroll_speed_label()
-
-            self.refresh_constraint_sheet_combo(preferred_sheet_name=None)
-            constraints_path = self.structure_filter_csv_path
-            if constraints_path is not None and self.constraints_sheet_name is not None:
-                stage_start = perf_counter()
-                (
-                    _,
-                    self.csv_structure_goals_by_name,
-                    self.structure_csv_order,
-                ) = load_structure_constraints_sheet(
-                    constraints_path,
-                    self.constraints_sheet_name,
-                    self.plan_phases,
-                )
-                self.rebuild_structure_goals_by_name()
-                timing_entries.append(("Load constraints workbook", perf_counter() - stage_start))
+            if fast_activate and payload.precomputed_view_state is not None:
+                self.tabs.setCurrentWidget(self.axial_tab_widget)
+                self.apply_precomputed_initial_view_state(payload.precomputed_view_state)
+                timing_entries.append(("Apply precomputed initial views", perf_counter() - stage_start))
+                self.pump_viewer_ui()
             else:
-                self.csv_structure_goals_by_name = {}
-                self.structure_csv_order = []
-                self.rebuild_structure_goals_by_name()
-                timing_entries.append(("Load constraints workbook", None))
-
-            self.rtstruct_path = rtstruct_path
-            if self.rtstruct_path:
-                self.show_progress_status("Loading structures", pump_events=True)
-                stage_start = perf_counter()
-                self.reload_rtstruct_from_current_selection(
-                    refresh_dvh=False,
-                    refresh_views=False,
-                    refresh_lists=False,
-                )
-                timing_entries.append(("Load RTSTRUCT", perf_counter() - stage_start))
-                visible_range = self.get_visible_structure_slice_range()
-                if visible_range is not None:
-                    start_idx, end_idx = visible_range
-                    self.slice_slider.setValue((start_idx + end_idx) // 2)
-            else:
-                self.populate_structures_list()
-                self.populate_isodose_controls()
-                timing_entries.append(("Load RTSTRUCT", None))
-
-            if rtdose_paths:
-                stage_start = perf_counter()
-                self.dose = load_combined_rtdose(rtdose_paths)
-                timing_entries.append(("Load/merge RTDOSE", perf_counter() - stage_start))
-
-                stage_start = perf_counter()
-                derived_array_cache_path = self.get_derived_array_cache_path()
-                if derived_array_cache_path is not None and derived_array_cache_path.exists():
-                    self.show_progress_status("Loading saved derived cache", pump_events=True)
-                derived_array_cache_loaded = self.try_load_derived_array_cache()
-                timing_entries.append(
-                    ("Load derived array cache", perf_counter() - stage_start if derived_array_cache_loaded else None)
-                )
-
-                if not derived_array_cache_loaded or self.sampled_dose_volume_ct is None:
-                    self.show_progress_status("Resampling dose", pump_events=True)
-                    stage_start = perf_counter()
-                    self.sampled_dose_volume_ct = resample_dose_to_ct_volume(self.ct, self.dose)
-                    timing_entries.append(("Resample dose to CT grid", perf_counter() - stage_start))
-                else:
-                    timing_entries.append(("Resample dose to CT grid", None))
-                self.target_curve_cache = {}
-                self.target_metrics_cache = {}
-                self.stereotactic_metrics_cache = {}
-                self.stereotactic_volume_context_cache = {}
-                self.max_tissue_dose_gy_cache = None
-                self.max_tissue_index_zyx = None
-                self.cached_target_table_rows = None
-                self.apply_default_dose_range()
-            else:
-                timing_entries.append(("Load/merge RTDOSE", None))
-                timing_entries.append(("Load derived array cache", None))
-                timing_entries.append(("Resample dose to CT grid", None))
-
-            if self.rtstruct is not None:
-                self.populate_isodose_controls()
-
-            stage_start = perf_counter()
-            self.update_display()
-            self.apply_image_based_view_ranges()
-            timing_entries.append(("Refresh axial view", perf_counter() - stage_start))
+                self.update_display()
+                self.apply_image_based_view_ranges()
+                timing_entries.append(("Refresh axial view", perf_counter() - stage_start))
 
             self.latest_timing_entries = list(timing_entries)
             self.latest_timing_folder = folder
             self.latest_timing_csv_path = constraints_path
             self.latest_timing_rtstruct_path = rtstruct_path
             self.latest_timing_rtdose_paths = list(rtdose_paths)
+            if fast_activate:
+                self.show_progress_status("Finalizing preloaded patient...", pump_events=False)
+                self.set_patient_activation_ui_locked(True)
+                if payload.precomputed_view_state is not None:
+                    self.start_patient_activation_movie(folder, payload.precomputed_view_state)
+                self.pump_viewer_ui()
+                activation_token = self.patient_activation_token + 1
+                self.patient_activation_token = activation_token
+                self.start_background_patient_activation_preparation(
+                    activation_token=activation_token,
+                    folder=folder,
+                    payload=payload,
+                )
 
-            cache_info, cache_loaded, cache_load_duration = self._load_saved_review_cache_if_available(
+                def _continue_activation() -> None:
+                    self._continue_patient_activation_when_ready(
+                        activation_token=activation_token,
+                        folder=folder,
+                        patient_list_index=patient_list_index,
+                        constraints_path=constraints_path,
+                        rtstruct_path=rtstruct_path,
+                        rtdose_paths=rtdose_paths,
+                        timing_entries=timing_entries,
+                        overall_start=overall_start,
+                    )
+
+                QtCore.QTimer.singleShot(self.get_patient_activation_midstage_delay_ms(), _continue_activation)
+                return True
+
+            return self._complete_patient_folder_activation(
+                activation_token=self.patient_activation_token,
+                folder=folder,
+                patient_list_index=patient_list_index,
+                payload=payload,
+                constraints_path=constraints_path,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
                 derived_array_cache_path=derived_array_cache_path,
-            )
-            self._finalize_patient_load_interactive_state(
-                cache_info=cache_info,
-                cache_loaded=cache_loaded,
-                cache_load_duration=cache_load_duration,
                 timing_entries=timing_entries,
                 overall_start=overall_start,
+                fast_activate=fast_activate,
             )
-
-            self.latest_timing_entries = list(timing_entries)
-            self.latest_timing_folder = folder
-            self.latest_timing_csv_path = constraints_path
-            self.latest_timing_rtstruct_path = rtstruct_path
-            self.latest_timing_rtdose_paths = list(rtdose_paths)
-
-            report_path = self.write_latest_timing_report()
-
-            dvh_started = False
-            if not cache_loaded:
-                dvh_started = self.refresh_dvh()
-                if not dvh_started and cache_info.dvh_can_start:
-                    self.latest_timing_entries = [
-                        ("Compute DVH", duration_s) if label == "Compute DVH (background)" else (label, duration_s)
-                        for label, duration_s in self.latest_timing_entries
-                    ]
-                    report_path = self.write_latest_timing_report()
-            if cache_loaded or not dvh_started:
-                self.clear_progress_status()
-
-            if self.constraint_workbook_error:
-                self.statusBar().showMessage(
-                    f"Could not read constraints workbook: {self.constraint_workbook_error}",
-                    8000,
-                )
-            else:
-                self.statusBar().clearMessage()
         except Exception as e:
             self.clear_patient_session_state()
             timing_entries.append(("Total patient load to interactive review (failed)", perf_counter() - overall_start))
@@ -1349,8 +2179,394 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 error_message=str(e),
             )
             QtWidgets.QMessageBox.critical(self, "Patient load failed", str(e))
+            return False
         finally:
+            if not fast_activate:
+                self.set_patient_activation_ui_locked(False)
+                self.set_heavy_view_updates_enabled(True)
+
+    def _is_current_patient_activation(self, activation_token: int, folder: str) -> bool:
+        return activation_token == self.patient_activation_token and self.current_patient_folder == folder
+
+    def _handle_patient_activation_failure(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        constraints_path: Optional[str],
+        rtstruct_path: Optional[str],
+        rtdose_paths: List[str],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        overall_start: float,
+        error: Exception,
+    ) -> bool:
+        if self._is_current_patient_activation(activation_token, folder):
+            self.clear_patient_session_state()
+        failed_timing_entries = list(timing_entries)
+        failed_timing_entries.append(("Total patient load to interactive review (failed)", perf_counter() - overall_start))
+        self.write_load_timing_report(
+            folder,
+            failed_timing_entries,
+            csv_path=constraints_path,
+            rtstruct_path=rtstruct_path,
+            rtdose_paths=rtdose_paths,
+            error_message=str(error),
+        )
+        QtWidgets.QMessageBox.critical(self, "Patient load failed", str(error))
+        self.stop_patient_activation_movie()
+        self.set_patient_activation_ui_locked(False)
+        self.set_heavy_view_updates_enabled(True)
+        return False
+
+    def _finish_patient_activation_success(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        patient_list_index: Optional[int],
+        constraints_path: Optional[str],
+        rtstruct_path: Optional[str],
+        rtdose_paths: List[str],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        cache_info: ReviewCacheAvailability,
+        cache_loaded: bool,
+    ) -> bool:
+        if not self._is_current_patient_activation(activation_token, folder):
+            return False
+
+        self.latest_timing_entries = list(timing_entries)
+        self.latest_timing_folder = folder
+        self.latest_timing_csv_path = constraints_path
+        self.latest_timing_rtstruct_path = rtstruct_path
+        self.latest_timing_rtdose_paths = list(rtdose_paths)
+
+        self.write_latest_timing_report()
+
+        dvh_started = False
+        if not cache_loaded:
+            dvh_started = self.refresh_dvh()
+            if not dvh_started and cache_info.dvh_can_start:
+                self.latest_timing_entries = [
+                    ("Compute DVH", duration_s) if label == "Compute DVH (background)" else (label, duration_s)
+                    for label, duration_s in self.latest_timing_entries
+                ]
+                self.write_latest_timing_report()
+        if cache_loaded or not dvh_started:
+            self.clear_progress_status()
+
+        if self.constraint_workbook_error:
+            self.statusBar().showMessage(
+                f"Could not read constraints workbook: {self.constraint_workbook_error}",
+                8000,
+            )
+        else:
+            self.statusBar().clearMessage()
+
+        if patient_list_index is not None:
+            self.current_patient_list_index = patient_list_index
+            self.populate_patient_list_combo()
+            self.start_background_preload_for_index(self.get_next_patient_queue_index())
+        else:
+            self.update_patient_list_controls()
+
+        self.stop_patient_activation_movie()
+        self.set_patient_activation_ui_locked(False)
+        self.set_heavy_view_updates_enabled(True)
+        return True
+
+    def _continue_patient_activation_when_ready(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        patient_list_index: Optional[int],
+        constraints_path: Optional[str],
+        rtstruct_path: Optional[str],
+        rtdose_paths: List[str],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        overall_start: float,
+    ) -> bool:
+        if not self._is_current_patient_activation(activation_token, folder):
+            return False
+        if self.pending_patient_activation_prepare_token != activation_token:
+            return False
+        if self.pending_patient_activation_prepare_error:
+            return self._handle_patient_activation_failure(
+                activation_token=activation_token,
+                folder=folder,
+                constraints_path=constraints_path,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
+                timing_entries=timing_entries,
+                overall_start=overall_start,
+                error=RuntimeError(self.pending_patient_activation_prepare_error),
+            )
+        if self.pending_patient_activation_prepare_result is None:
+            QtCore.QTimer.singleShot(
+                self.get_patient_activation_step_delay_ms(),
+                lambda: self._continue_patient_activation_when_ready(
+                    activation_token=activation_token,
+                    folder=folder,
+                    patient_list_index=patient_list_index,
+                    constraints_path=constraints_path,
+                    rtstruct_path=rtstruct_path,
+                    rtdose_paths=rtdose_paths,
+                    timing_entries=timing_entries,
+                    overall_start=overall_start,
+                ),
+            )
+            return True
+
+        prepared_activation = self.pending_patient_activation_prepare_result
+        self.pending_patient_activation_prepare_request_id = None
+        self.pending_patient_activation_prepare_token = None
+        self.pending_patient_activation_prepare_result = None
+        self.pending_patient_activation_prepare_error = None
+        return self._start_chunked_patient_folder_activation(
+            activation_token=activation_token,
+            folder=folder,
+            patient_list_index=patient_list_index,
+            constraints_path=constraints_path,
+            rtstruct_path=rtstruct_path,
+            rtdose_paths=rtdose_paths,
+            timing_entries=timing_entries,
+            overall_start=overall_start,
+            activation_preparation=prepared_activation,
+        )
+
+    def _run_patient_activation_step_sequence(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        steps: List[Callable[[], None]],
+        constraints_path: Optional[str],
+        rtstruct_path: Optional[str],
+        rtdose_paths: List[str],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        overall_start: float,
+    ) -> bool:
+        if not self._is_current_patient_activation(activation_token, folder):
+            return False
+        if not steps:
+            return True
+        step = steps[0]
+        remaining_steps = steps[1:]
+        try:
+            step()
+        except Exception as error:
+            return self._handle_patient_activation_failure(
+                activation_token=activation_token,
+                folder=folder,
+                constraints_path=constraints_path,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
+                timing_entries=timing_entries,
+                overall_start=overall_start,
+                error=error,
+            )
+        if remaining_steps:
+            self.pump_viewer_ui()
+            QtCore.QTimer.singleShot(
+                self.get_patient_activation_step_delay_ms(),
+                lambda: self._run_patient_activation_step_sequence(
+                    activation_token=activation_token,
+                    folder=folder,
+                    steps=remaining_steps,
+                    constraints_path=constraints_path,
+                    rtstruct_path=rtstruct_path,
+                    rtdose_paths=rtdose_paths,
+                    timing_entries=timing_entries,
+                    overall_start=overall_start,
+                ),
+            )
+        return True
+
+    def _start_chunked_patient_folder_activation(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        patient_list_index: Optional[int],
+        constraints_path: Optional[str],
+        rtstruct_path: Optional[str],
+        rtdose_paths: List[str],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        overall_start: float,
+        activation_preparation: PatientActivationPreparationPayload,
+    ) -> bool:
+        if not self._is_current_patient_activation(activation_token, folder):
+            return False
+
+        cache_info = get_review_cache_availability(
+            dvh_can_start=self.ct is not None and self.dose is not None and self.rtstruct is not None,
+            cache_path=self.get_dvh_cache_path(),
+            derived_array_cache_path=self.get_derived_array_cache_path(),
+        )
+        state: Dict[str, object] = {
+            "cache_info": cache_info,
+            "cache_loaded": activation_preparation.cache_loaded,
+            "cache_load_duration": activation_preparation.cache_load_duration,
+            "used_preloaded_review_cache": activation_preparation.used_preloaded_review_cache,
+            "prepared_review_cache_state": activation_preparation.prepared_review_cache_state,
+        }
+
+        def step_prepare_status() -> None:
+            self.defer_sidebar_summary_metrics = False
+
+            if self.rtstruct is None or self.ct is None:
+                return
+
+            if not bool(state["cache_loaded"]):
+                cache_info = state["cache_info"]
+                if cache_info.cache_found:
+                    self.show_progress_status("Saved JSON cache found but not usable; recalculating", pump_events=False)
+                elif cache_info.derived_sidecar_only:
+                    self.show_progress_status("Using derived cache only; recalculating review state", pump_events=False)
+                self.show_progress_status("Computing metrics", pump_events=False)
+
+        def step_populate_structures() -> None:
+            if self.rtstruct is not None and self.ct is not None:
+                self.populate_structures_list()
+
+        def step_refresh_axial_final() -> None:
+            if self.ct is None:
+                return
+            stage_start = perf_counter()
+            self.update_display()
+            self.apply_image_based_view_ranges()
+            timing_entries.append(("Refresh axial view (final)", perf_counter() - stage_start))
+
+        def step_apply_prepared_cache() -> None:
+            prepared_state = state["prepared_review_cache_state"]
+            if prepared_state is not None:
+                self.apply_prepared_review_cache_state(prepared_state, refresh_ui=False)
+
+        def step_render_cached_dvh() -> None:
+            if self.rtstruct is not None and self.ct is not None and bool(state["cache_loaded"]):
+                self.render_dvh_plot()
+                if self.dvh_curves:
+                    self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
+                else:
+                    self.dvh_status_label.setText("Saved DVH cache contained no curves.")
+                self.update_dvh_cache_button()
+                if bool(state["used_preloaded_review_cache"]):
+                    self.show_progress_status("Loaded preloaded saved JSON cache")
+                else:
+                    self.show_progress_status("Loaded saved JSON cache")
+
+        def step_schedule_orthogonal_refresh() -> None:
+            if self.ct is not None:
+                self.schedule_deferred_patient_view_refresh(
+                    timing_entries=timing_entries,
+                    folder=folder,
+                )
+
+        def step_record_timing() -> None:
+            timing_entries.append(("Load saved DVH cache", state["cache_load_duration"]))
+            if not bool(state["cache_loaded"]):
+                cache_info = state["cache_info"]
+                timing_entries.append(("Compute DVH (background)" if cache_info.dvh_can_start else "Compute DVH", None))
+            timing_entries.append(("Total patient load to interactive review", perf_counter() - overall_start))
+
+        def step_finish() -> None:
+            self._finish_patient_activation_success(
+                activation_token=activation_token,
+                folder=folder,
+                patient_list_index=patient_list_index,
+                constraints_path=constraints_path,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
+                timing_entries=timing_entries,
+                cache_info=state["cache_info"],
+                cache_loaded=bool(state["cache_loaded"]),
+            )
+
+        return self._run_patient_activation_step_sequence(
+            activation_token=activation_token,
+            folder=folder,
+            steps=[
+                step_prepare_status,
+                step_apply_prepared_cache,
+                step_populate_structures,
+                step_refresh_axial_final,
+                step_render_cached_dvh,
+                step_schedule_orthogonal_refresh,
+                step_record_timing,
+                step_finish,
+            ],
+            constraints_path=constraints_path,
+            rtstruct_path=rtstruct_path,
+            rtdose_paths=rtdose_paths,
+            timing_entries=timing_entries,
+            overall_start=overall_start,
+        )
+
+    def _complete_patient_folder_activation(
+        self,
+        *,
+        activation_token: int,
+        folder: str,
+        patient_list_index: Optional[int],
+        payload: PatientPreloadPayload,
+        constraints_path: Optional[str],
+        rtstruct_path: Optional[str],
+        rtdose_paths: List[str],
+        derived_array_cache_path: Optional[Path],
+        timing_entries: List[Tuple[str, Optional[float]]],
+        overall_start: float,
+        fast_activate: bool,
+    ) -> bool:
+        if not self._is_current_patient_activation(activation_token, folder):
+            return False
+
+        try:
+            cache_info, cache_loaded, cache_load_duration, used_preloaded_review_cache = self._load_saved_review_cache_if_available(
+                derived_array_cache_path=derived_array_cache_path,
+                preloaded_review_cache_data=payload.review_cache_data,
+            )
+            self._finalize_patient_load_interactive_state(
+                cache_info=cache_info,
+                cache_loaded=cache_loaded,
+                cache_load_duration=cache_load_duration,
+                used_preloaded_review_cache=used_preloaded_review_cache,
+                fast_activate=fast_activate,
+                patient_folder=folder,
+                timing_entries=timing_entries,
+                overall_start=overall_start,
+            )
+            return self._finish_patient_activation_success(
+                activation_token=activation_token,
+                folder=folder,
+                patient_list_index=patient_list_index,
+                constraints_path=constraints_path,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
+                timing_entries=timing_entries,
+                cache_info=cache_info,
+                cache_loaded=cache_loaded,
+            )
+        except Exception as e:
+            return self._handle_patient_activation_failure(
+                activation_token=activation_token,
+                folder=folder,
+                constraints_path=constraints_path,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
+                timing_entries=timing_entries,
+                overall_start=overall_start,
+                error=e,
+            )
+        finally:
+            self.set_patient_activation_ui_locked(False)
             self.set_heavy_view_updates_enabled(True)
+
+    def on_load_patient_folder(self):
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Patient Folder")
+        if not folder:
+            return
+        self.clear_patient_queue_state()
+        self.load_patient_folder_path(folder)
 
     def on_reset_view(self):
         if not self.apply_image_based_view_ranges():
@@ -1360,6 +2576,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.fit_dvh_view_to_visible_curves()
 
     def on_clear_patient_session(self):
+        self.clear_patient_queue_state()
         self.clear_patient_session_state()
 
     def ensure_structure_filter_dialog(self) -> QtWidgets.QDialog:
@@ -1628,8 +2845,60 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         for edit in self.isodose_edit_widgets:
             edit.setEnabled(not locked)
         self.load_patient_action.setEnabled(not locked)
+        self.load_patient_list_action.setEnabled(not locked)
+        self.patient_list_combo.setEnabled((not locked) and bool(self.patient_list_folders))
+        self.next_patient_button.setEnabled((not locked) and self.preload_matches_next_patient())
         self.reset_view_action.setEnabled(not locked)
         self.tabs.tabBar().setEnabled(not locked)
+
+    def set_patient_activation_ui_locked(self, locked: bool) -> None:
+        if self.patient_activation_ui_locked == locked:
+            return
+        self.patient_activation_ui_locked = locked
+
+        self.set_view_interaction_enabled(not locked)
+        self.autoscroll_button.setEnabled(not locked)
+        self.autoscroll_slower_button.setEnabled(not locked)
+        self.autoscroll_faster_button.setEnabled(not locked)
+        self.axial_structure_list.set_enabled(not locked)
+        self.dvh_structure_list.set_enabled(not locked)
+        self.clear_dvh_structures_button.setEnabled(not locked)
+        self.slice_prev_button.setEnabled(not locked)
+        self.slice_slider.setEnabled(not locked)
+        self.slice_next_button.setEnabled(not locked)
+        self.window_level_slider.setEnabled(not locked)
+        self.reset_window_level_button.setEnabled(not locked)
+        self.dose_opacity_slider.setEnabled((not locked) and self.dose is not None)
+        self.dose_toggle_button.setEnabled((not locked) and self.dose is not None)
+        self.max_dose_button.setEnabled((not locked) and self.sampled_dose_volume_ct is not None)
+        self.dose_range_slider.setEnabled((not locked) and self.dose is not None)
+        self.dose_min_edit.setEnabled((not locked) and self.dose is not None)
+        self.dose_max_edit.setEnabled((not locked) and self.dose is not None)
+        for edit in self.isodose_edit_widgets:
+            edit.setEnabled(not locked)
+        self.load_patient_action.setEnabled(not locked)
+        self.load_patient_list_action.setEnabled(not locked)
+        self.patient_list_combo.setEnabled((not locked) and bool(self.patient_list_folders))
+        self.next_patient_button.setEnabled((not locked) and self.preload_matches_next_patient())
+        self.reset_view_action.setEnabled(not locked)
+        self.tabs.tabBar().setEnabled(not locked)
+        self.constraint_sheet_combo.setEnabled((not locked) and bool(self.available_constraint_sheet_names))
+        self.add_constraint_button.setEnabled((not locked) and self.rtstruct is not None)
+        self.constraints_table.setEnabled(not locked)
+        self.targets_table.setEnabled(not locked)
+        self.save_cache_action.setEnabled((not locked) and self.current_patient_folder is not None and bool(self.dvh_curves))
+        self.print_report_action.setEnabled((not locked) and self.current_patient_folder is not None and self.rtstruct is not None)
+        self.structure_filter_action.setEnabled((not locked) and self.rtstruct is not None and bool(self.get_filterable_structure_entries()))
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            if locked:
+                if app.overrideCursor() is None:
+                    app.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+            elif app.overrideCursor() is not None:
+                app.restoreOverrideCursor()
+        if not locked and self.autoscroll_button.isChecked():
+            self.set_autoscroll_ui_locked(True)
 
     def finish_autoscroll_ui(self, clear_checked_state: bool):
         self.autoscroll_timer.stop()
@@ -2245,6 +3514,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         target_rows = self.get_target_table_rows()
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         derived_array_cache_path = self.get_derived_array_cache_path(path)
+        screenshot_path = self.get_review_screenshot_path(path)
+        movie_path = self.get_review_movie_path(path)
         payload = build_review_cache_payload(
             selected_constraint_set=selected_constraint_set,
             constraints_file_name=Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
@@ -2274,14 +3545,59 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         write_json_atomic(path, payload)
 
-        if derived_array_cache_path is None:
-            return None
+        warnings: List[str] = []
 
+        if screenshot_path is not None:
+            screenshot_warning = self.save_review_screenshot(screenshot_path)
+            if screenshot_warning:
+                warnings.append(screenshot_warning)
+
+        if movie_path is not None:
+            movie_warning = self.save_review_movie(movie_path)
+            if movie_warning:
+                warnings.append(movie_warning)
+
+        if derived_array_cache_path is not None:
+            try:
+                self.save_derived_array_cache(derived_array_cache_path)
+            except Exception as exc:
+                logger.warning("Saved JSON review cache but failed to save derived array cache: %s", exc)
+                warnings.append(f"Failed to save the derived array cache: {exc}")
+
+        if warnings:
+            return "Saved review data, but " + " ".join(warnings)
+        return None
+
+    def get_review_screenshot_path(self, base_path: Optional[Path] = None) -> Optional[Path]:
+        cache_path = base_path if base_path is not None else self.get_dvh_cache_path()
+        if cache_path is None:
+            return None
+        return cache_path.with_name(f"{cache_path.stem}_screenshot.png")
+
+    def save_review_screenshot(self, path: Path) -> Optional[str]:
+        self.pump_viewer_ui()
+        source_widget = getattr(self, "axial_tab_widget", getattr(self, "viewer_widget", self))
+        pixmap = source_widget.grab()
+        if pixmap.isNull():
+            return "failed to save the review screenshot."
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
+        temp_path = Path(temp_path_str)
         try:
-            self.save_derived_array_cache(derived_array_cache_path)
+            try:
+                Path(temp_path).unlink()
+            except OSError:
+                pass
+            if not pixmap.save(str(temp_path), "PNG"):
+                return "failed to save the review screenshot."
+            temp_path.replace(path)
         except Exception as exc:
-            logger.warning("Saved JSON review cache but failed to save derived array cache: %s", exc)
-            return f"Saved review data, but failed to save the derived array cache: {exc}"
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            logger.warning("Saved JSON review cache but failed to save screenshot: %s", exc)
+            return f"failed to save the review screenshot: {exc}"
         return None
 
     def build_max_tissue_payload(self) -> Optional[Dict[str, object]]:
@@ -2367,126 +3683,37 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return False
         return self.load_derived_array_cache(cache_path)
 
-    def load_saved_dvh_cache(self, path: Path, *, refresh_ui: bool = True) -> bool:
+    def prepare_saved_review_cache_data(
+        self,
+        loaded_cache: ReviewCacheFileData,
+    ) -> Optional[PreparedReviewCacheState]:
         if self.rtstruct is None:
-            return False
-        loaded_cache = load_review_cache_file(path)
-        if loaded_cache is None:
-            return False
-        payload = loaded_cache.payload
-        cache_version = loaded_cache.cache_version
+            return None
+        return prepare_review_cache_state(
+            loaded_cache,
+            expected_structure_names=[structure.name for structure in self.rtstruct.structures],
+            available_constraint_sheet_names=self.available_constraint_sheet_names,
+            no_constraints_sheet_label=NO_CONSTRAINTS_SHEET_LABEL,
+            constraints_sheet_name=self.constraints_sheet_name,
+            structure_filter_csv_path=self.structure_filter_csv_path,
+            rtstruct_path=self.rtstruct_path,
+            rtdose_paths=self.latest_timing_rtdose_paths,
+            rtplan_paths=self.current_rtplan_paths,
+            dvh_mode=self.get_dvh_mode(),
+            dvh_method_signature=get_dvh_method_signature(),
+            target_method_signature=self.get_target_method_signature(),
+            has_ct=self.ct is not None,
+            has_dose=self.dose is not None,
+            is_base_listable_structure_name=self.is_base_listable_structure_name,
+        )
 
-        expected_names = [normalize_structure_name(structure.name) for structure in self.rtstruct.structures]
-        expected_name_set = set(expected_names)
-        saved_names = [normalize_structure_name(str(name)) for name in payload.get("structure_names", [])]
-        saved_name_set = set(saved_names)
-        saved_selected_names = [
-            normalize_structure_name(str(name))
-            for name in payload.get("dvh_structure_names", [])
-        ]
-        saved_selected_name_set = set(saved_selected_names)
-        if not saved_selected_names:
-            saved_selected_names = [
-                normalize_structure_name(str(curve_payload.get("name", "")))
-                for curve_payload in payload.get("curves", [])
-                if isinstance(curve_payload, dict)
-            ]
-            saved_selected_name_set = set(saved_selected_names)
-
-        if saved_names:
-            if saved_name_set == expected_name_set:
-                pass
-            elif saved_name_set == saved_selected_name_set and saved_name_set.issubset(expected_name_set):
-                # Backward compatibility: older caches stored only the DVH-calculated
-                # structures in structure_names before the app started loading every
-                # RTSTRUCT entry into the sidebar.
-                pass
-            else:
-                return False
-
-        if not saved_selected_name_set.issubset(expected_name_set):
-            return False
-
-        saved_constraint_set = payload.get("selected_constraint_set", payload.get("constraints_sheet"))
-        if saved_constraint_set == NO_CONSTRAINTS_SHEET_LABEL:
-            saved_constraints_sheet = None
-        elif saved_constraint_set in {None, ""}:
-            saved_constraints_sheet = payload.get("constraints_sheet")
-        else:
-            saved_constraints_sheet = str(saved_constraint_set)
-
-        if saved_constraints_sheet is not None and saved_constraints_sheet not in self.available_constraint_sheet_names:
-            return False
-
-        saved_csv_fingerprint = payload.get("constraints_fingerprint", payload.get("csv_fingerprint"))
-        if saved_csv_fingerprint is not None:
-            if not file_fingerprint_matches(saved_csv_fingerprint, self.structure_filter_csv_path):
-                return False
-
-        saved_csv_name = payload.get("constraints_file", payload.get("csv_file"))
-        current_csv_name = Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None
-        if saved_csv_fingerprint is None and saved_csv_name not in {None, current_csv_name}:
-            return False
-
-        saved_rtstruct_fingerprint = payload.get("rtstruct_fingerprint")
-        if saved_rtstruct_fingerprint is not None:
-            if not file_fingerprint_matches(saved_rtstruct_fingerprint, self.rtstruct_path):
-                return False
-
-        saved_rtstruct_name = payload.get("rtstruct_file")
-        current_rtstruct_name = Path(self.rtstruct_path).name if self.rtstruct_path else None
-        if saved_rtstruct_fingerprint is None and saved_rtstruct_name not in {None, current_rtstruct_name}:
-            return False
-
-        saved_rtdose_fingerprints = payload.get("rtdose_fingerprints")
-        if saved_rtdose_fingerprints is not None and not file_fingerprint_list_matches(
-            saved_rtdose_fingerprints,
-            self.latest_timing_rtdose_paths,
-        ):
-            return False
-
-        saved_rtplan_fingerprints = payload.get("rtplan_fingerprints")
-        if saved_rtplan_fingerprints is not None and not file_fingerprint_list_matches(
-            saved_rtplan_fingerprints,
-            self.current_rtplan_paths,
-        ):
-            return False
-
-        saved_dvh_mode = payload.get("dvh_mode")
-        if saved_dvh_mode not in {None, self.get_dvh_mode()}:
-            return False
-
-        notes_payload = payload.get("constraint_notes", {})
-        if not isinstance(notes_payload, dict):
-            return False
-        target_notes_payload = payload.get("target_notes", {})
-        if target_notes_payload is None:
-            target_notes_payload = {}
-        if not isinstance(target_notes_payload, dict):
-            return False
-        custom_constraints = self.deserialize_structure_goals(payload.get("custom_constraints"))
-        if custom_constraints is None:
-            return False
-        stereotactic_dose_payload = payload.get("stereotactic_target_doses", {})
-        if stereotactic_dose_payload is None:
-            stereotactic_dose_payload = {}
-        if not isinstance(stereotactic_dose_payload, dict):
-            return False
-        hidden_structure_payload = payload.get("hidden_structure_names", [])
-        if hidden_structure_payload is None:
-            hidden_structure_payload = []
-        if not isinstance(hidden_structure_payload, list):
-            return False
-        additional_target_subvolume_payload = payload.get("additional_target_subvolume_names", [])
-        if additional_target_subvolume_payload is None:
-            additional_target_subvolume_payload = []
-        if not isinstance(additional_target_subvolume_payload, list):
-            return False
-        target_table_rows = self.deserialize_target_table_rows(payload.get("target_table_rows"))
-        max_tissue_payload = payload.get("max_tissue")
-        if max_tissue_payload is not None and not isinstance(max_tissue_payload, dict):
-            return False
-
+    def apply_prepared_review_cache_state(
+        self,
+        prepared_state: PreparedReviewCacheState,
+        *,
+        refresh_ui: bool = True,
+    ) -> bool:
+        saved_constraints_sheet = prepared_state.selected_constraint_sheet
         if saved_constraints_sheet != self.constraints_sheet_name:
             self.refresh_constraint_sheet_combo(
                 preferred_sheet_name=saved_constraints_sheet or NO_CONSTRAINTS_SHEET_LABEL
@@ -2497,94 +3724,33 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 refresh_dvh=False,
             )
 
-        self.custom_structure_goals_by_name = custom_constraints
+        self.custom_structure_goals_by_name = prepared_state.custom_constraints
         self.rebuild_structure_goals_by_name()
-        self.stereotactic_target_dose_text_by_name = {
-            normalize_structure_name(str(name)): str(value).strip()
-            for name, value in stereotactic_dose_payload.items()
-            if normalize_structure_name(str(name))
-        }
-        self.hidden_structure_names = {
-            normalize_structure_name(str(name))
-            for name in hidden_structure_payload
-            if self.is_base_listable_structure_name(normalize_structure_name(str(name)))
-        }
-        self.additional_target_subvolume_names = {
-            normalize_structure_name(str(name))
-            for name in additional_target_subvolume_payload
-            if self.is_base_listable_structure_name(normalize_structure_name(str(name)))
-            and not normalize_structure_name(str(name)).startswith("PTV")
-        }
-        self.constraint_notes = {str(key): str(value) for key, value in notes_payload.items() if str(value).strip()}
-        cleaned_target_notes = {
-            str(key): str(value)
-            for key, value in target_notes_payload.items()
-            if str(value).strip()
-        }
-        if target_table_rows is None:
-            self.target_notes = cleaned_target_notes
-        else:
-            self.target_notes = self.extract_manual_target_notes(
-                cleaned_target_notes,
-                target_table_rows,
-            )
-
-        saved_dvh_signature = payload.get("dvh_method_signature")
-        if saved_dvh_signature is not None and saved_dvh_signature != get_dvh_method_signature():
-            return False
-
-        saved_target_signature = payload.get("target_method_signature")
-        if saved_target_signature is not None and saved_target_signature != self.get_target_method_signature():
-            return False
-
-        if target_table_rows is None:
-            return False
-
-        goal_evaluations = self.deserialize_goal_evaluations(payload.get("goal_evaluations"))
-        if goal_evaluations is None:
-            return False
-
-        try:
-            curves = [self.deserialize_dvh_curve(curve_payload) for curve_payload in payload.get("curves", [])]
-        except (TypeError, ValueError):
-            return False
-
-        self.dvh_curves = curves
-        if isinstance(max_tissue_payload, dict):
-            dose_value = max_tissue_payload.get("dose_gy")
-            try:
-                self.max_tissue_dose_gy_cache = float(dose_value) if dose_value is not None else None
-            except (TypeError, ValueError):
-                self.max_tissue_dose_gy_cache = None
-            index_payload = max_tissue_payload.get("index_zyx")
-            if isinstance(index_payload, list) and len(index_payload) == 3:
-                try:
-                    self.max_tissue_index_zyx = tuple(int(value) for value in index_payload)
-                except (TypeError, ValueError):
-                    self.max_tissue_index_zyx = None
-            else:
-                self.max_tissue_index_zyx = None
-        else:
-            self.max_tissue_dose_gy_cache = None
-            self.max_tissue_index_zyx = None
+        self.stereotactic_target_dose_text_by_name = dict(prepared_state.stereotactic_target_doses)
+        self.hidden_structure_names = set(prepared_state.hidden_structure_names)
+        self.additional_target_subvolume_names = set(prepared_state.additional_target_subvolume_names)
+        self.constraint_notes = dict(prepared_state.constraint_notes)
+        self.target_notes = self.extract_manual_target_notes(
+            dict(prepared_state.target_notes_payload),
+            prepared_state.target_table_rows,
+        )
+        self.dvh_curves = list(prepared_state.curves)
+        self.max_tissue_dose_gy_cache = prepared_state.max_tissue_dose_gy
+        self.max_tissue_index_zyx = prepared_state.max_tissue_index_zyx
         self.structure_mask_cache = None
         self.structure_mask_cache_names = []
         self.dvh_request_structure_names = {}
-        target_signature_matches = saved_target_signature is not None or cache_version >= 11
-        use_cached_target_rows = target_signature_matches and not self.target_table_rows_require_recompute(
-            target_table_rows
-        )
-        self.cached_target_table_rows = target_table_rows if use_cached_target_rows else None
+        self.cached_target_table_rows = prepared_state.cached_target_table_rows
         self.update_dvh_secondary_metric_caches()
-        if saved_selected_names:
+        if prepared_state.saved_selected_names:
             if refresh_ui:
-                self.dvh_structure_list.set_checked_names(saved_selected_names)
+                self.dvh_structure_list.set_checked_names(prepared_state.saved_selected_names)
             else:
-                self.pending_saved_dvh_selected_names = list(saved_selected_names)
+                self.pending_saved_dvh_selected_names = list(prepared_state.saved_selected_names)
         else:
             self.pending_saved_dvh_selected_names = None
-        self.refresh_visible_structure_goal_evaluations(precomputed=goal_evaluations or None)
-        self.update_dvh_goal_evaluation_cache(goal_evaluations or None)
+        self.refresh_visible_structure_goal_evaluations(precomputed=prepared_state.goal_evaluations or None)
+        self.update_dvh_goal_evaluation_cache(prepared_state.goal_evaluations or None)
         if refresh_ui:
             self.update_structure_list_goal_texts()
             self.render_dvh_plot()
@@ -2594,6 +3760,23 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.dvh_status_label.setText("Saved DVH cache contained no curves.")
             self.update_dvh_cache_button()
         return True
+
+    def load_saved_review_cache_data(
+        self,
+        loaded_cache: ReviewCacheFileData,
+        *,
+        refresh_ui: bool = True,
+    ) -> bool:
+        prepared_state = self.prepare_saved_review_cache_data(loaded_cache)
+        if prepared_state is None:
+            return False
+        return self.apply_prepared_review_cache_state(prepared_state, refresh_ui=refresh_ui)
+
+    def load_saved_dvh_cache(self, path: Path, *, refresh_ui: bool = True) -> bool:
+        loaded_cache = load_review_cache_file(path)
+        if loaded_cache is None:
+            return False
+        return self.load_saved_review_cache_data(loaded_cache, refresh_ui=refresh_ui)
 
     def try_load_saved_dvh_cache(self, *, refresh_ui: bool = True) -> bool:
         cache_path = self.get_dvh_cache_path()
@@ -5055,6 +6238,10 @@ h2 {{
         self.update_targets_table_column_widths()
         self.update_axial_overlay_positions()
 
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        self.stop_patient_activation_movie()
+        super().closeEvent(event)
+
     def get_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
         goals = self.structure_goals_by_name.get(normalized_name, [])
         if not goals:
@@ -5232,7 +6419,7 @@ h2 {{
             frame_of_reference_uid=self.rtstruct.frame_of_reference_uid,
         )
 
-    def build_axial_list_rtstruct(self) -> Optional[RTStructData]:
+    def build_axial_list_rtstruct(self, *, include_max_tissue: bool = True) -> Optional[RTStructData]:
         listable_rtstruct = self.build_listable_rtstruct()
         if listable_rtstruct is None:
             return None
@@ -5249,7 +6436,7 @@ h2 {{
         ]
 
         structures: List[StructureSliceContours] = list(ptv_structures)
-        if self.get_max_tissue_dose_goal_lines():
+        if include_max_tissue and self.get_max_tissue_dose_goal_lines():
             structures.append(
                 StructureSliceContours(
                     name=MAX_TISSUE_ROW_LABEL,
@@ -5263,12 +6450,15 @@ h2 {{
             frame_of_reference_uid=listable_rtstruct.frame_of_reference_uid,
         )
 
-    def populate_structures_list(self):
-        axial_list_rtstruct = self.build_axial_list_rtstruct()
+    def populate_structure_sidebars(self, *, quick_mode: bool = False) -> None:
+        axial_list_rtstruct = self.build_axial_list_rtstruct(include_max_tissue=not quick_mode)
         listable_rtstruct = self.build_listable_rtstruct()
+        axial_goal_lines_getter = self.get_axial_structure_goal_lines if not quick_mode else (lambda _normalized_name: [])
+        dvh_goal_lines_getter = self.get_dvh_structure_goal_lines if not quick_mode else (lambda _normalized_name: [])
+        dvh_item_options_getter = self.get_dvh_structure_item_options if not quick_mode else (lambda _normalized_name: {})
         self.axial_structure_list.set_structures(
             axial_list_rtstruct,
-            self.get_axial_structure_goal_lines,
+            axial_goal_lines_getter,
             default_visibility_resolver=lambda normalized_name: normalized_name.startswith("PTV"),
             show_checkbox_resolver=lambda normalized_name: normalized_name != MAX_TISSUE_ROW_NAME,
             item_options_getter=lambda normalized_name: (
@@ -5284,16 +6474,19 @@ h2 {{
         )
         self.dvh_structure_list.set_structures(
             listable_rtstruct,
-            self.get_dvh_structure_goal_lines,
+            dvh_goal_lines_getter,
             default_visibility_resolver=lambda normalized_name: (
                 normalized_name.startswith("PTV")
                 or normalized_name in self.structure_goals_by_name
             ),
-            item_options_getter=self.get_dvh_structure_item_options,
+            item_options_getter=dvh_item_options_getter,
         )
         if self.pending_saved_dvh_selected_names:
             self.dvh_structure_list.set_checked_names(self.pending_saved_dvh_selected_names)
             self.pending_saved_dvh_selected_names = None
+
+    def populate_structures_list(self):
+        self.populate_structure_sidebars()
         self.update_constraints_table()
         self.update_targets_table()
 
@@ -5567,8 +6760,10 @@ h2 {{
             return
         if self.ct is None:
             self.axial_readout_label.hide()
+            self.update_patient_activation_overlay_positions()
             return
         self.axial_readout_label.move(*overlay_positions.readout_pos)
+        self.update_patient_activation_overlay_positions()
 
     def on_mouse_moved(self, pos):
         if self.ct is None or self.autoscroll_button.isChecked():
