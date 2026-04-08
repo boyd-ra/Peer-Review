@@ -758,6 +758,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         axial_widget = pg.GraphicsLayoutWidget()
         self.axial_graphics_widget = axial_widget
+        self.axial_overlay_host = axial_widget.viewport()
         self.axial_view = axial_widget.addViewBox(lockAspect=True, invertY=True)
         self.axial_view.setMenuEnabled(False)
         self.axial_view.enableAutoRange()
@@ -775,7 +776,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.crosshair_text = pg.TextItem(anchor=(1, 0))
         self.axial_view.addItem(self.crosshair_text)
         self.crosshair_text.hide()
-        self.axial_readout_label = QtWidgets.QLabel(axial_widget)
+        self.axial_readout_label = QtWidgets.QLabel(self.axial_overlay_host)
         self.axial_readout_label.setStyleSheet(
             "QLabel { background-color: rgba(0, 0, 0, 210); color: white; "
             "padding: 3px 7px; border-radius: 4px; font-size: 11px; }"
@@ -785,7 +786,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         self.axial_readout_label.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.axial_readout_label.hide()
-        self.axial_autoscroll_overlay = QtWidgets.QWidget(axial_widget)
+        self.axial_autoscroll_overlay = QtWidgets.QWidget(self.axial_overlay_host)
         self.axial_autoscroll_overlay.setStyleSheet(
             "QWidget { background-color: rgba(0, 0, 0, 210); border-radius: 4px; }"
         )
@@ -6856,19 +6857,24 @@ h2 {{
         if hasattr(self, "axial_readout_label"):
             self.axial_readout_label.adjustSize()
         readout_width = self.axial_readout_label.width() if hasattr(self, "axial_readout_label") else 0
+        overlay_host_width = self.axial_graphics_widget.width()
+        if hasattr(self, "axial_overlay_host") and self.axial_overlay_host is not None:
+            overlay_host_width = self.axial_overlay_host.width()
         overlay_positions = build_axial_overlay_positions(
-            self.axial_graphics_widget.width(),
+            overlay_host_width,
             readout_width,
             margin=margin,
         )
         if hasattr(self, "axial_autoscroll_overlay"):
             self.axial_autoscroll_overlay.move(*overlay_positions.autoscroll_pos)
+            self.axial_autoscroll_overlay.raise_()
         if not hasattr(self, "axial_readout_label"):
             return
         if self.ct is None:
             self.axial_readout_label.hide()
             return
         self.axial_readout_label.move(*overlay_positions.readout_pos)
+        self.axial_readout_label.raise_()
 
     def on_mouse_moved(self, pos):
         if self.ct is None or self.autoscroll_button.isChecked():
