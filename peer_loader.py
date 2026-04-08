@@ -574,6 +574,7 @@ def prepare_patient_preload_payload(
     *,
     array_cache_signature: Dict[str, str],
     progress_callback: Optional[Callable[[str], None]] = None,
+    patient_plan_callback: Optional[Callable[[Optional[List[str]]], None]] = None,
     include_precomputed_view_state: bool = False,
 ) -> PatientPreloadPayload:
     timing_entries: List[Tuple[str, Optional[float]]] = []
@@ -584,6 +585,8 @@ def prepare_patient_preload_payload(
     rtdose_paths = list(patient_discovery.rtdose_paths)
     rtplan_paths = list(patient_discovery.rtplan_paths)
     timing_entries.append(("CT scan/load + file discovery", perf_counter() - stage_start))
+    if patient_plan_callback is not None:
+        patient_plan_callback(patient_discovery.patient_plan_lines)
 
     stage_start = perf_counter()
     image_view_bounds = compute_image_view_bounds(ct)

@@ -473,7 +473,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             (50, 205, 50),
             (255, 140, 0),
         ]
-        self.autoscroll_interval_step_ms = 20
+        self.autoscroll_default_speed_mm_per_s = 7.5
+        self.autoscroll_speed_step_mm_per_s = 2.5
         self.autoscroll_interval_min_ms = 30
         self.autoscroll_interval_max_ms = 400
         self.autoscroll_timer = QtCore.QTimer(self)
@@ -508,6 +509,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.statusBar().addWidget(self.progress_status_label, 1)
 
         self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setStyleSheet("QTabWidget::tab-bar { alignment: right; }")
+        self.tabs.tabBar().setExpanding(False)
         root.addWidget(self.tabs)
 
         constraints_tab = QtWidgets.QWidget()
@@ -670,8 +673,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structures_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.structures_list.setSpacing(1)
         self.patient_name_label = QtWidgets.QLabel("")
-        self.patient_name_label.setWordWrap(True)
-        self.patient_name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.patient_name_label.setWordWrap(False)
+        self.patient_name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.patient_name_label.setMargin(2)
         patient_name_font = self.patient_name_label.font()
         patient_name_font.setPointSize(patient_name_font.pointSize() + 1)
@@ -683,25 +686,28 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
         self.patient_name_label.setVisible(False)
         self.patient_plan_label = QtWidgets.QLabel("")
-        self.patient_plan_label.setWordWrap(True)
-        self.patient_plan_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+        self.patient_plan_label.setWordWrap(False)
+        self.patient_plan_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.patient_plan_label.setMargin(2)
         self.patient_plan_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
         self.patient_plan_label.setVisible(False)
 
         self.patient_summary_widget = QtWidgets.QWidget()
-        patient_summary_layout = QtWidgets.QVBoxLayout(self.patient_summary_widget)
-        patient_summary_layout.setContentsMargins(0, 0, 0, 0)
-        patient_summary_layout.setSpacing(0)
+        patient_summary_layout = QtWidgets.QHBoxLayout(self.patient_summary_widget)
+        patient_summary_layout.setContentsMargins(6, 2, 12, 0)
+        patient_summary_layout.setSpacing(10)
         patient_summary_layout.addWidget(self.patient_name_label)
         patient_summary_layout.addWidget(self.patient_plan_label)
+        self.patient_summary_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.tabs.setCornerWidget(self.patient_summary_widget, QtCore.Qt.Corner.TopLeftCorner)
 
         self.axial_sidebar_widget = sidebar_widget
-        sidebar_layout.addWidget(self.patient_summary_widget)
-        sidebar_layout.addSpacing(10)
         sidebar_layout.addWidget(QtWidgets.QLabel("Structures"))
         sidebar_layout.addWidget(self.structures_list, 1)
         sidebar_widget.setMinimumWidth(280)
@@ -1572,14 +1578,13 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.ct = payload.ct
         self.plan_phases = list(payload.plan_phases)
         self.current_rtplan_paths = list(payload.rtplan_paths)
-        self.patient_plan_lines = tuple(payload.patient_plan_lines) if payload.patient_plan_lines is not None else None
+        self.set_patient_plan_lines(payload.patient_plan_lines, pump_events=True)
         self.image_view_bounds = payload.image_view_bounds
         self.rtstruct_path = payload.rtstruct_path
         self.rtstruct = payload.rtstruct
         self.dose = payload.dose
         self.sampled_dose_volume_ct = payload.sampled_dose_volume_ct
         self.latest_timing_rtdose_paths = list(payload.rtdose_paths)
-        self.update_patient_plan_label(pump_events=True)
 
         self.displayed_dose_plane = None
         self.structure_mask_cache = None
@@ -1587,6 +1592,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.max_dose_index_zyx = None
         self.current_row = self.ct.rows // 2
         self.current_col = self.ct.cols // 2
+        self.reset_autoscroll_speed()
         self.slice_slider.setRange(0, self.ct.volume_hu.shape[0] - 1)
         self.slice_slider.setValue(self.ct.volume_hu.shape[0] // 2)
         self.update_autoscroll_speed_label()
@@ -2028,6 +2034,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.clear_patient_session_state(quick_swap=fast_activate)
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
+            if preloaded_payload is not None and preloaded_payload.patient_plan_lines:
+                self.set_patient_plan_lines(preloaded_payload.patient_plan_lines, pump_events=True)
+            elif preloaded_payload is None:
+                self.try_stage_patient_plan_lines_from_cache(folder, pump_events=True)
             if preloaded_payload is None:
                 self.tabs.setCurrentWidget(self.axial_tab_widget)
                 self.start_patient_transition_overlay_process(folder)
@@ -2038,6 +2048,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     folder,
                     array_cache_signature=self.get_derived_array_cache_signature(),
                     progress_callback=lambda message: self.show_progress_status(message, pump_events=True),
+                    patient_plan_callback=lambda lines: self.set_patient_plan_lines(lines, pump_events=True),
                     include_precomputed_view_state=False,
                 )
             else:
@@ -2684,24 +2695,53 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def on_next_slice(self):
         self.step_slice(1)
 
-    def adjust_autoscroll_interval(self, delta_ms: int):
-        new_interval = int(
+    def get_autoscroll_slice_step_mm(self) -> Optional[float]:
+        if self.ct is None:
+            return None
+        z_positions = np.asarray(self.ct.z_positions_mm, dtype=float)
+        if z_positions.size < 2:
+            spacing_z = float(self.ct.spacing_xyz_mm[2])
+            return spacing_z if np.isfinite(spacing_z) and spacing_z > 0.0 else None
+        slice_steps_mm = np.abs(np.diff(z_positions))
+        slice_steps_mm = slice_steps_mm[np.isfinite(slice_steps_mm) & (slice_steps_mm > 0.0)]
+        if slice_steps_mm.size == 0:
+            spacing_z = float(self.ct.spacing_xyz_mm[2])
+            return spacing_z if np.isfinite(spacing_z) and spacing_z > 0.0 else None
+        return float(np.median(slice_steps_mm))
+
+    def set_autoscroll_speed_mm_per_s(self, target_speed_mm_per_s: float) -> None:
+        slice_step_mm = self.get_autoscroll_slice_step_mm()
+        if slice_step_mm is None or target_speed_mm_per_s <= 0.0:
+            return
+        target_interval_ms = int(round((slice_step_mm / float(target_speed_mm_per_s)) * 1000.0))
+        target_interval_ms = int(
             np.clip(
-                self.autoscroll_timer.interval() + delta_ms,
+                target_interval_ms,
                 self.autoscroll_interval_min_ms,
                 self.autoscroll_interval_max_ms,
             )
         )
-        self.autoscroll_timer.setInterval(new_interval)
+        self.autoscroll_timer.setInterval(target_interval_ms)
         self.update_autoscroll_speed_label()
         if self.autoscroll_button.isChecked():
             self.autoscroll_timer.start()
 
+    def reset_autoscroll_speed(self) -> None:
+        self.set_autoscroll_speed_mm_per_s(self.autoscroll_default_speed_mm_per_s)
+
+    def adjust_autoscroll_speed(self, delta_mm_per_s: float):
+        current_speed_mm_per_s = self.get_autoscroll_speed_mm_per_s()
+        if current_speed_mm_per_s is None:
+            self.reset_autoscroll_speed()
+            return
+        target_speed_mm_per_s = max(0.1, current_speed_mm_per_s + float(delta_mm_per_s))
+        self.set_autoscroll_speed_mm_per_s(target_speed_mm_per_s)
+
     def on_autoscroll_slower(self):
-        self.adjust_autoscroll_interval(self.autoscroll_interval_step_ms)
+        self.adjust_autoscroll_speed(-self.autoscroll_speed_step_mm_per_s)
 
     def on_autoscroll_faster(self):
-        self.adjust_autoscroll_interval(-self.autoscroll_interval_step_ms)
+        self.adjust_autoscroll_speed(self.autoscroll_speed_step_mm_per_s)
 
     def go_to_point(self, k: int, r: int, c: int):
         self.max_dose_index_zyx = (k, r, c)
@@ -3047,10 +3087,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
             self.patient_summary_widget.layout().activate()
             self.patient_summary_widget.updateGeometry()
-        if hasattr(self, "axial_sidebar_widget") and self.axial_sidebar_widget is not None:
-            self.axial_sidebar_widget.layout().activate()
-            self.axial_sidebar_widget.updateGeometry()
-            self.axial_sidebar_widget.repaint()
+        if hasattr(self, "tabs") and self.tabs is not None:
+            self.tabs.updateGeometry()
+            self.tabs.repaint()
+            self.tabs.tabBar().updateGeometry()
+            self.tabs.tabBar().repaint()
         if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
             self.patient_summary_widget.repaint()
         self.patient_name_label.repaint()
@@ -3059,8 +3100,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             QtCore.QCoreApplication.sendPostedEvents(self.patient_summary_widget, int(QtCore.QEvent.Type.Paint))
         QtCore.QCoreApplication.sendPostedEvents(self.patient_name_label, int(QtCore.QEvent.Type.Paint))
         QtCore.QCoreApplication.sendPostedEvents(self.patient_plan_label, int(QtCore.QEvent.Type.Paint))
-        if hasattr(self, "axial_sidebar_widget") and self.axial_sidebar_widget is not None:
-            QtCore.QCoreApplication.sendPostedEvents(self.axial_sidebar_widget, int(QtCore.QEvent.Type.Paint))
+        if hasattr(self, "tabs") and self.tabs is not None:
+            QtCore.QCoreApplication.sendPostedEvents(self.tabs, int(QtCore.QEvent.Type.Paint))
+            QtCore.QCoreApplication.sendPostedEvents(self.tabs.tabBar(), int(QtCore.QEvent.Type.Paint))
         if pump_events:
             app = QtWidgets.QApplication.instance()
             if app is not None:
@@ -3074,15 +3116,52 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.patient_plan_label.clear()
             self.patient_plan_label.setFixedHeight(0)
             self.patient_plan_label.setVisible(False)
+            self.patient_summary_widget.setVisible(False)
             return
 
         patient_name = str(self.patient_plan_lines[0]).strip()
-        details_text = "\n".join(str(line) for line in self.patient_plan_lines[1:])
+        detail_parts = [
+            str(line).strip()
+            for line in self.patient_plan_lines[1:]
+            if str(line).strip()
+        ]
+        if not detail_parts:
+            details_text = ""
+        elif len(detail_parts) == 1:
+            details_text = detail_parts[0]
+        else:
+            details_text = detail_parts[0] + (" " * 10) + " | ".join(detail_parts[1:])
         self.patient_name_label.setText(patient_name)
         self.patient_name_label.setVisible(bool(patient_name))
         self.patient_plan_label.setText(details_text)
         self.patient_plan_label.setVisible(bool(details_text))
+        self.patient_summary_widget.setVisible(bool(patient_name or details_text))
         self.refresh_patient_plan_label_layout(pump_events=pump_events)
+
+    def set_patient_plan_lines(
+        self,
+        patient_plan_lines: Optional[Sequence[str]],
+        *,
+        pump_events: bool = False,
+    ) -> None:
+        self.patient_plan_lines = tuple(patient_plan_lines) if patient_plan_lines else None
+        self.update_patient_plan_label(pump_events=pump_events)
+
+    def try_stage_patient_plan_lines_from_cache(self, folder: str, *, pump_events: bool = False) -> bool:
+        cache_path = compute_dvh_cache_path(folder)
+        if cache_path is None or not cache_path.exists():
+            return False
+        loaded_cache = load_review_cache_file(cache_path)
+        if loaded_cache is None:
+            return False
+        patient_plan_lines_payload = loaded_cache.payload.get("patient_plan_lines")
+        if not isinstance(patient_plan_lines_payload, list):
+            return False
+        patient_plan_lines = [str(line).strip() for line in patient_plan_lines_payload if str(line).strip()]
+        if not patient_plan_lines:
+            return False
+        self.set_patient_plan_lines(patient_plan_lines, pump_events=pump_events)
+        return True
 
     def refresh_constraint_sheet_combo(self, preferred_sheet_name: Optional[str] = None) -> None:
         workbook_path = get_constraints_workbook_path()
@@ -3456,6 +3535,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         screenshot_path = self.get_review_screenshot_path(path)
         movie_path = self.get_review_movie_path(path)
         payload = build_review_cache_payload(
+            patient_plan_lines=list(self.patient_plan_lines or []),
             selected_constraint_set=selected_constraint_set,
             constraints_file_name=Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
             constraints_sheet_name=self.constraints_sheet_name,
@@ -4218,17 +4298,11 @@ h2 {{
         self.dvh_plot.setYRange(y_range[0], y_range[1], padding=0.02)
 
     def get_autoscroll_speed_mm_per_s(self) -> Optional[float]:
-        if self.ct is None:
-            return None
-        z_positions = np.asarray(self.ct.z_positions_mm, dtype=float)
-        if z_positions.size < 2:
-            return None
-        slice_steps_mm = np.abs(np.diff(z_positions))
-        slice_steps_mm = slice_steps_mm[np.isfinite(slice_steps_mm) & (slice_steps_mm > 0.0)]
-        if slice_steps_mm.size == 0:
+        slice_step_mm = self.get_autoscroll_slice_step_mm()
+        if slice_step_mm is None:
             return None
         interval_s = max(float(self.autoscroll_timer.interval()), 1.0) / 1000.0
-        return float(np.median(slice_steps_mm)) / interval_s
+        return float(slice_step_mm) / interval_s
 
     def update_autoscroll_speed_label(self) -> None:
         if not hasattr(self, "autoscroll_speed_label"):

@@ -363,6 +363,7 @@ def deserialize_target_table_rows(payload: object) -> Optional[List[Dict[str, ob
 
 def build_review_cache_payload(
     *,
+    patient_plan_lines: Optional[Sequence[str]],
     selected_constraint_set: str,
     constraints_file_name: Optional[str],
     constraints_sheet_name: Optional[str],
@@ -394,6 +395,7 @@ def build_review_cache_payload(
     return {
         "version": 16,
         "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+        "patient_plan_lines": list(patient_plan_lines or []),
         "selected_constraint_set": selected_constraint_set,
         "constraints_file": constraints_file_name,
         "constraints_sheet": constraints_sheet_name,
