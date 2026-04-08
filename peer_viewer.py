@@ -2631,7 +2631,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def set_view_interaction_enabled(self, enabled: bool):
         for view in (self.axial_view, self.sagittal_view, self.coronal_view):
             view.setMouseEnabled(x=enabled, y=enabled)
-            view.setMenuEnabled(enabled)
 
     def center_view_on_point(self, view: pg.ViewBox, x: float, y: float):
         x_range, y_range = view.viewRange()
