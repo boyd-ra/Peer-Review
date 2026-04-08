@@ -13,7 +13,7 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pyqtgraph as pg
@@ -33,6 +33,7 @@ from peer_helpers import (
     estimate_structure_geometry_metrics,
     fill_binary_holes_2d,
     get_dvh_method_signature,
+    get_ptv_dose_levels_gy,
     normalize_structure_name,
     sample_dose_to_ct_slice,
     volume_cc_at_dose_gy,
@@ -466,11 +467,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.sagittal_isodose_items: List[pg.IsocurveItem] = []
         self.coronal_isodose_items: List[pg.IsocurveItem] = []
         self.isodose_colors: List[Tuple[int, int, int]] = [
+            (0, 0, 0),
             (255, 215, 0),
             (0, 255, 255),
             (50, 205, 50),
             (255, 140, 0),
-            (0, 0, 0),
         ]
         self.autoscroll_interval_step_ms = 20
         self.autoscroll_interval_min_ms = 30
@@ -825,6 +826,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         isodose_controls_layout.setSpacing(2)
         isodose_controls_layout.addWidget(QtWidgets.QLabel("Isodose"), 0, 0)
         self.isodose_edit_widgets: List[QtWidgets.QLineEdit] = []
+        self.isodose_swatch_widgets: List[LineSwatchWidget] = []
         isodose_validator = QtGui.QDoubleValidator(0.0, 100000.0, 2, self)
         isodose_validator.setNotation(QtGui.QDoubleValidator.Notation.StandardNotation)
         isodose_positions = [(1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]
@@ -833,13 +835,15 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             row_layout = QtWidgets.QHBoxLayout(row_widget)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(4)
-            row_layout.addWidget(LineSwatchWidget(color_rgb))
+            swatch = LineSwatchWidget(color_rgb)
+            row_layout.addWidget(swatch)
             edit = QtWidgets.QLineEdit("")
             edit.setFixedWidth(56)
             edit.setPlaceholderText("--")
             edit.setValidator(QtGui.QDoubleValidator(0.0, 100000.0, 2, self))
             row_layout.addWidget(edit)
             isodose_controls_layout.addWidget(row_widget, row, col)
+            self.isodose_swatch_widgets.append(swatch)
             self.isodose_edit_widgets.append(edit)
         isodose_controls_layout.setColumnStretch(2, 1)
 
@@ -3473,6 +3477,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             target_table_rows=target_rows,
             max_tissue_payload=self.build_max_tissue_payload(),
             stereotactic_target_doses=self.stereotactic_target_dose_text_by_name,
+            isodose_level_texts=[edit.text().strip() for edit in self.isodose_edit_widgets],
+            isodose_colors=self.isodose_colors,
             hidden_structure_names=sorted(self.hidden_structure_names),
             additional_target_subvolume_names=sorted(self.additional_target_subvolume_names),
             constraint_notes=self.constraint_notes,
@@ -3662,6 +3668,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.custom_structure_goals_by_name = prepared_state.custom_constraints
         self.rebuild_structure_goals_by_name()
         self.stereotactic_target_dose_text_by_name = dict(prepared_state.stereotactic_target_doses)
+        self.apply_isodose_settings(
+            level_texts=prepared_state.isodose_level_texts,
+            colors=prepared_state.isodose_colors,
+        )
         self.hidden_structure_names = set(prepared_state.hidden_structure_names)
         self.additional_target_subvolume_names = set(prepared_state.additional_target_subvolume_names)
         self.constraint_notes = dict(prepared_state.constraint_notes)
@@ -4586,17 +4596,24 @@ h2 {{
         return int(round(np.clip(dose_gy / global_max, 0.0, 1.0) * 1000.0))
 
     def get_default_colorwash_min_dose_gy(self) -> float:
-        lowest_reference_gy: Optional[float] = None
-        for structure in self.get_sorted_ptv_structures():
-            normalized_name = normalize_structure_name(structure.name)
-            reference_gy = self.get_stereotactic_threshold_gy(normalized_name, structure.name)
-            if reference_gy is None or reference_gy <= 0.0:
-                continue
-            if lowest_reference_gy is None or reference_gy < lowest_reference_gy:
-                lowest_reference_gy = reference_gy
-        if lowest_reference_gy is None:
-            return 0.0
-        return lowest_reference_gy * 0.95
+        available_phase_rx = [
+            float(phase.prescription_dose_gy)
+            for phase in self.plan_phases
+            if phase.prescription_dose_gy > 0.0 and phase.dose_path
+        ]
+        ptv_dose_values = get_ptv_dose_levels_gy(self.rtstruct)
+
+        if len(available_phase_rx) == 1:
+            return available_phase_rx[0] * 0.95
+        if len(available_phase_rx) > 1:
+            if ptv_dose_values:
+                return min(ptv_dose_values) * 0.95
+            return min(available_phase_rx) * 0.95
+        if ptv_dose_values:
+            if len(ptv_dose_values) == 1:
+                return ptv_dose_values[0] * 0.95
+            return min(ptv_dose_values) * 0.95
+        return 0.0
 
     def get_total_rx_dose_gy(self) -> Optional[float]:
         available_phase_rx = [
@@ -6490,18 +6507,53 @@ h2 {{
     def clear_overlay_items(self, view: pg.ViewBox, items: List[pg.GraphicsObject]):
         clear_overlay_items_helper(view, items)
 
-    def populate_isodose_controls(self):
+    def set_isodose_color_palette(self, colors: Sequence[Tuple[int, int, int]]) -> None:
+        if not colors:
+            return
+        normalized_colors = [tuple(int(component) for component in color[:3]) for color in colors if len(color) >= 3]
+        if not normalized_colors:
+            return
+        while len(normalized_colors) < len(self.isodose_colors):
+            normalized_colors.append(self.isodose_colors[len(normalized_colors)])
+        self.isodose_colors = normalized_colors[: len(self.isodose_colors)]
+        for swatch, color in zip(self.isodose_swatch_widgets, self.isodose_colors):
+            swatch.color_rgb = color
+            swatch.update()
+
+    def get_default_isodose_level_texts(self) -> List[str]:
+        default_levels: List[float] = []
+        total_rx_gy = self.get_total_rx_dose_gy()
+        if total_rx_gy is not None and total_rx_gy > 0.0:
+            default_levels.append(float(total_rx_gy))
+
+        for ptv_level_gy in sorted(get_ptv_dose_levels_gy(self.rtstruct), reverse=True):
+            if any(abs(ptv_level_gy - existing_level) < 0.05 for existing_level in default_levels):
+                continue
+            default_levels.append(float(ptv_level_gy))
+
+        return [f"{level_gy:.1f}" for level_gy in default_levels[: len(self.isodose_edit_widgets)]]
+
+    def apply_isodose_settings(
+        self,
+        *,
+        level_texts: Optional[Sequence[str]] = None,
+        colors: Optional[Sequence[Tuple[int, int, int]]] = None,
+    ) -> None:
+        if colors is not None:
+            self.set_isodose_color_palette(list(colors))
+
+        if level_texts is None:
+            level_texts_to_apply = self.get_default_isodose_level_texts()
+        else:
+            level_texts_to_apply = [str(text).strip() for text in level_texts]
+
         for idx, edit in enumerate(self.isodose_edit_widgets):
             blocker = QtCore.QSignalBlocker(edit)
-            if idx == 0:
-                total_rx_gy = self.get_total_rx_dose_gy()
-                if total_rx_gy is not None and total_rx_gy > 0.0:
-                    edit.setText(f"{total_rx_gy:.1f}")
-                else:
-                    edit.clear()
-            else:
-                edit.clear()
+            edit.setText(level_texts_to_apply[idx] if idx < len(level_texts_to_apply) else "")
             del blocker
+
+    def populate_isodose_controls(self):
+        self.apply_isodose_settings()
 
     def get_active_isodose_levels(self) -> List[Tuple[float, Tuple[int, int, int]]]:
         return build_active_isodose_levels(

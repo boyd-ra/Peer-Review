@@ -484,24 +484,28 @@ def _get_default_colorwash_min_dose_gy(
         for phase in plan_phases
         if phase.prescription_dose_gy > 0.0 and phase.dose_path
     ]
-    if available_phase_rx:
-        return min(available_phase_rx) * 0.95
-
-    if rtstruct is None:
-        return 0.0
-
     ptv_dose_values: List[float] = []
-    for structure in rtstruct.structures:
-        normalized_name = normalize_structure_name(structure.name)
-        if not normalized_name.startswith("PTV"):
-            continue
-        digits = "".join(ch for ch in normalized_name if ch.isdigit())
-        if not digits:
-            continue
-        ptv_dose_values.append(float(int(digits)) / 100.0)
-    if not ptv_dose_values:
-        return 0.0
-    return min(ptv_dose_values) * 0.95
+    if rtstruct is not None:
+        for structure in rtstruct.structures:
+            normalized_name = normalize_structure_name(structure.name)
+            if not normalized_name.startswith("PTV"):
+                continue
+            digits = "".join(ch for ch in normalized_name if ch.isdigit())
+            if not digits:
+                continue
+            ptv_dose_values.append(float(int(digits)) / 100.0)
+
+    if len(available_phase_rx) == 1:
+        return available_phase_rx[0] * 0.95
+    if len(available_phase_rx) > 1:
+        if ptv_dose_values:
+            return min(ptv_dose_values) * 0.95
+        return min(available_phase_rx) * 0.95
+    if ptv_dose_values:
+        if len(ptv_dose_values) == 1:
+            return ptv_dose_values[0] * 0.95
+        return min(ptv_dose_values) * 0.95
+    return 0.0
 
 
 def build_precomputed_patient_view_state(

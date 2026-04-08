@@ -141,6 +141,8 @@ class PreparedReviewCacheState:
     selected_constraint_sheet: Optional[str]
     custom_constraints: Dict[str, List[StructureGoal]]
     stereotactic_target_doses: Dict[str, str]
+    isodose_level_texts: Optional[List[str]]
+    isodose_colors: Optional[List[Tuple[int, int, int]]]
     hidden_structure_names: set[str]
     additional_target_subvolume_names: set[str]
     constraint_notes: Dict[str, str]
@@ -382,13 +384,15 @@ def build_review_cache_payload(
     target_table_rows: Sequence[Mapping[str, object]],
     max_tissue_payload: Optional[Dict[str, object]],
     stereotactic_target_doses: Mapping[str, str],
+    isodose_level_texts: Sequence[str],
+    isodose_colors: Sequence[Sequence[int]],
     hidden_structure_names: Sequence[str],
     additional_target_subvolume_names: Sequence[str],
     constraint_notes: Mapping[str, str],
     target_notes: Mapping[str, str],
 ) -> Dict[str, object]:
     return {
-        "version": 15,
+        "version": 16,
         "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
         "selected_constraint_set": selected_constraint_set,
         "constraints_file": constraints_file_name,
@@ -411,6 +415,12 @@ def build_review_cache_payload(
         "target_table_rows": serialize_target_table_rows(target_table_rows),
         "max_tissue": max_tissue_payload,
         "stereotactic_target_doses": dict(stereotactic_target_doses),
+        "isodose_level_texts": [str(text) for text in isodose_level_texts],
+        "isodose_colors": [
+            [int(component) for component in color[:3]]
+            for color in isodose_colors
+            if len(color) >= 3
+        ],
         "hidden_structure_names": list(hidden_structure_names),
         "additional_target_subvolume_names": list(additional_target_subvolume_names),
         "constraint_notes": dict(constraint_notes),
@@ -541,6 +551,27 @@ def prepare_review_cache_state(
     if not isinstance(stereotactic_dose_payload, dict):
         return None
 
+    isodose_level_texts_payload = payload.get("isodose_level_texts")
+    saved_isodose_level_texts: Optional[List[str]] = None
+    if isinstance(isodose_level_texts_payload, list):
+        saved_isodose_level_texts = [str(value).strip() for value in isodose_level_texts_payload]
+
+    isodose_colors_payload = payload.get("isodose_colors")
+    saved_isodose_colors: Optional[List[Tuple[int, int, int]]] = None
+    if isinstance(isodose_colors_payload, list):
+        parsed_colors: List[Tuple[int, int, int]] = []
+        for color_payload in isodose_colors_payload:
+            if not isinstance(color_payload, list) or len(color_payload) != 3:
+                parsed_colors = []
+                break
+            try:
+                parsed_colors.append(tuple(int(value) for value in color_payload))
+            except (TypeError, ValueError):
+                parsed_colors = []
+                break
+        if parsed_colors:
+            saved_isodose_colors = parsed_colors
+
     hidden_structure_payload = payload.get("hidden_structure_names", [])
     if hidden_structure_payload is None:
         hidden_structure_payload = []
@@ -609,6 +640,8 @@ def prepare_review_cache_state(
             for name, value in stereotactic_dose_payload.items()
             if normalize_structure_name(str(name))
         },
+        isodose_level_texts=saved_isodose_level_texts,
+        isodose_colors=saved_isodose_colors,
         hidden_structure_names={
             normalize_structure_name(str(name))
             for name in hidden_structure_payload
