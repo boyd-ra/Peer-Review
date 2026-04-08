@@ -10,7 +10,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
@@ -1824,43 +1823,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         temp_dir = self.patient_transition_overlay_temp_dir
         self.patient_transition_overlay_temp_dir = None
         if process is not None:
-            self.shutdown_transition_overlay_process_async(process, temp_dir)
-        elif temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def shutdown_transition_overlay_process_async(
-        self,
-        process: subprocess.Popen,
-        temp_dir: Optional[str],
-    ) -> None:
-        def _shutdown_worker() -> None:
             try:
                 if process.poll() is None:
                     try:
                         process.terminate()
                     except Exception:
                         pass
-                    try:
-                        process.wait(timeout=1.5)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            process.kill()
-                        except Exception:
-                            pass
-                        try:
-                            process.wait(timeout=1.0)
-                        except Exception:
-                            pass
             except Exception:
                 pass
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-        threading.Thread(
-            target=_shutdown_worker,
-            name="peer-overlay-shutdown",
-            daemon=True,
-        ).start()
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def pump_viewer_ui(self) -> None:
         app = QtWidgets.QApplication.instance()
