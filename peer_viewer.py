@@ -531,7 +531,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.constraint_sheet_combo = QtWidgets.QComboBox()
         self.constraint_sheet_combo.setMinimumWidth(180)
         self.constraint_sheet_combo.setEnabled(False)
-        constraints_top_row.addWidget(self.constraint_sheet_combo)
         constraints_top_row.addStretch(1)
         constraints_layout.addLayout(constraints_top_row)
         self.constraints_table = QtWidgets.QTableWidget(0, 6)
@@ -713,7 +712,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Policy.Maximum,
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
-        self.tabs.setCornerWidget(self.patient_summary_widget, QtCore.Qt.Corner.TopLeftCorner)
+        self.tabs_header_widget = QtWidgets.QWidget()
+        tabs_header_layout = QtWidgets.QHBoxLayout(self.tabs_header_widget)
+        tabs_header_layout.setContentsMargins(0, 0, 8, 0)
+        tabs_header_layout.setSpacing(12)
+        tabs_header_layout.addWidget(self.patient_summary_widget)
+        tabs_header_layout.addWidget(self.constraint_sheet_combo)
+        self.tabs_header_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Maximum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.tabs.setCornerWidget(self.tabs_header_widget, QtCore.Qt.Corner.TopLeftCorner)
 
         self.axial_sidebar_widget = sidebar_widget
         sidebar_layout.addWidget(QtWidgets.QLabel("Structures"))
@@ -2941,6 +2950,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
             self.patient_summary_widget.layout().activate()
             self.patient_summary_widget.updateGeometry()
+        if hasattr(self, "tabs_header_widget") and self.tabs_header_widget is not None:
+            self.tabs_header_widget.layout().activate()
+            self.tabs_header_widget.updateGeometry()
         if hasattr(self, "tabs") and self.tabs is not None:
             self.tabs.updateGeometry()
             self.tabs.repaint()
@@ -2948,10 +2960,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.tabs.tabBar().repaint()
         if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
             self.patient_summary_widget.repaint()
+        if hasattr(self, "tabs_header_widget") and self.tabs_header_widget is not None:
+            self.tabs_header_widget.repaint()
         self.patient_name_label.repaint()
         self.patient_plan_label.repaint()
         if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
             QtCore.QCoreApplication.sendPostedEvents(self.patient_summary_widget, int(QtCore.QEvent.Type.Paint))
+        if hasattr(self, "tabs_header_widget") and self.tabs_header_widget is not None:
+            QtCore.QCoreApplication.sendPostedEvents(self.tabs_header_widget, int(QtCore.QEvent.Type.Paint))
         QtCore.QCoreApplication.sendPostedEvents(self.patient_name_label, int(QtCore.QEvent.Type.Paint))
         QtCore.QCoreApplication.sendPostedEvents(self.patient_plan_label, int(QtCore.QEvent.Type.Paint))
         if hasattr(self, "tabs") and self.tabs is not None:
