@@ -3057,6 +3057,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             build_structure_slice_mask_func=build_structure_slice_mask,
             get_target_structure_slice_masks_func=type(self).get_target_structure_slice_masks,
             get_ptv_union_slice_masks_func=type(self).get_ptv_union_slice_masks,
+            load_rtstruct_func=load_rtstruct,
         )
 
     def get_derived_cache_structures(self) -> List[StructureSliceContours]:
@@ -3664,6 +3665,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         save_derived_array_cache_file(
             path,
             ct=self.ct,
+            rtstruct=self.rtstruct,
             rtstruct_path=self.rtstruct_path,
             rtdose_paths=self.latest_timing_rtdose_paths,
             array_cache_signature=self.get_derived_array_cache_signature(),
@@ -3675,7 +3677,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
 
     def load_derived_array_cache(self, path: Path) -> bool:
-        if self.ct is None or self.rtstruct is None:
+        if self.ct is None:
             return False
         loaded_cache = load_derived_array_cache_file(
             path,
@@ -3687,6 +3689,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if loaded_cache is None:
             return False
         loaded_any = False
+        if loaded_cache.rtstruct is not None:
+            self.rtstruct = loaded_cache.rtstruct
+            self.sort_rtstruct_structures_for_display()
+            loaded_any = True
         if loaded_cache.sampled_dose_volume_ct is not None:
             self.sampled_dose_volume_ct = loaded_cache.sampled_dose_volume_ct
             loaded_any = True

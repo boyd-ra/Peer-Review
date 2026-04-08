@@ -82,12 +82,14 @@ def get_derived_array_cache_signature(
     build_structure_slice_mask_func: Callable[..., object],
     get_target_structure_slice_masks_func: Callable[..., object],
     get_ptv_union_slice_masks_func: Callable[..., object],
+    load_rtstruct_func: Callable[..., object],
 ) -> Dict[str, str]:
     return {
         "sample_dose_to_ct_slice": callable_signature_hash(sample_dose_to_ct_slice_func),
         "build_structure_slice_mask": callable_signature_hash(build_structure_slice_mask_func),
         "get_target_structure_slice_masks": callable_signature_hash(get_target_structure_slice_masks_func),
         "get_ptv_union_slice_masks": callable_signature_hash(get_ptv_union_slice_masks_func),
+        "load_rtstruct": callable_signature_hash(load_rtstruct_func),
     }
 
 
@@ -124,6 +126,7 @@ def default_is_base_listable_structure_name(normalized_name: str) -> bool:
 
 @dataclass(slots=True)
 class DerivedArrayCacheData:
+    rtstruct: Optional[RTStructData]
     sampled_dose_volume_ct: Optional[np.ndarray]
     ptv_union_volume_mask: Optional[np.ndarray]
     structure_volume_masks: Dict[str, np.ndarray]
@@ -154,6 +157,127 @@ class PreparedReviewCacheState:
     max_tissue_dose_gy: Optional[float]
     max_tissue_index_zyx: Optional[Tuple[int, int, int]]
     saved_selected_names: Optional[List[str]]
+
+
+def _serialize_rtstruct_geometry(
+    rtstruct: Optional[RTStructData],
+    arrays: Dict[str, np.ndarray],
+) -> Dict[str, object]:
+    if rtstruct is None:
+        return {}
+
+    structure_entries: List[Dict[str, object]] = []
+    for structure_index, structure in enumerate(rtstruct.structures):
+        contour_arrays: List[np.ndarray] = []
+        contour_slice_indices: List[int] = []
+        for slice_index in sorted(structure.points_rc_by_slice.keys()):
+            for contour_rc in structure.points_rc_by_slice.get(slice_index, []):
+                contour_array = np.asarray(contour_rc, dtype=np.float32)
+                if contour_array.ndim != 2 or contour_array.shape[1] != 2:
+                    continue
+                contour_arrays.append(contour_array)
+                contour_slice_indices.append(int(slice_index))
+
+        points_key = f"rtstruct_points_{structure_index:03d}"
+        offsets_key = f"rtstruct_offsets_{structure_index:03d}"
+        slices_key = f"rtstruct_slices_{structure_index:03d}"
+
+        if contour_arrays:
+            stacked_points = np.concatenate(contour_arrays, axis=0).astype(np.float32, copy=False)
+            contour_lengths = np.asarray([contour.shape[0] for contour in contour_arrays], dtype=np.int32)
+            contour_offsets = np.concatenate(
+                (
+                    np.asarray([0], dtype=np.int32),
+                    np.cumsum(contour_lengths, dtype=np.int32),
+                )
+            )
+        else:
+            stacked_points = np.zeros((0, 2), dtype=np.float32)
+            contour_offsets = np.zeros((1,), dtype=np.int32)
+
+        arrays[points_key] = stacked_points
+        arrays[offsets_key] = contour_offsets
+        arrays[slices_key] = np.asarray(contour_slice_indices, dtype=np.int32)
+        structure_entries.append(
+            {
+                "name": structure.name,
+                "color_rgb": [int(component) for component in structure.color_rgb[:3]],
+                "points_key": points_key,
+                "offsets_key": offsets_key,
+                "slices_key": slices_key,
+            }
+        )
+
+    return {
+        "frame_of_reference_uid": rtstruct.frame_of_reference_uid,
+        "structures": structure_entries,
+    }
+
+
+def _deserialize_rtstruct_geometry(
+    payload: Mapping[str, object],
+    arrays: Any,
+) -> Optional[RTStructData]:
+    structures_payload = payload.get("structures")
+    if not isinstance(structures_payload, list):
+        return None
+
+    structures: List[StructureSliceContours] = []
+    for structure_entry in structures_payload:
+        if not isinstance(structure_entry, dict):
+            return None
+        name = str(structure_entry.get("name", ""))
+        if not name:
+            return None
+        color_payload = structure_entry.get("color_rgb", [255, 255, 255])
+        if not isinstance(color_payload, list) or len(color_payload) < 3:
+            return None
+        try:
+            color_rgb = tuple(int(component) for component in color_payload[:3])
+        except (TypeError, ValueError):
+            return None
+
+        points_key = str(structure_entry.get("points_key", ""))
+        offsets_key = str(structure_entry.get("offsets_key", ""))
+        slices_key = str(structure_entry.get("slices_key", ""))
+        if not points_key or not offsets_key or not slices_key:
+            return None
+
+        try:
+            contour_points = np.asarray(arrays[points_key], dtype=np.float32)
+            contour_offsets = np.asarray(arrays[offsets_key], dtype=np.int32)
+            contour_slices = np.asarray(arrays[slices_key], dtype=np.int32)
+        except KeyError:
+            return None
+
+        if contour_points.ndim != 2 or contour_points.shape[1] != 2:
+            return None
+        if contour_offsets.ndim != 1 or contour_offsets.size != contour_slices.size + 1:
+            return None
+        if contour_offsets.size == 0 or int(contour_offsets[0]) != 0 or int(contour_offsets[-1]) != contour_points.shape[0]:
+            return None
+
+        points_rc_by_slice: Dict[int, List[np.ndarray]] = {}
+        for contour_index, slice_index in enumerate(contour_slices.tolist()):
+            start = int(contour_offsets[contour_index])
+            end = int(contour_offsets[contour_index + 1])
+            if start < 0 or end < start or end > contour_points.shape[0]:
+                return None
+            contour_rc = np.asarray(contour_points[start:end], dtype=np.float32).copy()
+            points_rc_by_slice.setdefault(int(slice_index), []).append(contour_rc)
+
+        structures.append(
+            StructureSliceContours(
+                name=name,
+                color_rgb=color_rgb,  # type: ignore[arg-type]
+                points_rc_by_slice=points_rc_by_slice,
+            )
+        )
+
+    return RTStructData(
+        structures=structures,
+        frame_of_reference_uid=str(payload.get("frame_of_reference_uid", "")),
+    )
 
 
 def json_safe_metadata_value(value: object) -> object:
@@ -671,6 +795,7 @@ def save_derived_array_cache(
     path: Path,
     *,
     ct: CTVolume,
+    rtstruct: Optional[RTStructData],
     rtstruct_path: Optional[str],
     rtdose_paths: Sequence[str],
     array_cache_signature: Dict[str, str],
@@ -681,18 +806,20 @@ def save_derived_array_cache(
     structure_geometry_volumes_cc: Dict[str, float],
 ) -> None:
     metadata: Dict[str, object] = {
-        "version": 1,
+        "version": 2,
         "saved_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
         "ct_geometry_signature": get_ct_geometry_signature(ct),
         "rtstruct_fingerprint": build_file_fingerprint(rtstruct_path),
         "rtdose_fingerprints": build_file_fingerprints(list(rtdose_paths)),
         "array_cache_signature": array_cache_signature,
         "structures": [],
+        "rtstruct_geometry": {},
     }
 
     arrays: Dict[str, np.ndarray] = {
         "metadata_json": np.asarray(json.dumps(metadata), dtype=np.str_),
     }
+    metadata["rtstruct_geometry"] = _serialize_rtstruct_geometry(rtstruct, arrays)
     if sampled_dose_volume_ct is not None:
         arrays["sampled_dose_volume_ct"] = np.asarray(sampled_dose_volume_ct, dtype=np.float32)
     if ptv_union_volume_mask is not None:
@@ -755,7 +882,8 @@ def load_derived_array_cache(
     if not isinstance(metadata, dict):
         payload.close()
         return None
-    if metadata.get("version") != 1:
+    cache_version = metadata.get("version")
+    if cache_version not in {1, 2}:
         payload.close()
         return None
     if metadata.get("ct_geometry_signature") != get_ct_geometry_signature(ct):
@@ -817,8 +945,21 @@ def load_derived_array_cache(
         if geometry_volume_cc > 0.0:
             structure_geometry_volumes_cc[normalized_name] = geometry_volume_cc
 
+    rtstruct: Optional[RTStructData] = None
+    if cache_version >= 2:
+        rtstruct_geometry_payload = metadata.get("rtstruct_geometry")
+        if rtstruct_geometry_payload not in (None, {}):
+            if not isinstance(rtstruct_geometry_payload, dict):
+                payload.close()
+                return None
+            rtstruct = _deserialize_rtstruct_geometry(rtstruct_geometry_payload, payload)
+            if rtstruct is None:
+                payload.close()
+                return None
+
     payload.close()
     return DerivedArrayCacheData(
+        rtstruct=rtstruct,
         sampled_dose_volume_ct=sampled_dose_volume_ct,
         ptv_union_volume_mask=ptv_union_volume_mask,
         structure_volume_masks=structure_volume_masks,

@@ -592,16 +592,6 @@ def prepare_patient_preload_payload(
     image_view_bounds = compute_image_view_bounds(ct)
     timing_entries.append(("Compute image bounds", perf_counter() - stage_start))
 
-    rtstruct: Optional[RTStructData] = None
-    if rtstruct_path:
-        if progress_callback is not None:
-            progress_callback("Loading structures")
-        stage_start = perf_counter()
-        rtstruct = load_rtstruct(rtstruct_path, ct)
-        timing_entries.append(("Load RTSTRUCT", perf_counter() - stage_start))
-    else:
-        timing_entries.append(("Load RTSTRUCT", None))
-
     dose: Optional[DoseVolume] = None
     sampled_dose_volume_ct: Optional[np.ndarray] = None
     derived_array_cache_loaded = False
@@ -625,7 +615,7 @@ def prepare_patient_preload_payload(
             )
         if derived_array_cache_data is not None:
             sampled_dose_volume_ct = derived_array_cache_data.sampled_dose_volume_ct
-            derived_array_cache_loaded = sampled_dose_volume_ct is not None
+            derived_array_cache_loaded = True
         timing_entries.append(("Load derived array cache", perf_counter() - stage_start if derived_array_cache_loaded else None))
 
         if sampled_dose_volume_ct is None:
@@ -640,6 +630,19 @@ def prepare_patient_preload_payload(
         timing_entries.append(("Load/merge RTDOSE", None))
         timing_entries.append(("Load derived array cache", None))
         timing_entries.append(("Resample dose to CT grid", None))
+
+    rtstruct: Optional[RTStructData] = None
+    if derived_array_cache_data is not None and derived_array_cache_data.rtstruct is not None:
+        rtstruct = derived_array_cache_data.rtstruct
+        timing_entries.append(("Load RTSTRUCT", None))
+    elif rtstruct_path:
+        if progress_callback is not None:
+            progress_callback("Loading structures")
+        stage_start = perf_counter()
+        rtstruct = load_rtstruct(rtstruct_path, ct)
+        timing_entries.append(("Load RTSTRUCT", perf_counter() - stage_start))
+    else:
+        timing_entries.append(("Load RTSTRUCT", None))
 
     review_cache_path = get_dvh_cache_path(folder)
     if review_cache_path is not None and review_cache_path.exists():
