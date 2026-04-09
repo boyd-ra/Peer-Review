@@ -120,6 +120,7 @@ from peer_loader import (
     PatientPreloadManager,
     PatientPreloadPayload,
     PrecomputedPatientViewState,
+    get_initial_focus_indices,
     prepare_patient_preload_payload,
     ReviewCacheAvailability,
 )
@@ -1605,11 +1606,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_mask_cache = None
         self.structure_mask_cache_names = []
         self.max_dose_index_zyx = None
-        self.current_row = self.ct.rows // 2
-        self.current_col = self.ct.cols // 2
+        initial_slice_index, initial_row, initial_col = get_initial_focus_indices(
+            self.ct,
+            self.rtstruct,
+            self.plan_phases,
+        )
+        self.current_row = initial_row
+        self.current_col = initial_col
         self.reset_autoscroll_speed()
         self.slice_slider.setRange(0, self.ct.volume_hu.shape[0] - 1)
-        self.slice_slider.setValue(self.ct.volume_hu.shape[0] // 2)
+        self.slice_slider.setValue(initial_slice_index)
         self.update_autoscroll_speed_label()
 
         self.refresh_constraint_sheet_combo(preferred_sheet_name=None)
@@ -1635,10 +1641,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         if self.rtstruct is not None:
             self.sort_rtstruct_structures_for_display()
-            visible_range = self.get_visible_structure_slice_range()
-            if visible_range is not None:
-                start_idx, end_idx = visible_range
-                self.slice_slider.setValue((start_idx + end_idx) // 2)
         else:
             self.populate_structures_list()
             self.populate_isodose_controls()

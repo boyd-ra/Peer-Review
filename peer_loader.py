@@ -27,6 +27,7 @@ from peer_cache import (
 from peer_helpers import compute_image_view_bounds, normalize_structure_name, sample_dose_to_ct_slice
 from peer_io import load_combined_rtdose, load_ct_series_from_paths, load_rtstruct, scan_patient_folder
 from peer_models import CTVolume, DoseVolume, ImageViewBounds, PatientFileDiscovery, RTPlanPhase, RTStructData
+from peer_targets import get_phase_target_assignments as get_phase_target_assignments_helper
 from peer_rendering import (
     AxialRenderState,
     OrthogonalRenderState,
@@ -381,10 +382,118 @@ def _preload_structure_visible(rtstruct: Optional[RTStructData], idx: int) -> bo
     return normalize_structure_name(rtstruct.structures[idx].name).startswith("PTV")
 
 
-def _get_default_initial_slice_index(ct: CTVolume, rtstruct: Optional[RTStructData]) -> int:
+def _parse_ptv_rx_gy_from_name(structure_name: str) -> Optional[float]:
+    normalized_name = normalize_structure_name(structure_name)
+    if not normalized_name.startswith("PTV"):
+        return None
+    digits = "".join(ch for ch in normalized_name if ch.isdigit())
+    if not digits:
+        return None
+    return float(int(digits)) / 100.0
+
+
+def _get_sorted_ptv_structures(rtstruct: Optional[RTStructData]) -> List[StructureSliceContours]:
+    if rtstruct is None:
+        return []
+
+    def sort_key(structure: StructureSliceContours) -> Tuple[float, str]:
+        rx_gy = _parse_ptv_rx_gy_from_name(structure.name)
+        return (rx_gy if rx_gy is not None else float("inf"), normalize_structure_name(structure.name))
+
+    return sorted(
+        [
+            structure
+            for structure in rtstruct.structures
+            if normalize_structure_name(structure.name).startswith("PTV")
+        ],
+        key=sort_key,
+    )
+
+
+def _get_initial_focus_target_structure(
+    rtstruct: Optional[RTStructData],
+    plan_phases: Sequence[RTPlanPhase],
+) -> Optional[StructureSliceContours]:
+    sorted_ptv_structures = _get_sorted_ptv_structures(rtstruct)
+    if not sorted_ptv_structures:
+        return None
+
+    phase_assignments = get_phase_target_assignments_helper(
+        plan_phases,
+        sorted_ptv_structures,
+        parse_ptv_rx_gy_from_name=_parse_ptv_rx_gy_from_name,
+    )
+    if phase_assignments:
+        for structure in reversed(sorted_ptv_structures):
+            normalized_name = normalize_structure_name(structure.name)
+            if normalized_name in phase_assignments:
+                return structure
+
+    available_phases = [
+        phase
+        for phase in plan_phases
+        if phase.prescription_dose_gy > 0.0 and phase.dose_path
+    ]
+    if len(available_phases) == 1:
+        target_name = normalize_structure_name(available_phases[0].target_structure_name)
+        if target_name:
+            for structure in sorted_ptv_structures:
+                if normalize_structure_name(structure.name) == target_name:
+                    return structure
+
+    return sorted_ptv_structures[-1]
+
+
+def _get_structure_center_indices(
+    ct: CTVolume,
+    structure: Optional[StructureSliceContours],
+) -> Optional[Tuple[int, int, int]]:
+    if structure is None:
+        return None
+    slice_indices = sorted(int(index) for index in structure.points_rc_by_slice.keys())
+    if not slice_indices:
+        return None
+
+    weighted_slice_samples: List[float] = []
+    all_points: List[np.ndarray] = []
+    for slice_index in slice_indices:
+        contours = structure.points_rc_by_slice.get(slice_index, [])
+        point_count = 0
+        for contour_rc in contours:
+            contour_array = np.asarray(contour_rc, dtype=np.float32)
+            if contour_array.ndim != 2 or contour_array.shape[1] != 2 or contour_array.size == 0:
+                continue
+            all_points.append(contour_array)
+            point_count += contour_array.shape[0]
+        if point_count > 0:
+            weighted_slice_samples.extend([float(slice_index)] * point_count)
+
+    if not all_points:
+        return None
+
+    stacked_points = np.concatenate(all_points, axis=0)
+    row_idx = int(np.clip(np.round(float(np.mean(stacked_points[:, 0]))), 0, ct.rows - 1))
+    col_idx = int(np.clip(np.round(float(np.mean(stacked_points[:, 1]))), 0, ct.cols - 1))
+    if weighted_slice_samples:
+        slice_idx = int(np.clip(np.round(float(np.mean(weighted_slice_samples))), 0, ct.volume_hu.shape[0] - 1))
+    else:
+        slice_idx = int(np.clip(np.round(float(np.mean(slice_indices))), 0, ct.volume_hu.shape[0] - 1))
+    return slice_idx, row_idx, col_idx
+
+
+def get_initial_focus_indices(
+    ct: CTVolume,
+    rtstruct: Optional[RTStructData],
+    plan_phases: Sequence[RTPlanPhase],
+) -> Tuple[int, int, int]:
+    target_structure = _get_initial_focus_target_structure(rtstruct, plan_phases)
+    target_center = _get_structure_center_indices(ct, target_structure)
+    if target_center is not None:
+        return target_center
+
     default_index = int(ct.volume_hu.shape[0] // 2)
     if rtstruct is None:
-        return default_index
+        return default_index, int(ct.rows // 2), int(ct.cols // 2)
 
     indices: List[int] = []
     for structure in rtstruct.structures:
@@ -392,7 +501,7 @@ def _get_default_initial_slice_index(ct: CTVolume, rtstruct: Optional[RTStructDa
             continue
         indices.extend(int(index) for index in structure.points_rc_by_slice.keys())
     if not indices:
-        return default_index
+        return default_index, int(ct.rows // 2), int(ct.cols // 2)
 
     structure_start = min(indices)
     structure_end = max(indices)
@@ -403,7 +512,7 @@ def _get_default_initial_slice_index(ct: CTVolume, rtstruct: Optional[RTStructDa
     end_idx = int(np.searchsorted(z_positions, end_pos, side="right") - 1)
     start_idx = max(0, min(start_idx, len(z_positions) - 1))
     end_idx = max(0, min(end_idx, len(z_positions) - 1))
-    return int((start_idx + end_idx) // 2)
+    return int((start_idx + end_idx) // 2), int(ct.rows // 2), int(ct.cols // 2)
 
 
 def _get_default_colorwash_min_dose_gy(
@@ -447,9 +556,7 @@ def build_precomputed_patient_view_state(
     sampled_dose_volume_ct: Optional[np.ndarray],
     plan_phases: Sequence[RTPlanPhase],
 ) -> PrecomputedPatientViewState:
-    slice_index = _get_default_initial_slice_index(ct, rtstruct)
-    row_idx = int(ct.rows // 2)
-    col_idx = int(ct.cols // 2)
+    slice_index, row_idx, col_idx = get_initial_focus_indices(ct, rtstruct, plan_phases)
     window_level = 40.0
     window_width = 400.0
     lo = window_level - window_width / 2.0
