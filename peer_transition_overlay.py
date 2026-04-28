@@ -3,12 +3,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 from PySide6 import QtCore, QtGui, QtWidgets
-
-from peer_cache import load_review_bundle_screenshot_bytes
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -17,8 +14,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--window-y", type=int, required=True)
     parser.add_argument("--window-width", type=int, required=True)
     parser.add_argument("--window-height", type=int, required=True)
-    parser.add_argument("--bundle", type=str, default=None)
-    parser.add_argument("--screenshot", type=str, default=None)
     parser.add_argument("--parent-pid", type=int, default=0)
     return parser.parse_args(argv)
 
@@ -28,8 +23,7 @@ class TransitionOverlayWindow(QtWidgets.QWidget):
         self,
         *,
         window_rect: QtCore.QRect,
-        bundle_path: Optional[Path],
-        screenshot_path: Optional[Path],
+        screenshot_bytes: bytes,
         parent_pid: int,
     ) -> None:
         super().__init__(
@@ -52,14 +46,6 @@ class TransitionOverlayWindow(QtWidgets.QWidget):
         self.screenshot_label.setStyleSheet("QLabel { background-color: black; }")
         self.screenshot_label.setGeometry(self.rect())
 
-        screenshot_bytes = b""
-        if bundle_path is not None and bundle_path.exists():
-            screenshot_bytes = load_review_bundle_screenshot_bytes(bundle_path) or b""
-        if not screenshot_bytes and screenshot_path is not None and screenshot_path.exists():
-            try:
-                screenshot_bytes = screenshot_path.read_bytes()
-            except OSError:
-                screenshot_bytes = b""
         pixmap = QtGui.QPixmap()
         if screenshot_bytes and pixmap.loadFromData(screenshot_bytes):
             self.screenshot_source_pixmap = pixmap
@@ -103,6 +89,12 @@ class TransitionOverlayWindow(QtWidgets.QWidget):
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    screenshot_bytes = b""
+    try:
+        if not sys.stdin.isatty():
+            screenshot_bytes = sys.stdin.buffer.read()
+    except Exception:
+        screenshot_bytes = b""
     app = QtWidgets.QApplication(sys.argv[:1])
     window = TransitionOverlayWindow(
         window_rect=QtCore.QRect(
@@ -111,8 +103,7 @@ def main(argv: List[str]) -> int:
             args.window_width,
             args.window_height,
         ),
-        bundle_path=Path(args.bundle) if args.bundle else None,
-        screenshot_path=Path(args.screenshot) if args.screenshot else None,
+        screenshot_bytes=screenshot_bytes,
         parent_pid=args.parent_pid,
     )
     window.show()

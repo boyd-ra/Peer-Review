@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 import re
 from typing import Dict, List, Optional, Tuple
+import xml.etree.ElementTree as ET
 
 import numpy as np
 import pydicom
@@ -331,6 +332,161 @@ def load_structure_constraints_sheet(
         return _parse_structure_goal_rows(fieldnames, rows)
     finally:
         workbook.close()
+
+def find_constraint_script_xml_file(folder: Optional[str]) -> Optional[str]:
+    if not folder:
+        return None
+    try:
+        entries = [path for path in Path(folder).iterdir() if path.is_file() and path.suffix.lower() == ".xml"]
+    except OSError:
+        return None
+    if not entries:
+        return None
+    entries.sort(
+        key=lambda candidate: (
+            0 if candidate.name.lower().endswith("_ctable.xml") else 1,
+            candidate.name.lower(),
+        )
+    )
+    return str(entries[0])
+
+
+def _format_script_goal_number(value_text: str) -> str:
+    try:
+        numeric_value = float(value_text)
+    except (TypeError, ValueError):
+        return str(value_text).strip()
+    rounded_value = round(numeric_value)
+    if abs(numeric_value - rounded_value) <= 1e-9:
+        return str(int(rounded_value))
+    return f"{numeric_value:.6g}"
+
+
+def _normalize_script_goal_value(goal_text: str) -> str:
+    text = " ".join(str(goal_text or "").split())
+    if not text:
+        return ""
+    match = re.search(r"([-+]?\d*\.?\d+)\s*(%|CC|CM3|GY)", text, flags=re.IGNORECASE)
+    if match is not None:
+        numeric_text = _format_script_goal_number(match.group(1))
+        unit = match.group(2).upper()
+        if unit == "%":
+            return f"{numeric_text}%"
+        if unit == "CM3":
+            unit = "CC"
+        if unit == "CC":
+            return f"{numeric_text} cc"
+        if unit == "GY":
+            return f"{numeric_text} Gy"
+        return f"{numeric_text} {unit}"
+    match = re.search(r"[-+]?\d*\.?\d+", text)
+    if match is None:
+        return text
+    return _format_script_goal_number(match.group(0))
+
+
+def _parse_script_constraint_clause(constraint_text: str) -> Optional[Tuple[str, str]]:
+    text = " ".join(str(constraint_text or "").replace("≤", "<=").replace("≥", ">=").split())
+    if not text:
+        return None
+    match = re.search(r"(<=|>=|==|=|<|>)\s*$", text)
+    if match is None:
+        return None
+    metric = text[:match.start()].strip().replace(" ", "")
+    comparator = match.group(1).strip()
+    if not metric or not comparator:
+        return None
+    return metric, comparator
+
+
+def _build_script_constraint_note_text(result_text: str, comment_text: str) -> str:
+    pieces: List[str] = []
+    cleaned_result = str(result_text or "").strip()
+    cleaned_comment = str(comment_text or "").strip()
+    if cleaned_result:
+        pieces.append(f"Eclipse: {cleaned_result}")
+    if cleaned_comment:
+        pieces.append(f"Comment: {cleaned_comment}")
+    return "    ".join(pieces)
+
+
+def _build_script_constraint_note_key(
+    normalized_name: str,
+    metric: str,
+    comparator: str,
+    value_text: str,
+) -> str:
+    return "||".join(
+        [
+            normalized_name,
+            metric.strip(),
+            comparator.strip(),
+            value_text.strip(),
+        ]
+    )
+
+
+def load_structure_constraints_script(
+    path: str,
+) -> Tuple[set[str], dict[str, List[StructureGoal]], List[str], dict[str, str]]:
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise ValueError(f"Failed to read script XML constraints from {Path(path).name}: {exc}") from exc
+
+    allowed_names: set[str] = set()
+    goals_by_structure: dict[str, List[StructureGoal]] = {}
+    structure_order: List[str] = []
+    note_text_by_goal_key: dict[str, str] = {}
+    seen_goals: set[Tuple[str, str, str, str]] = set()
+
+    for item in root.findall('.//Constraints_x0020_Checks_x0020_2'):
+        display_name = str(item.findtext('strTemp', '') or '').strip()
+        plan_name = str(item.findtext('strPlan', '') or '').strip()
+        normalized_display_name = normalize_structure_name(display_name)
+        normalized_plan_name = normalize_structure_name(plan_name)
+        if normalized_display_name.startswith('PTV') or normalized_plan_name.startswith('PTV'):
+            continue
+
+        normalized_name = normalized_plan_name or normalized_display_name
+        structure_name = plan_name or display_name
+        if not normalized_name or not structure_name:
+            continue
+
+        if normalized_name not in allowed_names:
+            structure_order.append(normalized_name)
+        allowed_names.add(normalized_name)
+
+        note_text = _build_script_constraint_note_text(
+            item.findtext('cPlan', ''),
+            item.findtext('cComment', ''),
+        )
+        for constraint_field, goal_field in (('constraint', 'cGoal'), ('constraint2', 'cGoal2')):
+            parsed_constraint = _parse_script_constraint_clause(item.findtext(constraint_field, ''))
+            value_text = _normalize_script_goal_value(item.findtext(goal_field, ''))
+            if parsed_constraint is None or not value_text:
+                continue
+            metric, comparator = parsed_constraint
+            goal_key = (normalized_name, metric.upper(), comparator, value_text.upper())
+            if goal_key in seen_goals:
+                continue
+            seen_goals.add(goal_key)
+            goal = StructureGoal(
+                structure_name=structure_name,
+                metric=metric,
+                comparator=comparator,
+                value_text=value_text,
+            )
+            goals_by_structure.setdefault(normalized_name, []).append(goal)
+            if note_text:
+                note_text_by_goal_key[_build_script_constraint_note_key(
+                    normalized_name,
+                    goal.metric,
+                    goal.comparator,
+                    goal.value_text,
+                )] = note_text
+
+    return allowed_names, goals_by_structure, structure_order, note_text_by_goal_key
 
 
 def _summarize_rtplan_phase_records(

@@ -17,6 +17,7 @@ from peer_models import (
     CTVolume,
     DoseVolume,
     DVHCurve,
+    ImageViewBounds,
     PatientFileDiscovery,
     RTPlanPhase,
     RTStructData,
@@ -159,6 +160,7 @@ class DerivedArrayCacheData:
     dose: Optional[DoseVolume]
     rtstruct: Optional[RTStructData]
     patient_discovery: Optional[PatientFileDiscovery]
+    image_view_bounds: Optional[ImageViewBounds]
     sampled_dose_volume_ct: Optional[np.ndarray]
     ptv_union_volume_mask: Optional[np.ndarray]
     structure_volume_masks: Dict[str, np.ndarray]
@@ -408,6 +410,50 @@ def _deserialize_patient_discovery(
         plan_phases=plan_phases,
         patient_plan_lines=patient_plan_lines,
     )
+
+
+def _serialize_image_view_bounds(image_view_bounds: Optional[ImageViewBounds]) -> Dict[str, object]:
+    if image_view_bounds is None:
+        return {}
+    return {
+        "axial_by_slice": {
+            str(int(slice_index)): [float(value) for value in bounds]
+            for slice_index, bounds in image_view_bounds.axial_by_slice.items()
+        },
+        "sagittal": [float(value) for value in image_view_bounds.sagittal] if image_view_bounds.sagittal is not None else None,
+        "coronal": [float(value) for value in image_view_bounds.coronal] if image_view_bounds.coronal is not None else None,
+    }
+
+
+def _deserialize_image_view_bounds(payload: Mapping[str, object]) -> Optional[ImageViewBounds]:
+    axial_payload = payload.get("axial_by_slice")
+    sagittal_payload = payload.get("sagittal")
+    coronal_payload = payload.get("coronal")
+    if not isinstance(axial_payload, dict):
+        return None
+
+    axial_by_slice: Dict[int, Tuple[float, float, float, float]] = {}
+    for slice_index_text, bounds_payload in axial_payload.items():
+        if not isinstance(bounds_payload, (list, tuple)) or len(bounds_payload) != 4:
+            continue
+        try:
+            axial_by_slice[int(slice_index_text)] = tuple(float(value) for value in bounds_payload)
+        except (TypeError, ValueError):
+            continue
+
+    def _deserialize_bounds(bounds_payload: object) -> Optional[Tuple[float, float, float, float]]:
+        if not isinstance(bounds_payload, (list, tuple)) or len(bounds_payload) != 4:
+            return None
+        try:
+            return tuple(float(value) for value in bounds_payload)
+        except (TypeError, ValueError):
+            return None
+
+    sagittal = _deserialize_bounds(sagittal_payload)
+    coronal = _deserialize_bounds(coronal_payload)
+    if not axial_by_slice and sagittal is None and coronal is None:
+        return None
+    return ImageViewBounds(axial_by_slice=axial_by_slice, sagittal=sagittal, coronal=coronal)
 
 
 def load_cached_patient_discovery(path: Path, *, folder: str) -> Optional[PatientFileDiscovery]:
@@ -874,6 +920,8 @@ def prepare_review_cache_state(
     no_constraints_sheet_label: str,
     constraints_sheet_name: Optional[str],
     structure_filter_csv_path: Optional[str],
+    constraint_script_xml_path: Optional[str],
+    script_constraints_label: Optional[str],
     rtstruct_path: Optional[str],
     rtdose_paths: Sequence[str],
     rtplan_paths: Sequence[str],
@@ -927,16 +975,22 @@ def prepare_review_cache_state(
     if not trusted_source and saved_constraints_sheet is not None and saved_constraints_sheet not in available_constraint_sheet_names:
         return None
 
+    current_constraints_source_path = (
+        constraint_script_xml_path
+        if script_constraints_label and saved_constraints_sheet == script_constraints_label
+        else structure_filter_csv_path
+    )
+
     saved_csv_fingerprint = payload.get("constraints_fingerprint", payload.get("csv_fingerprint"))
     if (
         not trusted_source
         and saved_csv_fingerprint is not None
-        and not file_fingerprint_matches(saved_csv_fingerprint, structure_filter_csv_path)
+        and not file_fingerprint_matches(saved_csv_fingerprint, current_constraints_source_path)
     ):
         return None
 
     saved_csv_name = payload.get("constraints_file", payload.get("csv_file"))
-    current_csv_name = Path(structure_filter_csv_path).name if structure_filter_csv_path else None
+    current_csv_name = Path(current_constraints_source_path).name if current_constraints_source_path else None
     if not trusted_source and saved_csv_fingerprint is None and saved_csv_name not in {None, current_csv_name}:
         return None
 
@@ -1112,6 +1166,7 @@ def build_derived_array_archive(
     ct: CTVolume,
     ct_paths: Sequence[str],
     patient_discovery: Optional[PatientFileDiscovery],
+    image_view_bounds: Optional[ImageViewBounds],
     dose: Optional[DoseVolume],
     rtstruct: Optional[RTStructData],
     rtstruct_path: Optional[str],
@@ -1141,6 +1196,7 @@ def build_derived_array_archive(
         "dose_geometry": {},
         "rtstruct_geometry": {},
         "patient_discovery": _serialize_patient_discovery(patient_discovery, folder=folder),
+        "image_view_bounds": _serialize_image_view_bounds(image_view_bounds),
     }
 
     arrays: Dict[str, np.ndarray] = {}
@@ -1186,6 +1242,7 @@ def save_derived_array_cache(
     ct: CTVolume,
     ct_paths: Sequence[str],
     patient_discovery: Optional[PatientFileDiscovery],
+    image_view_bounds: Optional[ImageViewBounds],
     dose: Optional[DoseVolume],
     rtstruct: Optional[RTStructData],
     rtstruct_path: Optional[str],
@@ -1202,6 +1259,7 @@ def save_derived_array_cache(
         ct=ct,
         ct_paths=ct_paths,
         patient_discovery=patient_discovery,
+        image_view_bounds=image_view_bounds,
         dose=dose,
         rtstruct=rtstruct,
         rtstruct_path=rtstruct_path,
@@ -1224,6 +1282,7 @@ def save_review_bundle(
     ct: CTVolume,
     ct_paths: Sequence[str],
     patient_discovery: Optional[PatientFileDiscovery],
+    image_view_bounds: Optional[ImageViewBounds],
     dose: Optional[DoseVolume],
     rtstruct: Optional[RTStructData],
     rtstruct_path: Optional[str],
@@ -1246,6 +1305,7 @@ def save_review_bundle(
         ct=ct,
         ct_paths=ct_paths,
         patient_discovery=patient_discovery,
+        image_view_bounds=image_view_bounds,
         dose=dose,
         rtstruct=rtstruct,
         rtstruct_path=rtstruct_path,
@@ -1470,12 +1530,21 @@ def load_derived_array_cache(
                 payload.close()
                 return None
 
+    image_view_bounds: Optional[ImageViewBounds] = None
+    image_view_bounds_payload = metadata.get("image_view_bounds")
+    if image_view_bounds_payload not in (None, {}):
+        if not isinstance(image_view_bounds_payload, dict):
+            payload.close()
+            return None
+        image_view_bounds = _deserialize_image_view_bounds(image_view_bounds_payload)
+
     payload.close()
     return DerivedArrayCacheData(
         ct=loaded_ct,
         dose=dose,
         rtstruct=rtstruct,
         patient_discovery=patient_discovery,
+        image_view_bounds=image_view_bounds,
         sampled_dose_volume_ct=sampled_dose_volume_ct,
         ptv_union_volume_mask=ptv_union_volume_mask,
         structure_volume_masks=structure_volume_masks,
@@ -1594,6 +1663,14 @@ def load_review_bundle(path: Path) -> Optional[ReviewBundleData]:
             payload.close()
             return None
 
+    image_view_bounds: Optional[ImageViewBounds] = None
+    image_view_bounds_payload = metadata.get("image_view_bounds")
+    if image_view_bounds_payload not in (None, {}):
+        if not isinstance(image_view_bounds_payload, dict):
+            payload.close()
+            return None
+        image_view_bounds = _deserialize_image_view_bounds(image_view_bounds_payload)
+
     review_cache_data = load_review_bundle_review_cache_file(path)
     screenshot_png_bytes = load_review_bundle_screenshot_bytes(path)
     payload.close()
@@ -1604,6 +1681,7 @@ def load_review_bundle(path: Path) -> Optional[ReviewBundleData]:
             dose=dose,
             rtstruct=rtstruct,
             patient_discovery=patient_discovery,
+            image_view_bounds=image_view_bounds,
             sampled_dose_volume_ct=sampled_dose_volume_ct,
             ptv_union_volume_mask=ptv_union_volume_mask,
             structure_volume_masks=structure_volume_masks,

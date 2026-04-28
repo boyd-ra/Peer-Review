@@ -33,8 +33,11 @@ from peer_helpers import (
     estimate_structure_geometry_metrics,
     fill_binary_holes_2d,
     get_dvh_method_signature,
+    get_ct_row_col_normal,
     get_ptv_dose_levels_gy,
+    nearest_ct_slice_for_points,
     normalize_structure_name,
+    patient_xyz_to_ct_rc,
     sample_dose_to_ct_slice,
     volume_cc_at_dose_gy,
     volume_pct_at_dose_gy,
@@ -53,10 +56,11 @@ from peer_cache import (
     get_dvh_cache_path as compute_dvh_cache_path,
     get_review_bundle_path as compute_review_bundle_path,
     load_derived_array_cache as load_derived_array_cache_file,
-    load_review_bundle_review_cache_file,
+    load_review_bundle,
     load_review_cache_file,
     prepare_review_cache_state,
     PreparedReviewCacheState,
+    ReviewBundleData,
     ReviewCacheFileData,
     save_derived_array_cache as save_derived_array_cache_file,
     save_review_bundle as save_review_bundle_file,
@@ -104,12 +108,14 @@ from peer_dvh_controller import (
     resolve_selected_curve_name,
 )
 from peer_io import (
+    find_constraint_script_xml_file,
     get_constraints_workbook_path,
     list_constraints_workbook_sheets,
     load_combined_rtdose,
     load_ct_series_from_paths,
     load_rtdose,
     load_rtstruct,
+    load_structure_constraints_script,
     load_structure_constraints_sheet,
 )
 from peer_loader import (
@@ -189,8 +195,11 @@ from peer_viewer_support import (
 
 
 NO_CONSTRAINTS_SHEET_LABEL = "------"
+SCRIPT_CONSTRAINTS_LABEL = "script"
 MAX_TISSUE_ROW_LABEL = "Max Tissue"
 MAX_TISSUE_ROW_NAME = normalize_structure_name(MAX_TISSUE_ROW_LABEL)
+MAX_DOSE_ROW_LABEL = "Max Dose"
+MAX_DOSE_ROW_NAME = normalize_structure_name(MAX_DOSE_ROW_LABEL)
 logger = logging.getLogger(__name__)
 
 
@@ -380,7 +389,7 @@ def apply_app_theme(app: QtWidgets.QApplication) -> None:
 class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Radiotherapy Plan Review - powered by CommonSense™")
+        self.setWindowTitle("Montefiore-Einstein Radiotherapy Peer Review")
         self.resize(1450, 900)
 
         self.ct: Optional[CTVolume] = None
@@ -404,6 +413,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.pending_patient_activation_prepare_result: Optional[PatientActivationPreparationPayload] = None
         self.pending_patient_activation_prepare_error: Optional[str] = None
         self.structure_filter_csv_path: Optional[str] = None
+        self.constraint_script_xml_path: Optional[str] = None
         self.constraints_sheet_name: Optional[str] = None
         self.available_constraint_sheet_names: List[str] = []
         self.structure_csv_order: List[str] = []
@@ -415,6 +425,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.current_ct_paths: List[str] = []
         self.current_rtplan_paths: List[str] = []
         self.constraint_notes: Dict[str, str] = {}
+        self.script_constraint_notes: Dict[str, str] = {}
         self.target_notes: Dict[str, str] = {}
         self.patient_plan_lines: Optional[Tuple[str, ...]] = None
         self.displayed_dose_plane: Optional[np.ndarray] = None
@@ -490,7 +501,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_timer.setSingleShot(True)
         self.autoscroll_direction = 1
         self.patient_transition_overlay_process: Optional[subprocess.Popen] = None
-        self.patient_transition_overlay_temp_dir: Optional[str] = None
+        self.staged_review_bundle_folder: Optional[str] = None
+        self.staged_review_bundle_data: Optional[ReviewBundleData] = None
         self.isodose_refresh_timer = QtCore.QTimer(self)
         self.isodose_refresh_timer.setSingleShot(True)
         self.isodose_refresh_timer.timeout.connect(self.refresh_all_views)
@@ -631,7 +643,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dose_toggle_button = QtWidgets.QPushButton("On")
         self.dose_toggle_button.setCheckable(True)
         self.dose_toggle_button.setChecked(True)
-        self.max_dose_button = QtWidgets.QPushButton("Max")
 
         self.dose_range_label = QtWidgets.QLabel("Dose range: 0.00 Gy - 100%")
         self.dose_min_edit = QtWidgets.QLineEdit("0.00")
@@ -879,7 +890,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         dose_opacity_layout.addWidget(QtWidgets.QLabel("Dose opacity"))
         dose_opacity_layout.addWidget(self.dose_opacity_slider, 1)
         dose_opacity_layout.addWidget(self.dose_toggle_button)
-        dose_opacity_layout.addWidget(self.max_dose_button)
         dose_range_label = QtWidgets.QLabel("Dose range")
 
         slice_scroll_widget = QtWidgets.QWidget()
@@ -1010,7 +1020,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.next_patient_button.clicked.connect(self.on_next_patient_clicked)
         self.reset_window_level_button.clicked.connect(self.on_reset_window_level)
         self.clear_dvh_structures_button.clicked.connect(self.on_clear_dvh_structures_clicked)
-        self.max_dose_button.clicked.connect(self.on_go_to_max_dose)
         self.add_constraint_button.clicked.connect(self.on_add_constraint_clicked)
         self.constraint_sheet_combo.currentTextChanged.connect(self.on_constraint_sheet_changed)
         self.autoscroll_slower_button.clicked.connect(self.on_autoscroll_slower)
@@ -1109,6 +1118,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.rtstruct = None
         self.rtstruct_path = None
         self.structure_filter_csv_path = None
+        self.constraint_script_xml_path = None
         self.constraints_sheet_name = None
         self.available_constraint_sheet_names = []
         self.structure_csv_order = []
@@ -1120,6 +1130,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.current_ct_paths = []
         self.current_rtplan_paths = []
         self.constraint_notes = {}
+        self.script_constraint_notes = {}
         self.target_notes = {}
         self.stereotactic_target_dose_text_by_name = {}
         self.patient_plan_lines = None
@@ -1380,6 +1391,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             no_constraints_sheet_label=NO_CONSTRAINTS_SHEET_LABEL,
             constraints_sheet_name=self.constraints_sheet_name,
             structure_filter_csv_path=self.structure_filter_csv_path,
+            constraint_script_xml_path=self.constraint_script_xml_path,
+            script_constraints_label=SCRIPT_CONSTRAINTS_LABEL,
             rtstruct_path=self.rtstruct_path,
             rtdose_paths=list(self.latest_timing_rtdose_paths),
             rtplan_paths=list(self.current_rtplan_paths),
@@ -1619,28 +1632,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.update_autoscroll_speed_label()
 
         self.refresh_constraint_sheet_combo(preferred_sheet_name=None)
-        constraints_path = self.structure_filter_csv_path
-        if constraints_path is not None and self.constraints_sheet_name is not None:
+        if self.constraints_sheet_name is not None:
             stage_start = perf_counter()
-            (
-                _,
-                self.csv_structure_goals_by_name,
-                self.structure_csv_order,
-            ) = load_structure_constraints_sheet(
-                constraints_path,
-                self.constraints_sheet_name,
-                self.plan_phases,
-            )
-            self.rebuild_structure_goals_by_name()
-            timing_entries.append(("Load constraints workbook", perf_counter() - stage_start))
+            constraint_error = self.load_constraint_source(self.constraints_sheet_name)
+            timing_entries.append(("Load constraint source", perf_counter() - stage_start))
+            if constraint_error:
+                self.statusBar().showMessage(f"Could not load constraints source: {constraint_error}", 8000)
         else:
-            self.csv_structure_goals_by_name = {}
-            self.structure_csv_order = []
-            self.rebuild_structure_goals_by_name()
-            timing_entries.append(("Load constraints workbook", None))
+            self.load_constraint_source(None)
+            timing_entries.append(("Load constraint source", None))
 
         if self.rtstruct is not None:
             self.sort_rtstruct_structures_for_display()
+            if self.constraints_sheet_name == SCRIPT_CONSTRAINTS_LABEL:
+                self.apply_constraint_required_structure_selection(refresh_dvh=True)
         else:
             self.populate_structures_list()
             self.populate_isodose_controls()
@@ -1664,7 +1669,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         timing_entries.extend(payload.timing_entries)
         derived_array_cache_path = self.get_derived_array_cache_path()
-        return constraints_path, self.rtstruct_path, list(payload.rtdose_paths), derived_array_cache_path
+        return self.structure_filter_csv_path, self.rtstruct_path, list(payload.rtdose_paths), derived_array_cache_path
 
     def apply_precomputed_initial_view_state(
         self,
@@ -1762,40 +1767,27 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.window_label.setText(axial_state.window_label_text)
         self.update_axial_overlay_positions()
 
-    def build_patient_transition_overlay_geometry(self) -> Optional[Tuple[QtCore.QRect, QtCore.QRect]]:
+    def build_patient_transition_overlay_geometry(self) -> Optional[QtCore.QRect]:
         if not hasattr(self, "axial_tab_widget") or not hasattr(self, "axial_graphics_widget"):
             return None
         overlay_widget = self.axial_tab_widget
-        axial_widget = self.axial_graphics_widget
         overlay_size = overlay_widget.size()
-        axial_size = axial_widget.size()
         if overlay_size.width() <= 0 or overlay_size.height() <= 0:
             return None
-        if axial_size.width() <= 0 or axial_size.height() <= 0:
-            return None
         overlay_top_left = overlay_widget.mapToGlobal(QtCore.QPoint(0, 0))
-        overlay_rect = QtCore.QRect(overlay_top_left, overlay_size)
-        axial_top_left = axial_widget.mapTo(overlay_widget, QtCore.QPoint(0, 0))
-        axial_rect = QtCore.QRect(axial_top_left, axial_size)
-        return overlay_rect, axial_rect
+        return QtCore.QRect(overlay_top_left, overlay_size)
 
     def start_patient_transition_overlay_process(
         self,
-        folder: str,
+        screenshot_png_bytes: Optional[bytes],
     ) -> bool:
         self.stop_patient_transition_overlay_process()
 
         geometry = self.build_patient_transition_overlay_geometry()
-        cache_path = compute_dvh_cache_path(folder)
-        bundle_path = compute_review_bundle_path(folder)
-        screenshot_path = self.get_review_screenshot_path(cache_path)
-        has_bundle = bundle_path is not None and bundle_path.exists()
-        has_screenshot = screenshot_path is not None and screenshot_path.exists()
-
-        if geometry is None or not (has_bundle or has_screenshot):
+        if geometry is None or not screenshot_png_bytes:
             return False
 
-        overlay_rect, _axial_rect = geometry
+        overlay_rect = geometry
         overlay_script = Path(__file__).with_name("peer_transition_overlay.py")
         command = [
             sys.executable,
@@ -1811,28 +1803,29 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             "--parent-pid",
             str(os.getpid()),
         ]
-        if has_bundle and bundle_path is not None:
-            command.extend(["--bundle", str(bundle_path)])
-        elif has_screenshot and screenshot_path is not None:
-            command.extend(["--screenshot", str(screenshot_path)])
         try:
             self.patient_transition_overlay_process = subprocess.Popen(
                 command,
                 cwd=str(overlay_script.parent),
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
             )
-            self.patient_transition_overlay_temp_dir = None
+            if self.patient_transition_overlay_process.stdin is not None:
+                self.patient_transition_overlay_process.stdin.write(screenshot_png_bytes)
+                self.patient_transition_overlay_process.stdin.close()
         except Exception:
+            process = self.patient_transition_overlay_process
+            if process is not None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
             self.patient_transition_overlay_process = None
-            self.patient_transition_overlay_temp_dir = None
             return False
         return True
 
     def stop_patient_transition_overlay_process(self) -> None:
         process = self.patient_transition_overlay_process
         self.patient_transition_overlay_process = None
-        temp_dir = self.patient_transition_overlay_temp_dir
-        self.patient_transition_overlay_temp_dir = None
         if process is not None:
             try:
                 if process.poll() is None:
@@ -1842,16 +1835,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         pass
             except Exception:
                 pass
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def clear_staged_review_bundle(self) -> None:
+        self.staged_review_bundle_folder = None
+        self.staged_review_bundle_data = None
+
+    def get_staged_review_bundle_for_folder(self, folder: str) -> Optional[ReviewBundleData]:
+        if self.staged_review_bundle_folder != folder:
+            return None
+        return self.staged_review_bundle_data
 
     def pump_viewer_ui(self) -> None:
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-
-    def get_patient_activation_midstage_delay_ms(self) -> int:
-        return max(900, int(self.autoscroll_timer.interval()) * 6)
 
     def get_patient_activation_step_delay_ms(self) -> int:
         return max(90, int(self.autoscroll_timer.interval()))
@@ -1884,16 +1881,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 "Activating preloaded patient..." if preloaded_payload is not None else "Scanning patient folder...",
                 pump_events=True,
             )
+            self.clear_staged_review_bundle()
             self.clear_patient_session_state(quick_swap=fast_activate)
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
+            staged_bundle_data: Optional[ReviewBundleData] = None
             if preloaded_payload is not None and preloaded_payload.patient_plan_lines:
                 self.set_patient_plan_lines(preloaded_payload.patient_plan_lines, pump_events=True)
             elif preloaded_payload is None:
                 self.try_stage_patient_plan_lines_from_cache(folder, pump_events=True)
+                staged_bundle_data = self.get_staged_review_bundle_for_folder(folder)
             if preloaded_payload is None:
                 self.tabs.setCurrentWidget(self.axial_tab_widget)
-                self.start_patient_transition_overlay_process(folder)
+                if staged_bundle_data is not None:
+                    self.start_patient_transition_overlay_process(staged_bundle_data.screenshot_png_bytes)
                 self.pump_viewer_ui()
 
             if preloaded_payload is None:
@@ -1903,9 +1904,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     progress_callback=lambda message: self.show_progress_status(message, pump_events=True),
                     patient_plan_callback=lambda lines: self.set_patient_plan_lines(lines, pump_events=True),
                     include_precomputed_view_state=False,
+                    preloaded_bundle_data=staged_bundle_data,
                 )
             else:
                 payload = preloaded_payload
+            self.clear_staged_review_bundle()
 
             constraints_path, rtstruct_path, rtdose_paths, derived_array_cache_path = self._apply_patient_preload_payload(
                 payload,
@@ -1932,7 +1935,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 self.show_progress_status("Finalizing preloaded patient...", pump_events=False)
                 self.set_patient_activation_ui_locked(True)
                 if payload.precomputed_view_state is not None:
-                    self.start_patient_transition_overlay_process(folder)
+                    self.start_patient_transition_overlay_process(payload.transition_screenshot_png_bytes)
                 self.pump_viewer_ui()
                 activation_token = self.patient_activation_token + 1
                 self.patient_activation_token = activation_token
@@ -1954,7 +1957,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                         overall_start=overall_start,
                     )
 
-                QtCore.QTimer.singleShot(self.get_patient_activation_midstage_delay_ms(), _continue_activation)
+                QtCore.QTimer.singleShot(0, _continue_activation)
                 return True
 
             return self._complete_patient_folder_activation(
@@ -2422,6 +2425,59 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_filter_tree_widget = tree_widget
         return dialog
 
+    def get_structure_by_normalized_name(self, normalized_name: str) -> Optional[StructureSliceContours]:
+        if self.rtstruct is None:
+            return None
+        for structure in self.rtstruct.structures:
+            if normalize_structure_name(structure.name) == normalized_name:
+                return structure
+        return None
+
+    def invalidate_target_selection_caches(
+        self,
+        normalized_name: str,
+        *,
+        hidden_changed: bool,
+        target_changed: bool,
+    ) -> None:
+        if self.rtstruct is None:
+            self.cached_target_table_rows = None
+            return
+
+        if hidden_changed:
+            self.target_containment_cache = {}
+            self.stereotactic_metrics_cache = {}
+            self.stereotactic_volume_context_cache = {}
+            self.cached_target_table_rows = None
+            return
+
+        if target_changed:
+            toggled_structure = self.get_structure_by_normalized_name(normalized_name)
+            if toggled_structure is None:
+                self.target_containment_cache = {}
+            else:
+                affected_parent_names: set[str] = set()
+                for ptv_structure in self.get_sorted_ptv_structures():
+                    parent_normalized_name = normalize_structure_name(ptv_structure.name)
+                    cached_names = self.target_containment_cache.get(parent_normalized_name)
+                    if cached_names is not None and normalized_name in cached_names:
+                        affected_parent_names.add(parent_normalized_name)
+                        continue
+                    if parent_normalized_name == normalized_name:
+                        continue
+                    if self.structure_is_fully_encompassed(ptv_structure, toggled_structure):
+                        affected_parent_names.add(parent_normalized_name)
+                if not affected_parent_names:
+                    self.target_containment_cache = {}
+                else:
+                    for parent_normalized_name in affected_parent_names:
+                        self.target_containment_cache.pop(parent_normalized_name, None)
+            if self.stereotactic_summary_enabled():
+                self.stereotactic_metrics_cache = {}
+                self.stereotactic_volume_context_cache = {}
+
+        self.cached_target_table_rows = None
+
     def populate_structure_filter_dialog(self) -> None:
         if self.structure_filter_tree_widget is None:
             return
@@ -2454,13 +2510,13 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 item.setCheckState(1, QtCore.Qt.CheckState.Unchecked)
         del blocker
 
-    def apply_structure_filter_settings(self, *, refresh_lists: bool) -> None:
+    def apply_structure_filter_settings(
+        self,
+        *,
+        refresh_lists: bool,
+    ) -> None:
         if self.rtstruct is None:
             return
-        self.target_containment_cache = {}
-        self.stereotactic_metrics_cache = {}
-        self.stereotactic_volume_context_cache = {}
-        self.cached_target_table_rows = None
         if refresh_lists:
             self.populate_structures_list()
             self.on_structure_visibility_changed()
@@ -2495,6 +2551,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         hidden_changed = hidden_before != (normalized_name in self.hidden_structure_names)
         target_changed = target_before != (normalized_name in self.additional_target_subvolume_names)
         if hidden_changed or target_changed:
+            self.invalidate_target_selection_caches(
+                normalized_name,
+                hidden_changed=hidden_changed,
+                target_changed=target_changed,
+            )
             self.apply_structure_filter_settings(refresh_lists=hidden_changed)
 
     def on_show_structure_filter_popup(self) -> None:
@@ -2502,15 +2563,26 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             return
         dialog = self.ensure_structure_filter_dialog()
         self.populate_structure_filter_dialog()
+        dialog.adjustSize()
+        dialog_size = dialog.sizeHint().expandedTo(dialog.minimumSize())
         anchor_widget = None
         if hasattr(self, "main_toolbar"):
             anchor_widget = self.main_toolbar.widgetForAction(self.structure_filter_action)
         if anchor_widget is not None:
-            popup_origin = anchor_widget.mapToGlobal(
-                QtCore.QPoint(0, anchor_widget.height())
-            )
+            anchor_top_left = anchor_widget.mapToGlobal(QtCore.QPoint(0, anchor_widget.height()))
+            anchor_top_right = anchor_widget.mapToGlobal(QtCore.QPoint(anchor_widget.width(), anchor_widget.height()))
         else:
-            popup_origin = self.mapToGlobal(QtCore.QPoint(0, 0))
+            anchor_top_left = self.mapToGlobal(QtCore.QPoint(0, 0))
+            anchor_top_right = anchor_top_left
+        window_top_left = self.mapToGlobal(self.rect().topLeft())
+        window_bottom_right = self.mapToGlobal(self.rect().bottomRight())
+        min_x = window_top_left.x()
+        max_x = max(min_x, window_bottom_right.x() - dialog_size.width())
+        min_y = window_top_left.y()
+        max_y = max(min_y, window_bottom_right.y() - dialog_size.height())
+        popup_x = min(max(anchor_top_right.x() - dialog_size.width(), min_x), max_x)
+        popup_y = min(max(anchor_top_left.y(), min_y), max_y)
+        popup_origin = QtCore.QPoint(popup_x, popup_y)
         dialog.move(popup_origin)
         dialog.show()
         dialog.raise_()
@@ -2634,6 +2706,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         k, r, c = self.max_tissue_index_zyx
         self.go_to_point(k, r, c)
 
+    def get_max_dose_goal_lines(self) -> List[Tuple[str, Optional[str]]]:
+        if self.sampled_dose_volume_ct is None:
+            return []
+        if not np.isfinite(self.sampled_dose_volume_ct).any():
+            return []
+        max_dose_gy = float(np.nanmax(self.sampled_dose_volume_ct))
+        if not np.isfinite(max_dose_gy):
+            return []
+        return [(f"{max_dose_gy:.2f} Gy", None)]
+
     def on_toggle_dose_overlay(self, checked: bool):
         self.dose_overlay_enabled = checked
         self.dose_toggle_button.setText("On" if checked else "Off")
@@ -2676,7 +2758,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.reset_window_level_button.setEnabled(not locked)
         self.dose_opacity_slider.setEnabled(not locked and self.dose is not None)
         self.dose_toggle_button.setEnabled(not locked and self.dose is not None)
-        self.max_dose_button.setEnabled(not locked and self.sampled_dose_volume_ct is not None)
         self.dose_range_slider.setEnabled(not locked and self.dose is not None)
         self.dose_min_edit.setEnabled(not locked and self.dose is not None)
         self.dose_max_edit.setEnabled(not locked and self.dose is not None)
@@ -2708,7 +2789,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.reset_window_level_button.setEnabled(not locked)
         self.dose_opacity_slider.setEnabled((not locked) and self.dose is not None)
         self.dose_toggle_button.setEnabled((not locked) and self.dose is not None)
-        self.max_dose_button.setEnabled((not locked) and self.sampled_dose_volume_ct is not None)
         self.dose_range_slider.setEnabled((not locked) and self.dose is not None)
         self.dose_min_edit.setEnabled((not locked) and self.dose is not None)
         self.dose_max_edit.setEnabled((not locked) and self.dose is not None)
@@ -3022,9 +3102,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def try_stage_patient_plan_lines_from_cache(self, folder: str, *, pump_events: bool = False) -> bool:
         bundle_path = compute_review_bundle_path(folder)
         if bundle_path is not None and bundle_path.exists():
-            loaded_bundle_cache = load_review_bundle_review_cache_file(bundle_path)
-            if loaded_bundle_cache is not None:
-                patient_plan_lines_payload = loaded_bundle_cache.payload.get("patient_plan_lines")
+            loaded_bundle = load_review_bundle(bundle_path)
+            if loaded_bundle is not None:
+                self.staged_review_bundle_folder = folder
+                self.staged_review_bundle_data = loaded_bundle
+                loaded_bundle_cache = loaded_bundle.review_cache_data
+                patient_plan_lines_payload = loaded_bundle_cache.payload.get("patient_plan_lines") if loaded_bundle_cache is not None else None
                 if isinstance(patient_plan_lines_payload, list):
                     patient_plan_lines = [str(line).strip() for line in patient_plan_lines_payload if str(line).strip()]
                     if patient_plan_lines:
@@ -3046,36 +3129,96 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.set_patient_plan_lines(patient_plan_lines, pump_events=pump_events)
         return True
 
-    def refresh_constraint_sheet_combo(self, preferred_sheet_name: Optional[str] = None) -> None:
+    def get_constraint_source_path(self, sheet_name: Optional[str]) -> Optional[str]:
+        if sheet_name == SCRIPT_CONSTRAINTS_LABEL:
+            return self.constraint_script_xml_path
+        return get_constraints_workbook_path()
+
+    def get_display_constraint_notes(self) -> Dict[str, str]:
+        combined_notes = dict(self.script_constraint_notes)
+        for note_key, note_text in self.constraint_notes.items():
+            cleaned_note = note_text.strip()
+            if not cleaned_note:
+                continue
+            if note_key in combined_notes and combined_notes[note_key].strip():
+                combined_notes[note_key] = self.compose_constraint_note_text(combined_notes[note_key], cleaned_note)
+            else:
+                combined_notes[note_key] = cleaned_note
+        return combined_notes
+
+    def load_constraint_source(self, sheet_name: Optional[str]) -> Optional[str]:
         workbook_path = get_constraints_workbook_path()
-        self.structure_filter_csv_path = workbook_path
-        self.constraint_workbook_error = None
-        if workbook_path is None:
-            self.available_constraint_sheet_names = []
-            self.constraints_sheet_name = None
-            blocker = QtCore.QSignalBlocker(self.constraint_sheet_combo)
-            self.constraint_sheet_combo.clear()
-            self.constraint_sheet_combo.setEnabled(False)
-            del blocker
-            return
+        self.constraints_sheet_name = sheet_name if sheet_name else None
+        self.structure_filter_csv_path = self.get_constraint_source_path(self.constraints_sheet_name)
+        self.script_constraint_notes = {}
+        self.structure_goal_evaluations = {}
 
         try:
-            sheet_names = list_constraints_workbook_sheets(workbook_path)
+            if self.constraints_sheet_name is None:
+                self.csv_structure_goals_by_name = {}
+                self.structure_csv_order = []
+            elif self.constraints_sheet_name == SCRIPT_CONSTRAINTS_LABEL:
+                if self.constraint_script_xml_path is None:
+                    self.csv_structure_goals_by_name = {}
+                    self.structure_csv_order = []
+                else:
+                    (
+                        _,
+                        self.csv_structure_goals_by_name,
+                        self.structure_csv_order,
+                        self.script_constraint_notes,
+                    ) = load_structure_constraints_script(self.constraint_script_xml_path)
+            elif workbook_path is None:
+                self.csv_structure_goals_by_name = {}
+                self.structure_csv_order = []
+            else:
+                _, self.csv_structure_goals_by_name, self.structure_csv_order = load_structure_constraints_sheet(
+                    workbook_path,
+                    self.constraints_sheet_name,
+                    self.plan_phases,
+                )
         except Exception as exc:
-            logger.warning("Failed to read constraints workbook: %s (%s)", workbook_path, exc)
-            self.constraint_workbook_error = str(exc)
-            sheet_names = []
+            self.csv_structure_goals_by_name = {}
+            self.structure_csv_order = []
+            self.script_constraint_notes = {}
+            self.rebuild_structure_goals_by_name()
+            return str(exc)
+
+        self.rebuild_structure_goals_by_name()
+        return None
+
+    def refresh_constraint_sheet_combo(self, preferred_sheet_name: Optional[str] = None) -> None:
+        workbook_path = get_constraints_workbook_path()
+        self.constraint_script_xml_path = find_constraint_script_xml_file(self.current_patient_folder)
+        self.constraint_workbook_error = None
+
+        if workbook_path is None:
+            workbook_sheet_names: List[str] = []
+        else:
+            try:
+                workbook_sheet_names = list_constraints_workbook_sheets(workbook_path)
+            except Exception as exc:
+                logger.warning("Failed to read constraints workbook: %s (%s)", workbook_path, exc)
+                self.constraint_workbook_error = str(exc)
+                workbook_sheet_names = []
+
+        sheet_names = list(workbook_sheet_names)
+        if self.constraint_script_xml_path is not None:
+            sheet_names.append(SCRIPT_CONSTRAINTS_LABEL)
 
         self.available_constraint_sheet_names = sheet_names
-        if preferred_sheet_name in {None, NO_CONSTRAINTS_SHEET_LABEL}:
+        if preferred_sheet_name == NO_CONSTRAINTS_SHEET_LABEL:
             selected_sheet_name = None
         elif preferred_sheet_name in sheet_names:
             selected_sheet_name = preferred_sheet_name
         elif self.constraints_sheet_name in sheet_names:
             selected_sheet_name = self.constraints_sheet_name
+        elif preferred_sheet_name is None and self.constraint_script_xml_path is not None:
+            selected_sheet_name = SCRIPT_CONSTRAINTS_LABEL
         else:
             selected_sheet_name = None
         self.constraints_sheet_name = selected_sheet_name
+        self.structure_filter_csv_path = self.get_constraint_source_path(selected_sheet_name)
 
         blocker = QtCore.QSignalBlocker(self.constraint_sheet_combo)
         self.constraint_sheet_combo.clear()
@@ -3093,6 +3236,31 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 8000,
             )
 
+    def apply_constraint_required_structure_selection(self, *, refresh_dvh: bool) -> None:
+        if self.rtstruct is None:
+            return
+        self.populate_structures_list()
+        newly_required_names = [
+            normalized_name
+            for normalized_name in self.csv_structure_goals_by_name
+            if self.is_listable_structure_name(normalized_name)
+        ]
+        selection_changed = False
+        for normalized_name in newly_required_names:
+            if self.dvh_structure_list.set_checked(normalized_name, True):
+                selection_changed = True
+
+        current_curve_names = set(self.current_dvh_curve_names())
+        if refresh_dvh and (
+            selection_changed
+            or any(name not in current_curve_names for name in newly_required_names)
+        ):
+            self.refresh_dvh()
+        else:
+            self.refresh_visible_structure_goal_evaluations()
+            self.update_dvh_goal_evaluation_cache()
+            self.update_structure_list_goal_texts()
+
     def apply_constraint_sheet(
         self,
         sheet_name: Optional[str],
@@ -3100,20 +3268,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         refresh_lists: bool = True,
         refresh_dvh: bool = True,
     ) -> None:
-        workbook_path = get_constraints_workbook_path()
-        self.structure_filter_csv_path = workbook_path
-        self.constraints_sheet_name = sheet_name if sheet_name else None
-
-        if workbook_path is None or not sheet_name:
-            self.csv_structure_goals_by_name = {}
-            self.structure_csv_order = []
-        else:
-            _, self.csv_structure_goals_by_name, self.structure_csv_order = load_structure_constraints_sheet(
-                workbook_path,
-                sheet_name,
-                self.plan_phases,
-            )
-        self.rebuild_structure_goals_by_name()
+        constraint_error = self.load_constraint_source(sheet_name)
+        if constraint_error:
+            self.statusBar().showMessage(f"Could not load constraints source: {constraint_error}", 8000)
         self.cached_target_table_rows = None
 
         if self.rtstruct is None:
@@ -3122,27 +3279,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
         self.sort_rtstruct_structures_for_display()
         if refresh_lists:
-            self.populate_structures_list()
-            newly_required_names = [
-                normalized_name
-                for normalized_name in self.csv_structure_goals_by_name
-                if self.is_listable_structure_name(normalized_name)
-            ]
-            selection_changed = False
-            for normalized_name in newly_required_names:
-                if self.dvh_structure_list.set_checked(normalized_name, True):
-                    selection_changed = True
-
-            current_curve_names = set(self.current_dvh_curve_names())
-            if refresh_dvh and (
-                selection_changed
-                or any(name not in current_curve_names for name in newly_required_names)
-            ):
-                self.refresh_dvh()
-            else:
-                self.refresh_visible_structure_goal_evaluations()
-                self.update_dvh_goal_evaluation_cache()
-                self.update_structure_list_goal_texts()
+            self.apply_constraint_required_structure_selection(refresh_dvh=refresh_dvh)
         self.update_targets_table()
 
     def on_constraint_sheet_changed(self, sheet_name: str) -> None:
@@ -3418,14 +3555,14 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         selected_constraint_set = self.constraints_sheet_name or NO_CONSTRAINTS_SHEET_LABEL
         legacy_cache_path = self.get_dvh_cache_path()
         derived_array_cache_path = self.get_derived_array_cache_path(legacy_cache_path)
-        screenshot_path = self.get_review_screenshot_path(legacy_cache_path)
+        constraints_source_path = self.get_constraint_source_path(self.constraints_sheet_name)
         payload = build_review_cache_payload(
             patient_plan_lines=list(self.patient_plan_lines or []),
             selected_constraint_set=selected_constraint_set,
-            constraints_file_name=Path(self.structure_filter_csv_path).name if self.structure_filter_csv_path else None,
+            constraints_file_name=Path(constraints_source_path).name if constraints_source_path else None,
             constraints_sheet_name=self.constraints_sheet_name,
             rtstruct_file_name=Path(self.rtstruct_path).name if self.rtstruct_path else None,
-            constraints_fingerprint=build_file_fingerprint(self.structure_filter_csv_path),
+            constraints_fingerprint=build_file_fingerprint(constraints_source_path),
             rtstruct_fingerprint=build_file_fingerprint(self.rtstruct_path),
             rtdose_fingerprints=build_file_fingerprints(self.latest_timing_rtdose_paths),
             rtplan_fingerprints=build_file_fingerprints(self.current_rtplan_paths),
@@ -3468,7 +3605,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             logger.warning("Failed to save the review bundle: %s", exc)
             raise
 
-        for legacy_path in (legacy_cache_path, derived_array_cache_path, screenshot_path):
+        for legacy_path in (legacy_cache_path, derived_array_cache_path):
             if legacy_path is None or legacy_path == path:
                 continue
             try:
@@ -3480,12 +3617,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if warnings:
             return "Saved review data, but " + " ".join(warnings)
         return None
-
-    def get_review_screenshot_path(self, base_path: Optional[Path] = None) -> Optional[Path]:
-        cache_path = base_path if base_path is not None else self.get_dvh_cache_path()
-        if cache_path is None:
-            return None
-        return cache_path.with_name(f"{cache_path.stem}_screenshot.png")
 
     def capture_review_screenshot_png_bytes(self) -> Tuple[Optional[bytes], Optional[str]]:
         self.pump_viewer_ui()
@@ -3567,6 +3698,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 plan_phases=list(self.plan_phases),
                 patient_plan_lines=self.patient_plan_lines,
             ),
+            "image_view_bounds": self.image_view_bounds if self.image_view_bounds is not None else compute_image_view_bounds(self.ct),
             "dose": self.dose,
             "rtstruct": self.rtstruct,
             "rtstruct_path": self.rtstruct_path,
@@ -3681,6 +3813,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             no_constraints_sheet_label=NO_CONSTRAINTS_SHEET_LABEL,
             constraints_sheet_name=self.constraints_sheet_name,
             structure_filter_csv_path=self.structure_filter_csv_path,
+            constraint_script_xml_path=self.constraint_script_xml_path,
+            script_constraints_label=SCRIPT_CONSTRAINTS_LABEL,
             rtstruct_path=self.rtstruct_path,
             rtdose_paths=self.latest_timing_rtdose_paths,
             rtplan_paths=self.current_rtplan_paths,
@@ -3814,9 +3948,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             for goal_index, goal in enumerate(goals):
                 evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
                 note_key = self.get_constraint_note_key(normalized_name, goal)
+                display_constraint_notes = self.get_display_constraint_notes()
                 note_text = self.compose_constraint_note_text(
                     self.get_computed_constraint_note_text(normalized_name, goals, goal_index, evaluation),
-                    self.constraint_notes.get(note_key, ""),
+                    display_constraint_notes.get(note_key, ""),
                 )
                 rows.append(
                     {
@@ -4698,13 +4833,11 @@ h2 {{
     def update_dose_range_controls(self):
         interaction_enabled = not self.autoscroll_button.isChecked()
         enabled = self.dose is not None and interaction_enabled
-        max_enabled = self.sampled_dose_volume_ct is not None and interaction_enabled
         self.dose_opacity_slider.setEnabled(enabled)
         self.dose_toggle_button.setEnabled(enabled)
         self.dose_min_edit.setEnabled(enabled)
         self.dose_max_edit.setEnabled(enabled)
         self.dose_range_slider.setEnabled(enabled)
-        self.max_dose_button.setEnabled(max_enabled)
 
         if self.dose is None:
             for widget, text in ((self.dose_min_edit, "0.00"), (self.dose_max_edit, "0.00")):
@@ -6031,9 +6164,12 @@ h2 {{
             if self.restore_saved_results_without_calculation:
                 return []
             progress_message = "Computing SRS metrics" if self.stereotactic_summary_enabled() else "Computing metrics"
-            self.show_progress_status(progress_message)
+            show_progress = not self.target_metrics_cache or self.stereotactic_summary_enabled()
+            if show_progress:
+                self.show_progress_status(progress_message)
             self.cached_target_table_rows = self.build_target_table_rows()
-            self.clear_progress_status(progress_message)
+            if show_progress:
+                self.clear_progress_status(progress_message)
         return self.cached_target_table_rows
 
     def update_targets_table_column_widths(self):
@@ -6140,33 +6276,41 @@ h2 {{
             return
 
         self.constraints_table_refresh_pending = False
-        rows = build_constraints_table_presentation_rows(
-            rtstruct=self.rtstruct,
-            structure_goals_by_name=self.structure_goals_by_name,
-            structure_goal_evaluations=self.structure_goal_evaluations,
-            dvh_structure_goal_evaluation_cache=self.dvh_structure_goal_evaluation_cache,
-            constraint_notes=self.constraint_notes,
-            constraints_sheet_name=self.constraints_sheet_name or "",
-            get_curve_for_name=self.get_curve_for_name,
-            get_constraint_note_key=self.get_constraint_note_key,
-            is_custom_only_constraint=self.is_custom_only_constraint,
-            allow_curve_computation=not self.restore_saved_results_without_calculation,
-        )
-        self.constraint_editor_widgets = refresh_constraints_table(
-            self.constraints_table,
-            rows,
-            constraint_editor_state=self.constraint_editor_state,
-            structure_names=self.get_listable_structure_names(),
-            on_edit_note=self.edit_constraint_note,
-            on_field_change=self.on_constraint_editor_field_changed,
-            on_commit=self.commit_constraint_editor,
-            on_cancel=self.cancel_constraint_editor,
-        )
-        if self.constraint_editor_state is not None:
-            self.update_constraint_editor_preview()
+        self.constraints_table.setUpdatesEnabled(False)
+        try:
+            rows = build_constraints_table_presentation_rows(
+                rtstruct=self.rtstruct,
+                structure_goals_by_name=self.structure_goals_by_name,
+                structure_goal_evaluations=self.structure_goal_evaluations,
+                dvh_structure_goal_evaluation_cache=self.dvh_structure_goal_evaluation_cache,
+                constraint_notes=self.get_display_constraint_notes(),
+                constraints_sheet_name=self.constraints_sheet_name or "",
+                get_curve_for_name=self.get_curve_for_name,
+                get_constraint_note_key=self.get_constraint_note_key,
+                is_custom_only_constraint=self.is_custom_only_constraint,
+                allow_curve_computation=not self.restore_saved_results_without_calculation,
+            )
+            self.constraint_editor_widgets = refresh_constraints_table(
+                self.constraints_table,
+                rows,
+                constraint_editor_state=self.constraint_editor_state,
+                structure_names=self.get_listable_structure_names(),
+                on_edit_note=self.edit_constraint_note,
+                on_field_change=self.on_constraint_editor_field_changed,
+                on_commit=self.commit_constraint_editor,
+                on_cancel=self.cancel_constraint_editor,
+            )
+            if self.constraint_editor_state is not None:
+                self.update_constraint_editor_preview()
+        finally:
+            self.constraints_table.setUpdatesEnabled(True)
 
+        QtCore.QTimer.singleShot(0, self.polish_constraints_table_layout)
+
+    def polish_constraints_table_layout(self):
         self.constraints_table.resizeColumnsToContents()
-        QtCore.QTimer.singleShot(0, self.update_constraints_table_column_widths)
+        self.update_constraints_table_column_widths()
+        self.constraints_table.resizeRowsToContents()
 
     def get_constraint_evaluations_for_structure(
         self,
@@ -6364,8 +6508,143 @@ h2 {{
 
         return [(f"Coverage {coverage_text}", None)]
 
+    def _point_inside_contours_xor(
+        self,
+        row_value: float,
+        col_value: float,
+        contours_rc: List[np.ndarray],
+    ) -> bool:
+        inside = False
+        for contour in contours_rc:
+            contour = np.asarray(contour, dtype=np.float64)
+            if contour.shape[0] < 3:
+                continue
+            rr = contour[:, 0]
+            cc = contour[:, 1]
+            next_rr = np.roll(rr, -1)
+            next_cc = np.roll(cc, -1)
+            contour_inside = False
+            for r0, c0, r1, c1 in zip(rr, cc, next_rr, next_cc):
+                if np.isclose(r0, r1):
+                    continue
+                intersects = ((r0 > row_value) != (r1 > row_value))
+                if not intersects:
+                    continue
+                cross_col = (c1 - c0) * (row_value - r0) / (r1 - r0) + c0
+                if col_value < cross_col:
+                    contour_inside = not contour_inside
+            inside ^= contour_inside
+        return inside
+
+    def _get_ptv_structures(self) -> List[StructureSliceContours]:
+        if self.rtstruct is None:
+            return []
+        return [
+            structure
+            for structure in self.rtstruct.structures
+            if normalize_structure_name(structure.name).startswith("PTV")
+        ]
+
+    def _is_index_outside_all_ptv_contours(self, index_zyx: Tuple[int, int, int]) -> bool:
+        if self.ct is None or self.rtstruct is None:
+            return True
+        slice_index, row_index, col_index = (int(index_zyx[0]), int(index_zyx[1]), int(index_zyx[2]))
+        row_center = float(row_index) + 0.5
+        col_center = float(col_index) + 0.5
+        for structure in self._get_ptv_structures():
+            contours_rc = structure.points_rc_by_slice.get(slice_index, [])
+            if contours_rc and self._point_inside_contours_xor(row_center, col_center, contours_rc):
+                return False
+        return True
+
+    def _dose_index_to_patient_xyz(self, index_zyx: Tuple[int, int, int]) -> Optional[np.ndarray]:
+        if self.dose is None:
+            return None
+        slice_index, row_index, col_index = (int(index_zyx[0]), int(index_zyx[1]), int(index_zyx[2]))
+        if not (
+            0 <= slice_index < self.dose.dose_gy.shape[0]
+            and 0 <= row_index < self.dose.dose_gy.shape[1]
+            and 0 <= col_index < self.dose.dose_gy.shape[2]
+        ):
+            return None
+        dose_row_cos, dose_col_cos, _dose_normal = get_ct_row_col_normal(self.dose.image_orientation_patient)
+        slice_origin = np.asarray(self.dose.slice_origins_xyz_mm[slice_index], dtype=np.float64)
+        spacing_col_mm = float(self.dose.spacing_xyz_mm[0])
+        spacing_row_mm = float(self.dose.spacing_xyz_mm[1])
+        return (
+            slice_origin
+            + (float(col_index) + 0.5) * spacing_col_mm * dose_row_cos
+            + (float(row_index) + 0.5) * spacing_row_mm * dose_col_cos
+        )
+
+    def _patient_xyz_to_ct_index(self, patient_xyz: np.ndarray) -> Optional[Tuple[int, int, int]]:
+        if self.ct is None:
+            return None
+        patient_xyz = np.asarray(patient_xyz, dtype=np.float64).reshape(1, 3)
+        slice_index = int(nearest_ct_slice_for_points(patient_xyz, self.ct))
+        row_col = patient_xyz_to_ct_rc(patient_xyz, self.ct, slice_index)[0]
+        row_index = int(np.clip(np.floor(float(row_col[0])), 0, self.ct.rows - 1))
+        col_index = int(np.clip(np.floor(float(row_col[1])), 0, self.ct.cols - 1))
+        return slice_index, row_index, col_index
+
+    def _is_patient_xyz_outside_all_ptv_contours(self, patient_xyz: np.ndarray) -> bool:
+        if self.ct is None or self.rtstruct is None:
+            return True
+        patient_xyz = np.asarray(patient_xyz, dtype=np.float64).reshape(1, 3)
+        slice_index = int(nearest_ct_slice_for_points(patient_xyz, self.ct))
+        row_col = patient_xyz_to_ct_rc(patient_xyz, self.ct, slice_index)[0]
+        row_value = float(row_col[0])
+        col_value = float(row_col[1])
+        for structure in self._get_ptv_structures():
+            contours_rc = structure.points_rc_by_slice.get(slice_index, [])
+            if contours_rc and self._point_inside_contours_xor(row_value, col_value, contours_rc):
+                return False
+        return True
+
+    def _compute_max_tissue_result(self) -> Optional[Tuple[float, Tuple[int, int, int]]]:
+        if self.ct is None or self.rtstruct is None or self.dose is None:
+            return None
+
+        ptv_structures = self._get_ptv_structures()
+        if not ptv_structures:
+            return None
+
+        dose_flat = np.asarray(self.dose.dose_gy, dtype=np.float32).ravel()
+        finite_mask = np.isfinite(dose_flat)
+        valid_count = int(np.count_nonzero(finite_mask))
+        if valid_count == 0:
+            return None
+
+        ranked_dose = np.where(finite_mask, dose_flat, -np.inf)
+        checked_flat_indices: set[int] = set()
+        top_k = min(valid_count, 4096)
+
+        while top_k > 0:
+            top_indices = np.argpartition(ranked_dose, -top_k)[-top_k:]
+            top_indices = top_indices[np.argsort(ranked_dose[top_indices])[::-1]]
+            for flat_index in top_indices:
+                flat_index_int = int(flat_index)
+                if flat_index_int in checked_flat_indices:
+                    continue
+                checked_flat_indices.add(flat_index_int)
+                dose_index = np.unravel_index(flat_index_int, self.dose.dose_gy.shape)
+                dose_index_zyx = (int(dose_index[0]), int(dose_index[1]), int(dose_index[2]))
+                patient_xyz = self._dose_index_to_patient_xyz(dose_index_zyx)
+                if patient_xyz is None or not self._is_patient_xyz_outside_all_ptv_contours(patient_xyz):
+                    continue
+                ct_index_zyx = self._patient_xyz_to_ct_index(patient_xyz)
+                if ct_index_zyx is None:
+                    continue
+                dose_gy = float(self.dose.dose_gy[dose_index_zyx])
+                if np.isfinite(dose_gy):
+                    return dose_gy, ct_index_zyx
+            if top_k >= valid_count:
+                break
+            top_k = min(valid_count, top_k * 4)
+        return None
+
     def get_max_tissue_dose_goal_lines(self) -> List[Tuple[str, Optional[str]]]:
-        if self.ct is None or self.rtstruct is None or self.sampled_dose_volume_ct is None:
+        if self.ct is None or self.rtstruct is None or self.dose is None:
             return []
 
         if self.max_tissue_dose_gy_cache is None and (
@@ -6373,36 +6652,17 @@ h2 {{
         ):
             return []
 
-        if self.max_tissue_dose_gy_cache is None:
-            ptv_union_masks = self.get_ptv_union_slice_masks()
-            if not ptv_union_masks and not any(
-                normalize_structure_name(structure.name).startswith("PTV")
-                for structure in self.rtstruct.structures
-            ):
-                return []
+        if self.max_tissue_index_zyx is not None and not self._is_index_outside_all_ptv_contours(self.max_tissue_index_zyx):
+            self.max_tissue_dose_gy_cache = None
+            self.max_tissue_index_zyx = None
 
-            tissue_mask = np.isfinite(self.sampled_dose_volume_ct)
-            ptv_union_volume_mask = self.get_ptv_union_volume_mask()
-            if ptv_union_volume_mask is not None and ptv_union_volume_mask.shape == tissue_mask.shape:
-                tissue_mask &= ~ptv_union_volume_mask
-            if np.any(tissue_mask):
-                tissue_dose_volume = np.where(tissue_mask, self.sampled_dose_volume_ct, -np.inf)
-                max_tissue_dose_gy = float(np.max(tissue_dose_volume))
-                if np.isfinite(max_tissue_dose_gy):
-                    flat_index = int(np.argmax(tissue_dose_volume))
-                    max_index = np.unravel_index(flat_index, tissue_dose_volume.shape)
-                    self.max_tissue_dose_gy_cache = max_tissue_dose_gy
-                    self.max_tissue_index_zyx = (
-                        int(max_index[0]),
-                        int(max_index[1]),
-                        int(max_index[2]),
-                    )
-                else:
-                    self.max_tissue_dose_gy_cache = None
-                    self.max_tissue_index_zyx = None
-            else:
+        if self.max_tissue_dose_gy_cache is None:
+            result = self._compute_max_tissue_result()
+            if result is None:
                 self.max_tissue_dose_gy_cache = None
                 self.max_tissue_index_zyx = None
+            else:
+                self.max_tissue_dose_gy_cache, self.max_tissue_index_zyx = result
 
         if self.max_tissue_dose_gy_cache is None:
             return []
@@ -6411,6 +6671,8 @@ h2 {{
     def get_axial_structure_goal_lines(self, normalized_name: str) -> List[Tuple[str, Optional[str]]]:
         if normalized_name == MAX_TISSUE_ROW_NAME:
             return self.get_max_tissue_dose_goal_lines()
+        if normalized_name == MAX_DOSE_ROW_NAME:
+            return self.get_max_dose_goal_lines()
         lines: List[Tuple[str, Optional[str]]] = []
         if normalized_name.startswith("PTV"):
             lines.extend(self.get_ptv_coverage_goal_lines(normalized_name))
@@ -6472,6 +6734,14 @@ h2 {{
                     points_rc_by_slice={},
                 )
             )
+        if include_max_tissue and self.get_max_dose_goal_lines():
+            structures.append(
+                StructureSliceContours(
+                    name=MAX_DOSE_ROW_LABEL,
+                    color_rgb=(255, 255, 255),
+                    points_rc_by_slice={},
+                )
+            )
         structures.extend(non_ptv_structures)
         return RTStructData(
             structures=structures,
@@ -6488,7 +6758,7 @@ h2 {{
             axial_list_rtstruct,
             axial_goal_lines_getter,
             default_visibility_resolver=lambda normalized_name: normalized_name.startswith("PTV"),
-            show_checkbox_resolver=lambda normalized_name: normalized_name != MAX_TISSUE_ROW_NAME,
+            show_checkbox_resolver=lambda normalized_name: normalized_name not in {MAX_TISSUE_ROW_NAME, MAX_DOSE_ROW_NAME},
             item_options_getter=lambda normalized_name: (
                 {
                     "trailing_button_text": "MT",
@@ -6497,7 +6767,16 @@ h2 {{
                     "inline_goals_compact": True,
                 }
                 if normalized_name == MAX_TISSUE_ROW_NAME
-                else {}
+                else (
+                    {
+                        "trailing_button_text": "MD",
+                        "trailing_button_callback": self.on_go_to_max_dose,
+                        "inline_goals": True,
+                        "inline_goals_compact": True,
+                    }
+                    if normalized_name == MAX_DOSE_ROW_NAME
+                    else {}
+                )
             ),
         )
         self.dvh_structure_list.set_structures(
