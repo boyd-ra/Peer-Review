@@ -545,16 +545,10 @@ def _get_default_colorwash_min_dose_gy(
                 continue
             ptv_dose_values.append(float(int(digits)) / 100.0)
 
-    if len(available_phase_rx) == 1:
-        return available_phase_rx[0] * 0.95
-    if len(available_phase_rx) > 1:
-        if ptv_dose_values:
-            return min(ptv_dose_values) * 0.95
-        return min(available_phase_rx) * 0.95
     if ptv_dose_values:
-        if len(ptv_dose_values) == 1:
-            return ptv_dose_values[0] * 0.95
         return min(ptv_dose_values) * 0.95
+    if available_phase_rx:
+        return min(available_phase_rx) * 0.95
     return 0.0
 
 

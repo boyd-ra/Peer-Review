@@ -107,7 +107,7 @@ def create_target_name_cell_widget(
     layout.setSpacing(6)
 
     label = QtWidgets.QLabel(display_name)
-    label.setStyleSheet(f"color: rgb({color_rgb[0]}, {color_rgb[1]}, {color_rgb[2]});")
+    label.setStyleSheet("color: #f2f2f2;")
     font = label.font()
     font.setPointSize(font_point_size)
     if is_primary_ptv:

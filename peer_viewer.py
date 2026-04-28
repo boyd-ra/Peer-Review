@@ -566,13 +566,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 column_index,
                 QtWidgets.QHeaderView.ResizeMode.Fixed,
             )
-        table_font = self.constraints_table.font()
-        table_font.setPointSize(11)
-        self.constraints_table.setFont(table_font)
-        header_font = self.constraints_table.horizontalHeader().font()
-        header_font.setPointSize(11)
-        header_font.setBold(True)
-        self.constraints_table.horizontalHeader().setFont(header_font)
         self.constraints_table.verticalHeader().setDefaultSectionSize(30)
         constraints_layout.addWidget(self.constraints_table, 1)
 
@@ -597,13 +590,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 column_index,
                 QtWidgets.QHeaderView.ResizeMode.Fixed,
             )
-        targets_table_font = self.targets_table.font()
-        targets_table_font.setPointSize(11)
-        self.targets_table.setFont(targets_table_font)
-        targets_header_font = self.targets_table.horizontalHeader().font()
-        targets_header_font.setPointSize(11)
-        targets_header_font.setBold(True)
-        self.targets_table.horizontalHeader().setFont(targets_header_font)
         self.targets_table.verticalHeader().setDefaultSectionSize(30)
         targets_layout.addWidget(self.targets_table, 1)
 
@@ -692,6 +678,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structures_list = QtWidgets.QListWidget()
         self.structures_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self.structures_list.setSpacing(1)
+        self.sync_review_table_fonts_to_structure_list()
         self.patient_name_label = QtWidgets.QLabel("")
         self.patient_name_label.setWordWrap(False)
         self.patient_name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
@@ -970,6 +957,28 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.tabs.setCurrentWidget(axial_tab)
 
         self.statusBar().clearMessage()
+
+    def sync_review_table_fonts_to_structure_list(self) -> None:
+        structure_font = self.structures_list.font()
+        structure_font_size = structure_font.pointSize()
+        if structure_font_size <= 0:
+            return
+
+        constraints_font = self.constraints_table.font()
+        constraints_font.setPointSize(structure_font_size)
+        self.constraints_table.setFont(constraints_font)
+        constraints_header_font = self.constraints_table.horizontalHeader().font()
+        constraints_header_font.setPointSize(structure_font_size)
+        constraints_header_font.setBold(True)
+        self.constraints_table.horizontalHeader().setFont(constraints_header_font)
+
+        targets_font = self.targets_table.font()
+        targets_font.setPointSize(structure_font_size)
+        self.targets_table.setFont(targets_font)
+        targets_header_font = self.targets_table.horizontalHeader().font()
+        targets_header_font.setPointSize(structure_font_size)
+        targets_header_font.setBold(True)
+        self.targets_table.horizontalHeader().setFont(targets_header_font)
 
     def _create_actions(self):
         self.load_patient_action = QtGui.QAction("Load Patient Folder", self)
@@ -4798,16 +4807,10 @@ h2 {{
         ]
         ptv_dose_values = get_ptv_dose_levels_gy(self.rtstruct)
 
-        if len(available_phase_rx) == 1:
-            return available_phase_rx[0] * 0.95
-        if len(available_phase_rx) > 1:
-            if ptv_dose_values:
-                return min(ptv_dose_values) * 0.95
-            return min(available_phase_rx) * 0.95
         if ptv_dose_values:
-            if len(ptv_dose_values) == 1:
-                return ptv_dose_values[0] * 0.95
             return min(ptv_dose_values) * 0.95
+        if available_phase_rx:
+            return min(available_phase_rx) * 0.95
         return 0.0
 
     def get_total_rx_dose_gy(self) -> Optional[float]:

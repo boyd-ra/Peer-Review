@@ -311,7 +311,7 @@ class StructureListItemWidget(QtWidgets.QWidget):
                 "width: 14px; height: 14px; border: 1px solid #7a7a7a; "
                 "border-radius: 3px; background-color: #1c1c1c; } "
                 "QCheckBox::indicator:checked { "
-                "border: 1px solid #79e08f; background-color: #2f9e44; } "
+                "border: 1px solid #b6b6b6; background-color: #7a7a7a; } "
                 "QCheckBox::indicator:hover { border: 1px solid #a0a0a0; }"
             )
             self.checkbox.setToolTip(name)
@@ -437,7 +437,7 @@ class StructureListItemWidget(QtWidgets.QWidget):
                 "width: 14px; height: 14px; border: 1px solid #7a7a7a; "
                 "border-radius: 3px; background-color: #1c1c1c; } "
                 "QCheckBox::indicator:checked { "
-                "border: 1px solid #79e08f; background-color: #2f9e44; } "
+                "border: 1px solid #b6b6b6; background-color: #7a7a7a; } "
                 "QCheckBox::indicator:hover { border: 1px solid #a0a0a0; }"
             )
         if self.title_label is not None:
