@@ -56,11 +56,11 @@ from peer_cache import (
     get_dvh_cache_path as compute_dvh_cache_path,
     get_review_bundle_path as compute_review_bundle_path,
     load_derived_array_cache as load_derived_array_cache_file,
-    load_review_bundle,
+    load_review_bundle_review_cache_file,
+    load_review_bundle_screenshot_bytes,
     load_review_cache_file,
     prepare_review_cache_state,
     PreparedReviewCacheState,
-    ReviewBundleData,
     ReviewCacheFileData,
     save_derived_array_cache as save_derived_array_cache_file,
     save_review_bundle as save_review_bundle_file,
@@ -455,6 +455,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stereotactic_volume_context_cache: Dict[Tuple[str, str, float], Optional[Dict[str, object]]] = {}
         self.max_tissue_dose_gy_cache: Optional[float] = None
         self.max_tissue_index_zyx: Optional[Tuple[int, int, int]] = None
+        self.max_tissue_cache_trusted_from_saved_review = False
         self.ptv_union_slice_mask_cache: Optional[Dict[int, np.ndarray]] = None
         self.ptv_union_volume_mask_cache: Optional[np.ndarray] = None
         self.target_slice_mask_cache: Dict[str, Dict[int, np.ndarray]] = {}
@@ -502,7 +503,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_direction = 1
         self.patient_transition_overlay_process: Optional[subprocess.Popen] = None
         self.staged_review_bundle_folder: Optional[str] = None
-        self.staged_review_bundle_data: Optional[ReviewBundleData] = None
+        self.staged_review_bundle_screenshot_png_bytes: Optional[bytes] = None
         self.isodose_refresh_timer = QtCore.QTimer(self)
         self.isodose_refresh_timer.setSingleShot(True)
         self.isodose_refresh_timer.timeout.connect(self.refresh_all_views)
@@ -1155,6 +1156,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stereotactic_volume_context_cache = {}
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
+        self.max_tissue_cache_trusted_from_saved_review = False
         self.ptv_union_slice_mask_cache = None
         self.ptv_union_volume_mask_cache = None
         self.target_slice_mask_cache = {}
@@ -1645,7 +1647,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if self.rtstruct is not None:
             self.sort_rtstruct_structures_for_display()
             if self.constraints_sheet_name == SCRIPT_CONSTRAINTS_LABEL:
-                self.apply_constraint_required_structure_selection(refresh_dvh=True)
+                self.apply_constraint_required_structure_selection(
+                    refresh_dvh=payload.review_cache_data is None
+                )
         else:
             self.populate_structures_list()
             self.populate_isodose_controls()
@@ -1662,6 +1666,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.stereotactic_volume_context_cache = {}
             self.max_tissue_dose_gy_cache = None
             self.max_tissue_index_zyx = None
+            self.max_tissue_cache_trusted_from_saved_review = False
             self.cached_target_table_rows = None
             self.apply_default_dose_range()
         if self.rtstruct is not None:
@@ -1838,12 +1843,12 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def clear_staged_review_bundle(self) -> None:
         self.staged_review_bundle_folder = None
-        self.staged_review_bundle_data = None
+        self.staged_review_bundle_screenshot_png_bytes = None
 
-    def get_staged_review_bundle_for_folder(self, folder: str) -> Optional[ReviewBundleData]:
+    def get_staged_review_bundle_screenshot_bytes_for_folder(self, folder: str) -> Optional[bytes]:
         if self.staged_review_bundle_folder != folder:
             return None
-        return self.staged_review_bundle_data
+        return self.staged_review_bundle_screenshot_png_bytes
 
     def pump_viewer_ui(self) -> None:
         app = QtWidgets.QApplication.instance()
@@ -1885,16 +1890,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.clear_patient_session_state(quick_swap=fast_activate)
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
-            staged_bundle_data: Optional[ReviewBundleData] = None
+            staged_screenshot_png_bytes: Optional[bytes] = None
             if preloaded_payload is not None and preloaded_payload.patient_plan_lines:
                 self.set_patient_plan_lines(preloaded_payload.patient_plan_lines, pump_events=True)
             elif preloaded_payload is None:
                 self.try_stage_patient_plan_lines_from_cache(folder, pump_events=True)
-                staged_bundle_data = self.get_staged_review_bundle_for_folder(folder)
+                staged_screenshot_png_bytes = self.get_staged_review_bundle_screenshot_bytes_for_folder(folder)
             if preloaded_payload is None:
                 self.tabs.setCurrentWidget(self.axial_tab_widget)
-                if staged_bundle_data is not None:
-                    self.start_patient_transition_overlay_process(staged_bundle_data.screenshot_png_bytes)
+                if staged_screenshot_png_bytes:
+                    self.start_patient_transition_overlay_process(staged_screenshot_png_bytes)
                 self.pump_viewer_ui()
 
             if preloaded_payload is None:
@@ -1904,7 +1909,6 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                     progress_callback=lambda message: self.show_progress_status(message, pump_events=True),
                     patient_plan_callback=lambda lines: self.set_patient_plan_lines(lines, pump_events=True),
                     include_precomputed_view_state=False,
-                    preloaded_bundle_data=staged_bundle_data,
                 )
             else:
                 payload = preloaded_payload
@@ -2916,6 +2920,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.stereotactic_volume_context_cache = {}
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
+        self.max_tissue_cache_trusted_from_saved_review = False
         self.ptv_union_slice_mask_cache = None
         self.ptv_union_volume_mask_cache = None
         self.target_slice_mask_cache = {}
@@ -3102,12 +3107,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def try_stage_patient_plan_lines_from_cache(self, folder: str, *, pump_events: bool = False) -> bool:
         bundle_path = compute_review_bundle_path(folder)
         if bundle_path is not None and bundle_path.exists():
-            loaded_bundle = load_review_bundle(bundle_path)
-            if loaded_bundle is not None:
-                self.staged_review_bundle_folder = folder
-                self.staged_review_bundle_data = loaded_bundle
-                loaded_bundle_cache = loaded_bundle.review_cache_data
-                patient_plan_lines_payload = loaded_bundle_cache.payload.get("patient_plan_lines") if loaded_bundle_cache is not None else None
+            self.staged_review_bundle_folder = folder
+            self.staged_review_bundle_screenshot_png_bytes = load_review_bundle_screenshot_bytes(bundle_path)
+            loaded_bundle_cache = load_review_bundle_review_cache_file(bundle_path)
+            if loaded_bundle_cache is not None:
+                patient_plan_lines_payload = loaded_bundle_cache.payload.get("patient_plan_lines")
                 if isinstance(patient_plan_lines_payload, list):
                     patient_plan_lines = [str(line).strip() for line in patient_plan_lines_payload if str(line).strip()]
                     if patient_plan_lines:
@@ -3860,6 +3864,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_curves = list(prepared_state.curves)
         self.max_tissue_dose_gy_cache = prepared_state.max_tissue_dose_gy
         self.max_tissue_index_zyx = prepared_state.max_tissue_index_zyx
+        self.max_tissue_cache_trusted_from_saved_review = prepared_state.max_tissue_dose_gy is not None
         self.structure_mask_cache = None
         self.structure_mask_cache_names = []
         self.dvh_request_structure_names = {}
@@ -6652,17 +6657,23 @@ h2 {{
         ):
             return []
 
+        if self.max_tissue_dose_gy_cache is not None and self.max_tissue_cache_trusted_from_saved_review:
+            return [(f"{self.max_tissue_dose_gy_cache:.2f} Gy", None)]
+
         if self.max_tissue_index_zyx is not None and not self._is_index_outside_all_ptv_contours(self.max_tissue_index_zyx):
             self.max_tissue_dose_gy_cache = None
             self.max_tissue_index_zyx = None
+            self.max_tissue_cache_trusted_from_saved_review = False
 
         if self.max_tissue_dose_gy_cache is None:
             result = self._compute_max_tissue_result()
             if result is None:
                 self.max_tissue_dose_gy_cache = None
                 self.max_tissue_index_zyx = None
+                self.max_tissue_cache_trusted_from_saved_review = False
             else:
                 self.max_tissue_dose_gy_cache, self.max_tissue_index_zyx = result
+                self.max_tissue_cache_trusted_from_saved_review = False
 
         if self.max_tissue_dose_gy_cache is None:
             return []
