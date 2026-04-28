@@ -995,7 +995,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def _create_toolbar(self):
         tb = self.addToolBar("Main")
         self.main_toolbar = tb
-        tb.addAction(self.load_patient_action)
+        tb.setMovable(False)
+        tb.setFloatable(False)
         tb.addAction(self.load_patient_list_action)
         self.patient_list_combo = QtWidgets.QComboBox(tb)
         self.patient_list_combo.setMinimumWidth(240)
@@ -1006,6 +1007,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.next_patient_button.setEnabled(False)
         tb.addWidget(self.next_patient_button)
         tb.addSeparator()
+        tb.addAction(self.load_patient_action)
         tb.addAction(self.reset_view_action)
         tb.addAction(self.clear_patient_action)
         tb.addAction(self.save_cache_action)
