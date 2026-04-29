@@ -534,6 +534,7 @@ class StructureListItemWidget(QtWidgets.QWidget):
 
 class StructureListManager(QtCore.QObject):
     visibilityChanged = QtCore.Signal()
+    structureToggled = QtCore.Signal(str, bool, str)
 
     def __init__(
         self,
@@ -554,6 +555,7 @@ class StructureListManager(QtCore.QObject):
         self._item_maps: Dict[str, Dict[str, QtWidgets.QListWidgetItem]] = {
             tag: {} for tag, _ in collections
         }
+        self._layout_refresh_pending = False
 
     def set_structures(
         self,
@@ -634,6 +636,30 @@ class StructureListManager(QtCore.QObject):
                 item.setSizeHint(widget.sizeHint())
         self.schedule_layout_refresh()
 
+    def update_goal_and_secondary_texts(
+        self,
+        rtstruct: Optional[RTStructData],
+        goal_line_getter: Callable[[str], List[Tuple[str, Optional[str]]]],
+        secondary_text_getter: Callable[[str], Tuple[Optional[str], Optional[str]]],
+    ) -> None:
+        if rtstruct is None:
+            return
+
+        for tag, _list_widget in self._collections:
+            widget_map = self._widget_maps[tag]
+            item_map = self._item_maps[tag]
+            for structure in rtstruct.structures:
+                normalized_name = normalize_structure_name(structure.name)
+                widget = widget_map.get(normalized_name)
+                item = item_map.get(normalized_name)
+                if widget is None or item is None:
+                    continue
+                widget.set_goal_lines(goal_line_getter(normalized_name))
+                text, color_name = secondary_text_getter(normalized_name)
+                widget.set_secondary_text(text, color_name)
+                item.setSizeHint(widget.sizeHint())
+        self.schedule_layout_refresh()
+
     def visibility_map(self) -> Dict[str, bool]:
         visibility: Dict[str, bool] = {}
         for tag, _list_widget in self._collections:
@@ -698,9 +724,16 @@ class StructureListManager(QtCore.QObject):
             list_widget.doItemsLayout()
             list_widget.viewport().update()
 
-    def schedule_layout_refresh(self) -> None:
+    def _run_scheduled_layout_refresh(self) -> None:
+        self._layout_refresh_pending = False
         self.refresh_layout()
-        QtCore.QTimer.singleShot(0, self.refresh_layout)
+
+    def schedule_layout_refresh(self, *, run_deferred: bool = True) -> None:
+        self.refresh_layout()
+        if not run_deferred or self._layout_refresh_pending:
+            return
+        self._layout_refresh_pending = True
+        QtCore.QTimer.singleShot(0, self._run_scheduled_layout_refresh)
 
     def _populate_list(
         self,
@@ -813,4 +846,5 @@ class StructureListManager(QtCore.QObject):
             widget = self._widget_maps[tag].get(normalized_name)
             if widget is not None and widget.is_checked() != checked:
                 widget.set_checked(checked)
+        self.structureToggled.emit(normalized_name, checked, source_tag)
         self.visibilityChanged.emit()

@@ -465,6 +465,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.cached_target_table_rows: Optional[List[Dict[str, object]]] = None
         self.defer_sidebar_summary_metrics: bool = False
         self.restore_saved_results_without_calculation: bool = False
+        self.pending_centered_view_refresh = False
         self.stereotactic_target_dose_text_by_name: Dict[str, str] = {}
         self.constraints_table_refresh_pending = False
         self.targets_table_refresh_pending = False
@@ -1059,7 +1060,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             edit.textChanged.connect(self.on_isodose_text_changed)
         self.autoscroll_button.toggled.connect(self.on_toggle_autoscroll)
         self.autoscroll_timer.timeout.connect(self.advance_autoscroll)
+        self.axial_structure_list.structureToggled.connect(self.on_structure_list_item_toggled)
         self.axial_structure_list.visibilityChanged.connect(self.on_structure_visibility_changed)
+        self.dvh_structure_list.structureToggled.connect(self.on_structure_list_item_toggled)
         self.dvh_structure_list.visibilityChanged.connect(self.on_dvh_structure_visibility_changed)
         self.dvh_job_manager.finished.connect(self.on_dvh_task_finished)
         self.dvh_job_manager.failed.connect(self.on_dvh_task_failed)
@@ -2608,6 +2611,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def on_tab_changed(self, _index: int):
         self.update_constraints_table_column_widths()
         self.update_targets_table_column_widths()
+        if self.pending_centered_view_refresh and self.tabs.currentWidget() is self.axial_tab_widget:
+            self.pending_centered_view_refresh = False
+            QtCore.QTimer.singleShot(0, self.refresh_all_views)
         if self.constraints_table_refresh_pending and self.tabs.currentWidget() is self.constraints_tab:
             QtCore.QTimer.singleShot(0, self.update_constraints_table)
         if self.targets_table_refresh_pending and self.tabs.currentWidget() is self.targets_tab:
@@ -2757,6 +2763,76 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.center_view_on_point(self.axial_view, *center_points.axial_point)
         self.center_view_on_point(self.sagittal_view, *center_points.sagittal_point)
         self.center_view_on_point(self.coronal_view, *center_points.coronal_point)
+
+    def get_structure_center_indices(
+        self,
+        structure: Optional[StructureSliceContours],
+    ) -> Optional[Tuple[int, int, int]]:
+        if self.ct is None or structure is None:
+            return None
+        slice_indices = sorted(int(index) for index in structure.points_rc_by_slice.keys())
+        if not slice_indices:
+            return None
+
+        weighted_slice_samples: List[float] = []
+        all_points: List[np.ndarray] = []
+        for slice_index in slice_indices:
+            contours = structure.points_rc_by_slice.get(slice_index, [])
+            point_count = 0
+            for contour_rc in contours:
+                contour_array = np.asarray(contour_rc, dtype=np.float32)
+                if contour_array.ndim != 2 or contour_array.shape[1] != 2 or contour_array.size == 0:
+                    continue
+                all_points.append(contour_array)
+                point_count += contour_array.shape[0]
+            if point_count > 0:
+                weighted_slice_samples.extend([float(slice_index)] * point_count)
+
+        if not all_points:
+            return None
+
+        stacked_points = np.concatenate(all_points, axis=0)
+        row_idx = int(np.clip(np.round(float(np.mean(stacked_points[:, 0]))), 0, self.ct.rows - 1))
+        col_idx = int(np.clip(np.round(float(np.mean(stacked_points[:, 1]))), 0, self.ct.cols - 1))
+        if weighted_slice_samples:
+            slice_idx = int(
+                np.clip(
+                    np.round(float(np.mean(weighted_slice_samples))),
+                    0,
+                    self.ct.volume_hu.shape[0] - 1,
+                )
+            )
+        else:
+            slice_idx = int(
+                np.clip(
+                    np.round(float(np.mean(slice_indices))),
+                    0,
+                    self.ct.volume_hu.shape[0] - 1,
+                )
+            )
+        return slice_idx, row_idx, col_idx
+
+    def center_views_on_structure(self, normalized_name: str) -> None:
+        structure = self.get_structure_by_normalized_name(normalized_name)
+        center_indices = self.get_structure_center_indices(structure)
+        if center_indices is None:
+            return
+        slice_idx, row_idx, col_idx = center_indices
+        self.current_row = row_idx
+        self.current_col = col_idx
+        blocker = QtCore.QSignalBlocker(self.slice_slider)
+        self.slice_slider.setValue(slice_idx)
+        del blocker
+
+    def on_structure_list_item_toggled(self, normalized_name: str, checked: bool, source_tag: str) -> None:
+        if not checked:
+            return
+        self.center_views_on_structure(normalized_name)
+        if source_tag == "dvh":
+            if self.tabs.currentWidget() is self.axial_tab_widget:
+                self.refresh_all_views()
+            else:
+                self.pending_centered_view_refresh = True
 
     def set_autoscroll_ui_locked(self, locked: bool):
         self.set_view_interaction_enabled(not locked)
@@ -3274,7 +3350,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         else:
             self.refresh_visible_structure_goal_evaluations()
             self.update_dvh_goal_evaluation_cache()
-            self.update_structure_list_goal_texts()
+            self.update_dvh_structure_list_texts()
 
     def apply_constraint_sheet(
         self,
@@ -3891,7 +3967,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.refresh_visible_structure_goal_evaluations(precomputed=prepared_state.goal_evaluations or None)
         self.update_dvh_goal_evaluation_cache(prepared_state.goal_evaluations or None)
         if refresh_ui:
-            self.update_structure_list_goal_texts()
+            self.update_dvh_structure_list_texts()
             self.render_dvh_plot()
             if self.dvh_curves:
                 self.dvh_status_label.setText("Loaded saved DVH/constraints cache.")
@@ -4445,12 +4521,9 @@ h2 {{
     def update_dvh_secondary_metric_caches(self) -> None:
         for curve in self.dvh_curves:
             normalized_name = normalize_structure_name(curve.name)
-            structure = self.get_structure_by_normalized_name(normalized_name)
             cached_volume_cc = self.structure_geometry_volume_cache.get(normalized_name)
             if cached_volume_cc is not None:
                 self.dvh_structure_volume_cache[normalized_name] = cached_volume_cc
-            elif structure is not None and not self.restore_saved_results_without_calculation:
-                self.dvh_structure_volume_cache[normalized_name] = self.get_structure_geometry_volume_cc(structure)
             else:
                 self.dvh_structure_volume_cache[normalized_name] = float(curve.volume_cc)
 
@@ -4755,6 +4828,15 @@ h2 {{
 
     def on_dvh_structure_visibility_changed(self, *_args):
         selected_names = self.get_selected_dvh_structure_names()
+        if not selected_names:
+            self.dvh_job_manager.invalidate()
+            self.dvh_request_structure_names = {}
+            self.clear_dvh_curve_selection()
+            self.render_dvh_plot()
+            self.update_dvh_cache_button()
+            self.dvh_status_label.setText(get_dvh_no_selection_status_text())
+            return
+
         refresh_plan = build_dvh_visibility_refresh_plan(
             selected_names,
             self.current_dvh_curve_names(),
@@ -4767,10 +4849,8 @@ h2 {{
         if refresh_plan.should_invalidate_jobs:
             self.dvh_job_manager.invalidate()
             self.dvh_request_structure_names = {}
-            self.refresh_visible_structure_goal_evaluations()
-            self.update_dvh_goal_evaluation_cache()
-            self.update_structure_list_goal_texts()
             self.render_dvh_plot()
+            self.update_dvh_cache_button()
             if refresh_plan.should_clear_status:
                 self.dvh_status_label.clear()
             return
@@ -6450,20 +6530,23 @@ h2 {{
 
         volume_cc = self.dvh_structure_volume_cache.get(normalized_name)
         if volume_cc is None:
-            structure = self.get_structure_by_normalized_name(normalized_name)
-            if structure is not None and not self.restore_saved_results_without_calculation:
-                volume_cc = self.get_structure_geometry_volume_cc(structure)
+            curve = self.get_curve_for_name(normalized_name)
+            if curve is not None:
+                volume_cc = float(curve.volume_cc)
                 self.dvh_structure_volume_cache[normalized_name] = volume_cc
-            else:
-                curve = self.get_curve_for_name(normalized_name)
-                if curve is not None:
-                    volume_cc = float(curve.volume_cc)
         if volume_cc is not None:
             parts.append(f"Vol {volume_cc:.2f} cc")
 
         if not parts:
             return None, None
         return "   ".join(parts), "#d0d0d0"
+
+    def update_dvh_structure_list_texts(self) -> None:
+        self.dvh_structure_list.update_goal_and_secondary_texts(
+            self.rtstruct,
+            self.get_dvh_structure_goal_lines,
+            self.get_dvh_structure_secondary_text,
+        )
 
     def get_dvh_structure_item_options(self, normalized_name: str) -> Dict[str, object]:
         secondary_text, secondary_text_color = self.get_dvh_structure_secondary_text(normalized_name)
@@ -6697,8 +6780,11 @@ h2 {{
 
     def update_structure_list_goal_texts(self):
         self.axial_structure_list.update_goal_lines(self.build_axial_list_rtstruct(), self.get_axial_structure_goal_lines)
-        self.dvh_structure_list.update_goal_lines(self.rtstruct, self.get_dvh_structure_goal_lines)
-        self.dvh_structure_list.update_secondary_texts(self.rtstruct, self.get_dvh_structure_secondary_text)
+        self.dvh_structure_list.update_goal_and_secondary_texts(
+            self.rtstruct,
+            self.get_dvh_structure_goal_lines,
+            self.get_dvh_structure_secondary_text,
+        )
         self.update_constraints_table()
         self.update_targets_table()
 
