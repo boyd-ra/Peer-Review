@@ -7,7 +7,15 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore
 
-from peer_helpers import normalize_structure_name, volume_cc_at_dose_gy, volume_pct_at_dose_gy
+from peer_helpers import (
+    dose_at_volume_pct,
+    normalize_structure_name,
+    parse_goal_value,
+    parse_d_metric_volume,
+    parse_v_metric_threshold_gy,
+    volume_cc_at_dose_gy,
+    volume_pct_at_dose_gy,
+)
 from peer_models import DVHCurve, RTStructData, StructureGoal, StructureGoalEvaluation
 from peer_viewer_support import evaluate_visible_structure_goals
 
@@ -32,6 +40,16 @@ class DvhPlotCurveSpec:
     plot_volume_pct: np.ndarray
     color_rgb: Tuple[int, int, int]
     width: int
+
+
+@dataclass(frozen=True)
+class DvhConstraintMarkerSpec:
+    normalized_name: str
+    dose_gy: float
+    volume_pct: float
+    curve_color_rgb: Tuple[int, int, int]
+    fill_color_rgb: Tuple[int, int, int]
+    tooltip_text: str
 
 
 @dataclass(frozen=True)
@@ -205,6 +223,73 @@ def build_dvh_plot_curve_specs(
                 width=get_dvh_curve_highlight_width(normalized_name, selected_name),
             )
         )
+    return specs
+
+
+def build_dvh_constraint_marker_specs(
+    curves: Sequence[DVHCurve],
+    goals_by_name: Dict[str, List[StructureGoal]],
+    evaluations_by_name: Dict[str, List[StructureGoalEvaluation]],
+    visibility_resolver: Callable[[str], bool],
+) -> List[DvhConstraintMarkerSpec]:
+    specs: List[DvhConstraintMarkerSpec] = []
+    for curve in curves:
+        normalized_name = normalize_structure_name(curve.name)
+        if not visibility_resolver(normalized_name):
+            continue
+
+        goals = goals_by_name.get(normalized_name, [])
+        evaluations = evaluations_by_name.get(normalized_name, [])
+        for goal_index, goal in enumerate(goals):
+            metric_key = goal.metric.strip().upper().replace(" ", "")
+            marker_dose_gy: Optional[float] = None
+            marker_volume_pct: Optional[float] = None
+            goal_value, goal_unit = parse_goal_value(goal.value_text)
+
+            dose_threshold_gy = parse_v_metric_threshold_gy(metric_key)
+            if dose_threshold_gy is not None:
+                if goal_value is None:
+                    continue
+                marker_dose_gy = float(dose_threshold_gy)
+                if goal_unit == "%":
+                    marker_volume_pct = float(goal_value)
+                elif goal_unit == "CC" and curve.volume_cc > 0.0:
+                    marker_volume_pct = float(100.0 * goal_value / curve.volume_cc)
+                else:
+                    continue
+            else:
+                volume_target, volume_unit = parse_d_metric_volume(metric_key)
+                if volume_target is None:
+                    continue
+                if volume_unit == "%":
+                    marker_volume_pct = float(volume_target)
+                elif curve.volume_cc > 0.0:
+                    marker_volume_pct = float(100.0 * volume_target / curve.volume_cc)
+                else:
+                    continue
+                if goal_value is None or goal_unit not in {"", "GY"}:
+                    continue
+                marker_dose_gy = float(goal_value)
+
+            if marker_dose_gy is None or marker_volume_pct is None:
+                continue
+            if not np.isfinite(marker_dose_gy) or not np.isfinite(marker_volume_pct):
+                continue
+
+            evaluation = evaluations[goal_index] if goal_index < len(evaluations) else None
+            goal_clause = " ".join(part for part in (goal.metric, goal.comparator, goal.value_text) if part).strip()
+            actual_text = evaluation.actual_text if evaluation is not None else ""
+            tooltip_text = goal_clause if not actual_text else f"{goal_clause}: {actual_text}"
+            specs.append(
+                DvhConstraintMarkerSpec(
+                    normalized_name=normalized_name,
+                    dose_gy=marker_dose_gy,
+                    volume_pct=marker_volume_pct,
+                    curve_color_rgb=curve.color_rgb,
+                    fill_color_rgb=curve.color_rgb,
+                    tooltip_text=tooltip_text,
+                )
+            )
     return specs
 
 

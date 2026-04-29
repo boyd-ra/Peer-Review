@@ -86,6 +86,7 @@ from peer_constraints_table import (
     refresh_constraints_table,
 )
 from peer_dvh_controller import (
+    build_dvh_constraint_marker_specs,
     build_dvh_readout_state,
     build_dvh_plot_curve_specs,
     build_dvh_refresh_request,
@@ -437,6 +438,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.image_view_bounds: Optional[ImageViewBounds] = None
         self.dvh_curves: List[DVHCurve] = []
         self.dvh_plot_items: Dict[str, pg.PlotDataItem] = {}
+        self.dvh_constraint_marker_item: Optional[pg.ScatterPlotItem] = None
         self.selected_dvh_curve_name: Optional[str] = None
         self.dvh_request_structure_names: Dict[int, List[str]] = {}
         self.dvh_structure_volume_cache: Dict[str, float] = {}
@@ -947,8 +949,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.dvh_crosshair_vline = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen((90, 90, 90), width=1))
         self.dvh_crosshair_hline = pg.InfiniteLine(angle=0, movable=False, pen=pg.mkPen((90, 90, 90), width=1))
         self.dvh_curve_marker = pg.ScatterPlotItem(size=9)
+        self.dvh_constraint_marker_item = pg.ScatterPlotItem(size=11, symbol="d", hoverable=False)
         self.dvh_crosshair_vline.setZValue(4)
         self.dvh_crosshair_hline.setZValue(4)
+        self.dvh_constraint_marker_item.setZValue(4.5)
         self.dvh_curve_marker.setZValue(5)
 
         dvh_content_layout.addWidget(self.dvh_status_label)
@@ -4436,11 +4440,15 @@ h2 {{
             plot_item.legend.scene().removeItem(plot_item.legend)
             plot_item.legend = None
         self.dvh_plot_items = {}
+        if self.dvh_constraint_marker_item is not None:
+            self.dvh_constraint_marker_item.setData([], [])
         self.dvh_curve_marker.setData([], [])
         self.dvh_crosshair_vline.setVisible(False)
         self.dvh_crosshair_hline.setVisible(False)
         plot_item.addItem(self.dvh_crosshair_vline, ignoreBounds=True)
         plot_item.addItem(self.dvh_crosshair_hline, ignoreBounds=True)
+        if self.dvh_constraint_marker_item is not None:
+            plot_item.addItem(self.dvh_constraint_marker_item)
         plot_item.addItem(self.dvh_curve_marker)
 
     def get_current_dvh_view_range(
@@ -4663,6 +4671,24 @@ h2 {{
             item.setCurveClickable(True, width=16)
             item.sigClicked.connect(self.on_dvh_curve_clicked)
             self.dvh_plot_items[spec.normalized_name] = item
+
+        if self.dvh_constraint_marker_item is not None:
+            marker_spots = [
+                {
+                    "pos": (spec.dose_gy, spec.volume_pct),
+                    "size": 10,
+                    "symbol": "d",
+                    "pen": pg.mkPen(color=spec.curve_color_rgb, width=1.5),
+                    "brush": pg.mkBrush(spec.fill_color_rgb),
+                }
+                for spec in build_dvh_constraint_marker_specs(
+                    self.dvh_curves,
+                    self.structure_goals_by_name,
+                    self.structure_goal_evaluations,
+                    self.dvh_structure_is_visible,
+                )
+            ]
+            self.dvh_constraint_marker_item.setData(spots=marker_spots)
 
         if self.dvh_plot_items:
             if previous_view_range is not None:
