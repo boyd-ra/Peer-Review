@@ -33,6 +33,7 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+_CONSTRAINT_WORKBOOK_SHEETS_CACHE: Dict[Tuple[str, int, int], List[str]] = {}
 
 
 def get_constraints_workbook_path() -> Optional[str]:
@@ -135,11 +136,21 @@ def _parse_structure_goal_rows(
 
 
 def list_constraints_workbook_sheets(path: str) -> List[str]:
+    workbook_path = Path(path)
+    stat_result = workbook_path.stat()
+    cache_key = (str(workbook_path.resolve()), int(stat_result.st_mtime_ns), int(stat_result.st_size))
+    cached_sheet_names = _CONSTRAINT_WORKBOOK_SHEETS_CACHE.get(cache_key)
+    if cached_sheet_names is not None:
+        return list(cached_sheet_names)
+
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
-        return list(workbook.sheetnames)
+        sheet_names = list(workbook.sheetnames)
     finally:
         workbook.close()
+    _CONSTRAINT_WORKBOOK_SHEETS_CACHE.clear()
+    _CONSTRAINT_WORKBOOK_SHEETS_CACHE[cache_key] = list(sheet_names)
+    return sheet_names
 
 
 def _cell_payload(cell) -> Dict[str, object]:
@@ -668,13 +679,6 @@ def load_ct_series_from_paths(ct_paths: List[str]) -> CTVolume:
         rows=rows,
         cols=cols,
     )
-
-def load_ct_series_and_discover_patient_files(
-    folder: str,
-) -> Tuple[CTVolume, PatientFileDiscovery]:
-    discovery = scan_patient_folder(folder)
-    return load_ct_series_from_paths(discovery.ct_paths), discovery
-
 
 def _format_patient_name(name_value: object) -> str:
     text = str(name_value or "").strip()

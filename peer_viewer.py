@@ -56,11 +56,11 @@ from peer_cache import (
     get_dvh_cache_path as compute_dvh_cache_path,
     get_review_bundle_path as compute_review_bundle_path,
     load_derived_array_cache as load_derived_array_cache_file,
-    load_review_bundle_review_cache_file,
-    load_review_bundle_screenshot_bytes,
+    load_review_bundle_preview,
     load_review_cache_file,
     prepare_review_cache_state,
     PreparedReviewCacheState,
+    ReviewBundlePreviewData,
     ReviewCacheFileData,
     save_derived_array_cache as save_derived_array_cache_file,
     save_review_bundle as save_review_bundle_file,
@@ -201,6 +201,8 @@ MAX_TISSUE_ROW_NAME = normalize_structure_name(MAX_TISSUE_ROW_LABEL)
 MAX_DOSE_ROW_LABEL = "Max Dose"
 MAX_DOSE_ROW_NAME = normalize_structure_name(MAX_DOSE_ROW_LABEL)
 logger = logging.getLogger(__name__)
+
+_TARGET_METHOD_SIGNATURE_CACHE: Optional[Dict[str, object]] = None
 
 
 class RectZoomViewBox(pg.ViewBox):
@@ -504,7 +506,10 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.autoscroll_direction = 1
         self.patient_transition_overlay_process: Optional[subprocess.Popen] = None
         self.staged_review_bundle_folder: Optional[str] = None
-        self.staged_review_bundle_screenshot_png_bytes: Optional[bytes] = None
+        self.staged_review_bundle_data: Optional[ReviewBundlePreviewData] = None
+        self.max_dose_gy_cache: Optional[float] = None
+        self.patient_activation_prepare_poll_delay_ms = 40
+        self.patient_activation_step_interval_ms = 0
         self.isodose_refresh_timer = QtCore.QTimer(self)
         self.isodose_refresh_timer.setSingleShot(True)
         self.isodose_refresh_timer.timeout.connect(self.refresh_all_views)
@@ -1171,6 +1176,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.max_tissue_dose_gy_cache = None
         self.max_tissue_index_zyx = None
         self.max_tissue_cache_trusted_from_saved_review = False
+        self.max_dose_gy_cache = None
         self.ptv_union_slice_mask_cache = None
         self.ptv_union_volume_mask_cache = None
         self.target_slice_mask_cache = {}
@@ -1634,6 +1640,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.displayed_dose_plane = None
         self.structure_mask_cache = None
         self.structure_mask_cache_names = []
+        self.max_dose_gy_cache = None
         self.max_dose_index_zyx = None
         initial_slice_index, initial_row, initial_col = get_initial_focus_indices(
             self.ct,
@@ -1857,20 +1864,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
 
     def clear_staged_review_bundle(self) -> None:
         self.staged_review_bundle_folder = None
-        self.staged_review_bundle_screenshot_png_bytes = None
+        self.staged_review_bundle_data = None
 
-    def get_staged_review_bundle_screenshot_bytes_for_folder(self, folder: str) -> Optional[bytes]:
+    def get_staged_review_bundle_for_folder(self, folder: str) -> Optional[ReviewBundlePreviewData]:
         if self.staged_review_bundle_folder != folder:
             return None
-        return self.staged_review_bundle_screenshot_png_bytes
+        return self.staged_review_bundle_data
 
     def pump_viewer_ui(self) -> None:
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-
-    def get_patient_activation_step_delay_ms(self) -> int:
-        return max(90, int(self.autoscroll_timer.interval()))
 
     def load_patient_folder_path(
         self,
@@ -1904,16 +1908,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.clear_patient_session_state(quick_swap=fast_activate)
             self.current_patient_folder = folder
             self.defer_sidebar_summary_metrics = True
-            staged_screenshot_png_bytes: Optional[bytes] = None
+            staged_bundle_data: Optional[ReviewBundlePreviewData] = None
+            preview_stage_duration: Optional[float] = None
             if preloaded_payload is not None and preloaded_payload.patient_plan_lines:
                 self.set_patient_plan_lines(preloaded_payload.patient_plan_lines, pump_events=True)
             elif preloaded_payload is None:
+                preview_stage_start = perf_counter()
                 self.try_stage_patient_plan_lines_from_cache(folder, pump_events=True)
-                staged_screenshot_png_bytes = self.get_staged_review_bundle_screenshot_bytes_for_folder(folder)
+                staged_bundle_data = self.get_staged_review_bundle_for_folder(folder)
+                if staged_bundle_data is not None:
+                    preview_stage_duration = perf_counter() - preview_stage_start
             if preloaded_payload is None:
                 self.tabs.setCurrentWidget(self.axial_tab_widget)
-                if staged_screenshot_png_bytes:
-                    self.start_patient_transition_overlay_process(staged_screenshot_png_bytes)
+                if staged_bundle_data is not None and staged_bundle_data.screenshot_png_bytes:
+                    self.start_patient_transition_overlay_process(staged_bundle_data.screenshot_png_bytes)
                 self.pump_viewer_ui()
 
             if preloaded_payload is None:
@@ -1927,6 +1935,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             else:
                 payload = preloaded_payload
             self.clear_staged_review_bundle()
+            if preloaded_payload is None:
+                timing_entries.append(("Load review bundle preview", preview_stage_duration))
 
             constraints_path, rtstruct_path, rtdose_paths, derived_array_cache_path = self._apply_patient_preload_payload(
                 payload,
@@ -2129,7 +2139,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             )
         if self.pending_patient_activation_prepare_result is None:
             QtCore.QTimer.singleShot(
-                self.get_patient_activation_step_delay_ms(),
+                self.patient_activation_prepare_poll_delay_ms,
                 lambda: self._continue_patient_activation_when_ready(
                     activation_token=activation_token,
                     folder=folder,
@@ -2194,7 +2204,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         if remaining_steps:
             self.pump_viewer_ui()
             QtCore.QTimer.singleShot(
-                self.get_patient_activation_step_delay_ms(),
+                self.patient_activation_step_interval_ms,
                 lambda: self._run_patient_activation_step_sequence(
                     activation_token=activation_token,
                     folder=folder,
@@ -2709,15 +2719,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.center_views_on_max_dose()
 
     def on_go_to_max_dose(self):
-        if self.sampled_dose_volume_ct is None:
-            return
-
-        if not np.isfinite(self.sampled_dose_volume_ct).any():
-            return
-
-        max_index = np.unravel_index(int(np.nanargmax(self.sampled_dose_volume_ct)), self.sampled_dose_volume_ct.shape)
-        k, r, c = (int(max_index[0]), int(max_index[1]), int(max_index[2]))
-        self.go_to_point(k, r, c)
+        if self.get_max_dose_goal_lines() and self.max_dose_index_zyx is not None:
+            k, r, c = self.max_dose_index_zyx
+            self.go_to_point(k, r, c)
 
     def on_go_to_max_tissue(self):
         if self.max_tissue_index_zyx is None:
@@ -2730,10 +2734,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def get_max_dose_goal_lines(self) -> List[Tuple[str, Optional[str]]]:
         if self.sampled_dose_volume_ct is None:
             return []
-        if not np.isfinite(self.sampled_dose_volume_ct).any():
-            return []
-        max_dose_gy = float(np.nanmax(self.sampled_dose_volume_ct))
+
+        if self.max_dose_gy_cache is None or self.max_dose_index_zyx is None:
+            if not np.isfinite(self.sampled_dose_volume_ct).any():
+                self.max_dose_gy_cache = None
+                self.max_dose_index_zyx = None
+                return []
+            max_index = np.unravel_index(int(np.nanargmax(self.sampled_dose_volume_ct)), self.sampled_dose_volume_ct.shape)
+            self.max_dose_index_zyx = (int(max_index[0]), int(max_index[1]), int(max_index[2]))
+            self.max_dose_gy_cache = float(self.sampled_dose_volume_ct[self.max_dose_index_zyx])
+
+        max_dose_gy = float(self.max_dose_gy_cache)
         if not np.isfinite(max_dose_gy):
+            self.max_dose_gy_cache = None
+            self.max_dose_index_zyx = None
             return []
         return [(f"{max_dose_gy:.2f} Gy", None)]
 
@@ -3129,25 +3143,17 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.tabs_header_widget.updateGeometry()
         if hasattr(self, "tabs") and self.tabs is not None:
             self.tabs.updateGeometry()
-            self.tabs.repaint()
             self.tabs.tabBar().updateGeometry()
-            self.tabs.tabBar().repaint()
-        if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
-            self.patient_summary_widget.repaint()
-        if hasattr(self, "tabs_header_widget") and self.tabs_header_widget is not None:
-            self.tabs_header_widget.repaint()
-        self.patient_name_label.repaint()
-        self.patient_plan_label.repaint()
-        if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
-            QtCore.QCoreApplication.sendPostedEvents(self.patient_summary_widget, int(QtCore.QEvent.Type.Paint))
-        if hasattr(self, "tabs_header_widget") and self.tabs_header_widget is not None:
-            QtCore.QCoreApplication.sendPostedEvents(self.tabs_header_widget, int(QtCore.QEvent.Type.Paint))
-        QtCore.QCoreApplication.sendPostedEvents(self.patient_name_label, int(QtCore.QEvent.Type.Paint))
-        QtCore.QCoreApplication.sendPostedEvents(self.patient_plan_label, int(QtCore.QEvent.Type.Paint))
-        if hasattr(self, "tabs") and self.tabs is not None:
-            QtCore.QCoreApplication.sendPostedEvents(self.tabs, int(QtCore.QEvent.Type.Paint))
-            QtCore.QCoreApplication.sendPostedEvents(self.tabs.tabBar(), int(QtCore.QEvent.Type.Paint))
         if pump_events:
+            if hasattr(self, "patient_summary_widget") and self.patient_summary_widget is not None:
+                self.patient_summary_widget.update()
+            if hasattr(self, "tabs_header_widget") and self.tabs_header_widget is not None:
+                self.tabs_header_widget.update()
+            self.patient_name_label.update()
+            self.patient_plan_label.update()
+            if hasattr(self, "tabs") and self.tabs is not None:
+                self.tabs.update()
+                self.tabs.tabBar().update()
             app = QtWidgets.QApplication.instance()
             if app is not None:
                 app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
@@ -3194,13 +3200,16 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
     def try_stage_patient_plan_lines_from_cache(self, folder: str, *, pump_events: bool = False) -> bool:
         bundle_path = compute_review_bundle_path(folder)
         if bundle_path is not None and bundle_path.exists():
-            self.staged_review_bundle_folder = folder
-            self.staged_review_bundle_screenshot_png_bytes = load_review_bundle_screenshot_bytes(bundle_path)
-            loaded_bundle_cache = load_review_bundle_review_cache_file(bundle_path)
-            if loaded_bundle_cache is not None:
-                patient_plan_lines_payload = loaded_bundle_cache.payload.get("patient_plan_lines")
-                if isinstance(patient_plan_lines_payload, list):
-                    patient_plan_lines = [str(line).strip() for line in patient_plan_lines_payload if str(line).strip()]
+            bundle_preview = load_review_bundle_preview(bundle_path)
+            if bundle_preview is not None:
+                self.staged_review_bundle_folder = folder
+                self.staged_review_bundle_data = bundle_preview
+                if bundle_preview.patient_plan_lines is not None:
+                    patient_plan_lines = [
+                        str(line).strip()
+                        for line in bundle_preview.patient_plan_lines
+                        if str(line).strip()
+                    ]
                     if patient_plan_lines:
                         self.set_patient_plan_lines(patient_plan_lines, pump_events=pump_events)
                         return True
@@ -3442,17 +3451,20 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         )
 
     def get_target_method_signature(self) -> Dict[str, object]:
-        return {
-            "dvh_helper_signature": get_dvh_method_signature(),
-            "get_primary_target_context": callable_signature_hash(type(self).get_primary_target_context),
-            "build_target_table_rows": callable_signature_hash(type(self).build_target_table_rows),
-            "compute_stereotactic_indices": callable_signature_hash(type(self).compute_stereotactic_indices),
-            "get_nested_target_structures": callable_signature_hash(type(self).get_nested_target_structures),
-            "get_max_tissue_dose_goal_lines": callable_signature_hash(type(self).get_max_tissue_dose_goal_lines),
-            "get_default_stereotactic_dose_text": callable_signature_hash(
-                type(self).get_default_stereotactic_dose_text
-            ),
-        }
+        global _TARGET_METHOD_SIGNATURE_CACHE
+        if _TARGET_METHOD_SIGNATURE_CACHE is None:
+            _TARGET_METHOD_SIGNATURE_CACHE = {
+                "dvh_helper_signature": get_dvh_method_signature(),
+                "get_primary_target_context": callable_signature_hash(type(self).get_primary_target_context),
+                "build_target_table_rows": callable_signature_hash(type(self).build_target_table_rows),
+                "compute_stereotactic_indices": callable_signature_hash(type(self).compute_stereotactic_indices),
+                "get_nested_target_structures": callable_signature_hash(type(self).get_nested_target_structures),
+                "get_max_tissue_dose_goal_lines": callable_signature_hash(type(self).get_max_tissue_dose_goal_lines),
+                "get_default_stereotactic_dose_text": callable_signature_hash(
+                    type(self).get_default_stereotactic_dose_text
+                ),
+            }
+        return _TARGET_METHOD_SIGNATURE_CACHE
 
     def get_constraint_note_key(self, normalized_name: str, goal: StructureGoal) -> str:
         return "||".join(
@@ -3725,59 +3737,24 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             png_buffer.close()
         return png_bytes, None
 
-    def save_review_screenshot(self, path: Path, *, screenshot_png_bytes: Optional[bytes] = None) -> Optional[str]:
-        png_bytes = screenshot_png_bytes
-        if png_bytes is None:
-            png_bytes, capture_warning = self.capture_review_screenshot_png_bytes()
-            if capture_warning is not None:
-                return capture_warning
-        if not png_bytes:
-            return "failed to save the review screenshot."
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_path_str = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
-        temp_path = Path(temp_path_str)
-        try:
-            try:
-                Path(temp_path).unlink()
-            except OSError:
-                pass
-            temp_path.write_bytes(png_bytes)
-            replace_error: Optional[Exception] = None
-            for _attempt in range(6):
-                try:
-                    temp_path.replace(path)
-                    replace_error = None
-                    break
-                except PermissionError as exc:
-                    replace_error = exc
-                    if os.name != "nt":
-                        break
-                    self.pump_viewer_ui()
-                    QtCore.QThread.msleep(100)
-            if replace_error is not None:
-                raise replace_error
-        except Exception as exc:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            logger.warning("Saved JSON review cache but failed to save screenshot: %s", exc)
-            return f"failed to save the review screenshot: {exc}"
-        return None
-
     def build_derived_array_cache_save_inputs(self) -> Dict[str, object]:
         if self.ct is None or self.rtstruct is None:
             raise ValueError("No CT/RTSTRUCT data is loaded.")
         derived_structures = self.get_derived_cache_structures()
         structure_order = [normalize_structure_name(structure.name) for structure in derived_structures]
-        structure_volume_masks = {
-            normalize_structure_name(structure.name): self.get_structure_volume_mask(structure)
-            for structure in derived_structures
-        }
-        structure_geometry_volumes_cc = {
-            normalize_structure_name(structure.name): float(self.get_structure_geometry_volume_cc(structure))
-            for structure in derived_structures
-        }
+        structure_volume_masks: Dict[str, np.ndarray] = {}
+        structure_geometry_volumes_cc: Dict[str, float] = {}
+        for structure in derived_structures:
+            normalized_name = normalize_structure_name(structure.name)
+            cached_mask = self.structure_volume_mask_cache.get(normalized_name)
+            if cached_mask is None:
+                cached_mask = self.get_structure_volume_mask(structure)
+            structure_volume_masks[normalized_name] = cached_mask
+
+            cached_volume_cc = self.structure_geometry_volume_cache.get(normalized_name)
+            if cached_volume_cc is None:
+                cached_volume_cc = float(self.get_structure_geometry_volume_cc(structure))
+            structure_geometry_volumes_cc[normalized_name] = float(cached_volume_cc)
         return {
             "ct": self.ct,
             "ct_paths": self.current_ct_paths,

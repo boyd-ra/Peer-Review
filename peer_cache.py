@@ -182,6 +182,12 @@ class ReviewBundleData:
 
 
 @dataclass(slots=True)
+class ReviewBundlePreviewData:
+    patient_plan_lines: Optional[List[str]]
+    screenshot_png_bytes: Optional[bytes]
+
+
+@dataclass(slots=True)
 class PreparedReviewCacheState:
     selected_constraint_sheet: Optional[str]
     custom_constraints: Dict[str, List[StructureGoal]]
@@ -1294,8 +1300,12 @@ def save_review_bundle(
     structure_volume_masks: Dict[str, np.ndarray],
     structure_geometry_volumes_cc: Dict[str, float],
 ) -> None:
+    preview_payload = {
+        "patient_plan_lines": list(review_payload.get("patient_plan_lines", []) or []),
+    }
     extra_arrays: Dict[str, np.ndarray] = {
         "review_cache_json": np.asarray(json.dumps(dict(review_payload)), dtype=np.str_),
+        "preview_json": np.asarray(json.dumps(preview_payload), dtype=np.str_),
     }
     if screenshot_png_bytes:
         extra_arrays["screenshot_png_bytes"] = np.frombuffer(screenshot_png_bytes, dtype=np.uint8)
@@ -1324,64 +1334,6 @@ def save_review_bundle(
         extra_arrays=extra_arrays,
     )
     write_npz_atomic(path, arrays)
-
-
-def load_review_bundle_review_cache_file(path: Path) -> Optional[ReviewCacheFileData]:
-    try:
-        payload = np.load(path, allow_pickle=False)
-    except (OSError, ValueError):
-        return None
-
-    try:
-        metadata_json = payload["metadata_json"].item()
-        metadata = json.loads(str(metadata_json))
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        payload.close()
-        return None
-
-    if not isinstance(metadata, dict) or metadata.get("cache_kind") != "peer_review_bundle":
-        payload.close()
-        return None
-
-    try:
-        review_cache_json = payload["review_cache_json"].item()
-        review_payload = json.loads(str(review_cache_json))
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        payload.close()
-        return None
-    finally:
-        payload.close()
-
-    if not isinstance(review_payload, dict):
-        return None
-    try:
-        cache_version = int(review_payload.get("version", metadata.get("review_cache_version", 0)))
-    except (TypeError, ValueError):
-        cache_version = 0
-    return ReviewCacheFileData(
-        payload=review_payload,
-        cache_version=cache_version,
-        trusted_source=True,
-    )
-
-
-def load_review_bundle_screenshot_bytes(path: Path) -> Optional[bytes]:
-    try:
-        payload = np.load(path, allow_pickle=False)
-    except (OSError, ValueError):
-        return None
-    try:
-        metadata_json = payload["metadata_json"].item()
-        metadata = json.loads(str(metadata_json))
-        if not isinstance(metadata, dict) or metadata.get("cache_kind") != "peer_review_bundle":
-            return None
-        if "screenshot_png_bytes" not in payload.files:
-            return None
-        return bytes(np.asarray(payload["screenshot_png_bytes"], dtype=np.uint8).tobytes())
-    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-        return None
-    finally:
-        payload.close()
 
 
 def load_derived_array_cache(
@@ -1671,8 +1623,30 @@ def load_review_bundle(path: Path) -> Optional[ReviewBundleData]:
             return None
         image_view_bounds = _deserialize_image_view_bounds(image_view_bounds_payload)
 
-    review_cache_data = load_review_bundle_review_cache_file(path)
-    screenshot_png_bytes = load_review_bundle_screenshot_bytes(path)
+    review_cache_data: Optional[ReviewCacheFileData] = None
+    if "review_cache_json" in payload.files:
+        try:
+            review_cache_json = payload["review_cache_json"].item()
+            review_payload = json.loads(str(review_cache_json))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            payload.close()
+            return None
+        if not isinstance(review_payload, dict):
+            payload.close()
+            return None
+        try:
+            cache_version = int(review_payload.get("version", metadata.get("review_cache_version", 0)))
+        except (TypeError, ValueError):
+            cache_version = 0
+        review_cache_data = ReviewCacheFileData(
+            payload=review_payload,
+            cache_version=cache_version,
+            trusted_source=True,
+        )
+
+    screenshot_png_bytes: Optional[bytes] = None
+    if "screenshot_png_bytes" in payload.files:
+        screenshot_png_bytes = bytes(np.asarray(payload["screenshot_png_bytes"], dtype=np.uint8).tobytes())
     payload.close()
 
     return ReviewBundleData(
@@ -1688,5 +1662,70 @@ def load_review_bundle(path: Path) -> Optional[ReviewBundleData]:
             structure_geometry_volumes_cc=structure_geometry_volumes_cc,
         ),
         review_cache_data=review_cache_data,
+        screenshot_png_bytes=screenshot_png_bytes,
+    )
+
+
+def load_review_bundle_preview(path: Path) -> Optional[ReviewBundlePreviewData]:
+    try:
+        payload = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+
+    try:
+        metadata_json = payload["metadata_json"].item()
+        metadata = json.loads(str(metadata_json))
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        payload.close()
+        return None
+
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("cache_kind") != "peer_review_bundle"
+        or metadata.get("bundle_version") not in {1}
+    ):
+        payload.close()
+        return None
+
+    patient_plan_lines: Optional[List[str]] = None
+    if "preview_json" in payload.files:
+        try:
+            preview_json = payload["preview_json"].item()
+            preview_payload = json.loads(str(preview_json))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            payload.close()
+            return None
+        if not isinstance(preview_payload, dict):
+            payload.close()
+            return None
+        patient_plan_lines_payload = preview_payload.get("patient_plan_lines")
+        if isinstance(patient_plan_lines_payload, list):
+            patient_plan_lines = [
+                str(line).strip()
+                for line in patient_plan_lines_payload
+                if str(line).strip()
+            ]
+    elif "review_cache_json" in payload.files:
+        try:
+            review_cache_json = payload["review_cache_json"].item()
+            review_payload = json.loads(str(review_cache_json))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            payload.close()
+            return None
+        if isinstance(review_payload, dict):
+            patient_plan_lines_payload = review_payload.get("patient_plan_lines")
+            if isinstance(patient_plan_lines_payload, list):
+                patient_plan_lines = [
+                    str(line).strip()
+                    for line in patient_plan_lines_payload
+                    if str(line).strip()
+                ]
+
+    screenshot_png_bytes: Optional[bytes] = None
+    if "screenshot_png_bytes" in payload.files:
+        screenshot_png_bytes = bytes(np.asarray(payload["screenshot_png_bytes"], dtype=np.uint8).tobytes())
+    payload.close()
+    return ReviewBundlePreviewData(
+        patient_plan_lines=patient_plan_lines,
         screenshot_png_bytes=screenshot_png_bytes,
     )

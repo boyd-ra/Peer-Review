@@ -1718,20 +1718,26 @@ def _options_signature(options: DVHCalculationOptions) -> Dict[str, object]:
     }
 
 
+_DVH_METHOD_SIGNATURE_CACHE: Optional[Dict[str, object]] = None
+
+
 def get_dvh_method_signature() -> Dict[str, object]:
-    return {
-        "high_accuracy_options": _options_signature(HIGH_ACCURACY_DVH_OPTIONS),
-        "srs_intensive_options": _options_signature(SRS_INTENSIVE_DVH_OPTIONS),
-        "srs_small_volume_threshold_cc": float(SRS_SMALL_VOLUME_THRESHOLD_CC),
-        "compute_dvh_curves": _callable_signature_hash(compute_dvh_curves),
-        "compute_single_structure_high_accuracy_curve": _callable_signature_hash(
-            compute_single_structure_high_accuracy_curve
-        ),
-        "compute_isodose_volume_within_structure_margin_cc": _callable_signature_hash(
-            compute_isodose_volume_within_structure_margin_cc
-        ),
-        "_build_srs_interpolated_occupancy_model": _callable_signature_hash(
-            _build_srs_interpolated_occupancy_model
-        ),
-        "_compute_srs_interpolated_curve": _callable_signature_hash(_compute_srs_interpolated_curve),
-    }
+    global _DVH_METHOD_SIGNATURE_CACHE
+    if _DVH_METHOD_SIGNATURE_CACHE is None:
+        _DVH_METHOD_SIGNATURE_CACHE = {
+            "high_accuracy_options": _options_signature(HIGH_ACCURACY_DVH_OPTIONS),
+            "srs_intensive_options": _options_signature(SRS_INTENSIVE_DVH_OPTIONS),
+            "srs_small_volume_threshold_cc": float(SRS_SMALL_VOLUME_THRESHOLD_CC),
+            "compute_dvh_curves": _callable_signature_hash(compute_dvh_curves),
+            "compute_single_structure_high_accuracy_curve": _callable_signature_hash(
+                compute_single_structure_high_accuracy_curve
+            ),
+            "compute_isodose_volume_within_structure_margin_cc": _callable_signature_hash(
+                compute_isodose_volume_within_structure_margin_cc
+            ),
+            "_build_srs_interpolated_occupancy_model": _callable_signature_hash(
+                _build_srs_interpolated_occupancy_model
+            ),
+            "_compute_srs_interpolated_curve": _callable_signature_hash(_compute_srs_interpolated_curve),
+        }
+    return _DVH_METHOD_SIGNATURE_CACHE
