@@ -32,6 +32,7 @@ from peer_dvh import (
     dose_at_volume_pct as dose_at_volume_pct_module,
     estimate_structure_geometry_metrics,
     _slice_thicknesses_mm,
+    trilinear_sample_dose_patient_xyz,
     volume_cc_at_dose_gy as volume_cc_at_dose_gy_module,
     volume_pct_at_dose_gy as volume_pct_at_dose_gy_module,
 )
@@ -351,19 +352,17 @@ def build_outline_series(
     return curves
 
 
-def sample_dose_to_ct_slice(ct: CTVolume, dose: DoseVolume, ct_slice_index: int) -> np.ndarray:
+def sample_dose_to_ct_slice(
+    ct: CTVolume,
+    dose: DoseVolume,
+    ct_slice_index: int,
+    ct_to_dose_transform: Optional[np.ndarray] = None,
+) -> np.ndarray:
     ct_origin = np.asarray(ct.slice_origins_xyz_mm[ct_slice_index], dtype=float)
-    ct_col_cos, ct_row_cos, _ = get_ct_row_col_normal(ct.image_orientation_patient)
-    dose_col_cos, dose_row_cos, dose_normal = get_ct_row_col_normal(dose.image_orientation_patient)
-
-    dose_plane_pos_mm = float(np.dot(ct_origin, dose_normal))
-    dose_k = nearest_slice_index(dose_plane_pos_mm, dose.z_positions_mm)
-    dose_plane = dose.dose_gy[dose_k]
+    ct_col_cos, ct_row_cos, ct_normal = get_ct_row_col_normal(ct.image_orientation_patient)
 
     ct_sx = float(ct.spacing_xyz_mm[0])
     ct_sy = float(ct.spacing_xyz_mm[1])
-    dose_sx = float(dose.spacing_xyz_mm[0])
-    dose_sy = float(dose.spacing_xyz_mm[1])
 
     row_coords = np.arange(ct.rows, dtype=np.float32)[:, None]
     col_coords = np.arange(ct.cols, dtype=np.float32)[None, :]
@@ -372,6 +371,38 @@ def sample_dose_to_ct_slice(ct: CTVolume, dose: DoseVolume, ct_slice_index: int)
         + col_coords[:, :, None] * ct_sx * ct_col_cos[None, None, :]
         + row_coords[:, :, None] * ct_sy * ct_row_cos[None, None, :]
     )
+    if ct_to_dose_transform is not None:
+        transform = np.asarray(ct_to_dose_transform, dtype=np.float32)
+        rotation = transform[:3, :3]
+        homogeneous_xyz = np.concatenate(
+            [
+                patient_xyz.reshape(-1, 3),
+                np.ones((patient_xyz.shape[0] * patient_xyz.shape[1], 1), dtype=np.float32),
+            ],
+            axis=1,
+        )
+        transformed_xyz = homogeneous_xyz @ transform.T
+        patient_xyz = transformed_xyz[:, :3].reshape(patient_xyz.shape)
+
+    dose_col_cos, dose_row_cos, dose_normal = get_ct_row_col_normal(dose.image_orientation_patient)
+    if ct_to_dose_transform is not None:
+        transformed_normal = rotation @ np.asarray(ct_normal, dtype=np.float32)
+        transformed_normal_norm = float(np.linalg.norm(transformed_normal))
+        if transformed_normal_norm <= 1e-6:
+            sampled = trilinear_sample_dose_patient_xyz(dose, patient_xyz.reshape(-1, 3))
+            return sampled.reshape((ct.rows, ct.cols)).astype(np.float32, copy=False)
+        transformed_normal = transformed_normal / transformed_normal_norm
+        if abs(float(np.dot(transformed_normal, dose_normal))) < 0.999:
+            sampled = trilinear_sample_dose_patient_xyz(dose, patient_xyz.reshape(-1, 3))
+            return sampled.reshape((ct.rows, ct.cols)).astype(np.float32, copy=False)
+        transformed_origin = patient_xyz[0, 0]
+        dose_plane_pos_mm = float(np.dot(transformed_origin, dose_normal))
+    else:
+        dose_plane_pos_mm = float(np.dot(ct_origin, dose_normal))
+    dose_k = nearest_slice_index(dose_plane_pos_mm, dose.z_positions_mm)
+    dose_plane = dose.dose_gy[dose_k]
+    dose_sx = float(dose.spacing_xyz_mm[0])
+    dose_sy = float(dose.spacing_xyz_mm[1])
 
     rel = patient_xyz - dose.slice_origins_xyz_mm[dose_k][None, None, :]
     dose_col_coords = np.tensordot(rel, dose_col_cos, axes=([2], [0])) / dose_sx

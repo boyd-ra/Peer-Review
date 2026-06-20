@@ -26,7 +26,13 @@ from peer_cache import (
     load_review_cache_file,
 )
 from peer_helpers import compute_image_view_bounds, normalize_structure_name, sample_dose_to_ct_slice
-from peer_io import load_combined_rtdose, load_ct_series_from_paths, load_rtstruct, scan_patient_folder
+from peer_io import (
+    load_combined_rtdose,
+    load_ct_series_from_paths,
+    load_rtstruct,
+    resample_dose_to_ct_grid,
+    scan_patient_folder,
+)
 from peer_models import CTVolume, DoseVolume, ImageViewBounds, PatientFileDiscovery, RTPlanPhase, RTStructData
 from peer_targets import get_phase_target_assignments as get_phase_target_assignments_helper
 from peer_rendering import (
@@ -51,6 +57,8 @@ class PatientPreloadPayload:
     ct: CTVolume
     image_view_bounds: ImageViewBounds
     ct_paths: List[str]
+    registration_paths: List[str]
+    dose_path_to_ct_transforms: Dict[str, np.ndarray]
     patient_plan_lines: Optional[List[str]]
     plan_phases: List[RTPlanPhase]
     rtplan_paths: List[str]
@@ -379,10 +387,26 @@ def load_patient_discovery(folder: str) -> PatientFileDiscovery:
     return scan_patient_folder(folder)
 
 
-def resample_dose_to_ct_volume(ct: CTVolume, dose: DoseVolume) -> np.ndarray:
-    return np.stack(
-        [sample_dose_to_ct_slice(ct, dose, slice_index) for slice_index in range(ct.volume_hu.shape[0])],
-        axis=0,
+def resample_dose_to_ct_volume(
+    ct: CTVolume,
+    dose: DoseVolume,
+    *,
+    ct_to_dose_transform: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    return resample_dose_to_ct_grid(
+        ct,
+        dose,
+        ct_to_dose_transform=ct_to_dose_transform,
+    )
+
+
+def _dose_is_ct_aligned(ct: CTVolume, dose: DoseVolume) -> bool:
+    return (
+        dose.dose_gy.shape == ct.volume_hu.shape
+        and dose.slice_origins_xyz_mm.shape == ct.slice_origins_xyz_mm.shape
+        and np.allclose(dose.slice_origins_xyz_mm, ct.slice_origins_xyz_mm, atol=1e-3)
+        and np.allclose(dose.spacing_xyz_mm, ct.spacing_xyz_mm, atol=1e-6)
+        and np.allclose(dose.image_orientation_patient, ct.image_orientation_patient, atol=1e-6)
     )
 
 
@@ -643,6 +667,8 @@ def prepare_patient_preload_payload(
             rtplan_paths=[],
         )
         ct_paths = list(patient_discovery.ct_paths)
+        registration_paths = list(patient_discovery.registration_paths)
+        dose_path_to_ct_transforms = dict(patient_discovery.dose_path_to_ct_transform_by_path)
         rtstruct_path = patient_discovery.rtstruct_path
         rtdose_paths = list(patient_discovery.rtdose_paths)
         rtplan_paths = list(patient_discovery.rtplan_paths)
@@ -685,6 +711,8 @@ def prepare_patient_preload_payload(
             ct=ct,
             image_view_bounds=image_view_bounds,
             ct_paths=ct_paths,
+            registration_paths=registration_paths,
+            dose_path_to_ct_transforms=dose_path_to_ct_transforms,
             patient_plan_lines=patient_discovery.patient_plan_lines,
             plan_phases=list(patient_discovery.plan_phases),
             rtplan_paths=rtplan_paths,
@@ -709,6 +737,8 @@ def prepare_patient_preload_payload(
     if patient_discovery is None:
         patient_discovery = load_patient_discovery(folder)
     ct_paths = list(patient_discovery.ct_paths)
+    registration_paths = list(patient_discovery.registration_paths)
+    dose_path_to_ct_transforms = dict(patient_discovery.dose_path_to_ct_transform_by_path)
     rtstruct_path = patient_discovery.rtstruct_path
     rtdose_paths = list(patient_discovery.rtdose_paths)
     rtplan_paths = list(patient_discovery.rtplan_paths)
@@ -721,14 +751,15 @@ def prepare_patient_preload_payload(
     derived_array_cache_load_duration: Optional[float] = None
     stage_start = perf_counter()
     if derived_array_cache_path is not None and derived_array_cache_path.exists():
-        derived_array_cache_data = load_derived_array_cache(
-            derived_array_cache_path,
-            ct=None,
-            ct_paths=ct_paths,
-            rtstruct_path=rtstruct_path,
-            rtdose_paths=rtdose_paths,
-            array_cache_signature=array_cache_signature,
-        )
+            derived_array_cache_data = load_derived_array_cache(
+                derived_array_cache_path,
+                ct=None,
+                ct_paths=ct_paths,
+                rtstruct_path=rtstruct_path,
+                rtdose_paths=rtdose_paths,
+                registration_paths=registration_paths,
+                array_cache_signature=array_cache_signature,
+            )
     if derived_array_cache_data is not None and derived_array_cache_data.ct is not None:
         ct = derived_array_cache_data.ct
         derived_array_cache_load_duration = perf_counter() - stage_start
@@ -761,8 +792,14 @@ def prepare_patient_preload_payload(
             dose = derived_array_cache_data.dose
             timing_entries.append(("Load/merge RTDOSE", None))
         else:
+            if progress_callback is not None:
+                progress_callback("Loading dose")
             stage_start = perf_counter()
-            dose = load_combined_rtdose(rtdose_paths)
+            dose = load_combined_rtdose(
+                rtdose_paths,
+                reference_ct=ct,
+                ct_to_dose_transforms=dose_path_to_ct_transforms,
+            )
             timing_entries.append(("Load/merge RTDOSE", perf_counter() - stage_start))
 
         if derived_array_cache_data is None and derived_array_cache_path is not None and derived_array_cache_path.exists():
@@ -773,6 +810,7 @@ def prepare_patient_preload_payload(
                 ct_paths=ct_paths,
                 rtstruct_path=rtstruct_path,
                 rtdose_paths=rtdose_paths,
+                registration_paths=registration_paths,
                 array_cache_signature=array_cache_signature,
             )
             if derived_array_cache_data is not None:
@@ -783,11 +821,15 @@ def prepare_patient_preload_payload(
             sampled_dose_volume_ct = derived_array_cache_data.sampled_dose_volume_ct
 
         if sampled_dose_volume_ct is None:
-            if progress_callback is not None:
-                progress_callback("Resampling dose")
-            stage_start = perf_counter()
-            sampled_dose_volume_ct = resample_dose_to_ct_volume(ct, dose)
-            timing_entries.append(("Resample dose to CT grid", perf_counter() - stage_start))
+            if dose is not None and _dose_is_ct_aligned(ct, dose):
+                sampled_dose_volume_ct = np.asarray(dose.dose_gy, dtype=np.float32).copy()
+                timing_entries.append(("Resample dose to CT grid", None))
+            else:
+                if progress_callback is not None:
+                    progress_callback("Resampling dose")
+                stage_start = perf_counter()
+                sampled_dose_volume_ct = resample_dose_to_ct_volume(ct, dose)
+                timing_entries.append(("Resample dose to CT grid", perf_counter() - stage_start))
         else:
             timing_entries.append(("Resample dose to CT grid", None))
     else:
@@ -834,6 +876,8 @@ def prepare_patient_preload_payload(
         ct=ct,
         image_view_bounds=image_view_bounds,
         ct_paths=ct_paths,
+        registration_paths=registration_paths,
+        dose_path_to_ct_transforms=dose_path_to_ct_transforms,
         patient_plan_lines=patient_discovery.patient_plan_lines,
         plan_phases=list(patient_discovery.plan_phases),
         rtplan_paths=rtplan_paths,

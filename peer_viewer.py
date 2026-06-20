@@ -109,6 +109,7 @@ from peer_dvh_controller import (
     resolve_selected_curve_name,
 )
 from peer_io import (
+    build_ct_aligned_dose_volume,
     find_constraint_script_xml_file,
     get_constraints_workbook_path,
     list_constraints_workbook_sheets,
@@ -118,6 +119,7 @@ from peer_io import (
     load_rtstruct,
     load_structure_constraints_script,
     load_structure_constraints_sheet,
+    resample_dose_to_ct_grid,
 )
 from peer_loader import (
     build_load_timing_report_text,
@@ -426,7 +428,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_goal_evaluations: Dict[str, List[StructureGoalEvaluation]] = {}
         self.plan_phases: List[RTPlanPhase] = []
         self.current_ct_paths: List[str] = []
+        self.current_registration_paths: List[str] = []
         self.current_rtplan_paths: List[str] = []
+        self.current_dose_path_to_ct_transform_by_path: Dict[str, np.ndarray] = {}
         self.constraint_notes: Dict[str, str] = {}
         self.script_constraint_notes: Dict[str, str] = {}
         self.target_notes: Dict[str, str] = {}
@@ -1152,7 +1156,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.structure_goal_evaluations = {}
         self.plan_phases = []
         self.current_ct_paths = []
+        self.current_registration_paths = []
         self.current_rtplan_paths = []
+        self.current_dose_path_to_ct_transform_by_path = {}
         self.constraint_notes = {}
         self.script_constraint_notes = {}
         self.target_notes = {}
@@ -1632,7 +1638,9 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
         self.ct = payload.ct
         self.plan_phases = list(payload.plan_phases)
         self.current_ct_paths = list(payload.ct_paths)
+        self.current_registration_paths = list(payload.registration_paths)
         self.current_rtplan_paths = list(payload.rtplan_paths)
+        self.current_dose_path_to_ct_transform_by_path = dict(payload.dose_path_to_ct_transforms)
         self.set_patient_plan_lines(payload.patient_plan_lines, pump_events=True)
         self.image_view_bounds = payload.image_view_bounds
         self.rtstruct_path = payload.rtstruct_path
@@ -3767,6 +3775,8 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
                 rtstruct_path=self.rtstruct_path,
                 rtdose_paths=list(self.latest_timing_rtdose_paths),
                 rtplan_paths=list(self.current_rtplan_paths),
+                registration_paths=list(self.current_registration_paths),
+                dose_path_to_ct_transform_by_path=dict(self.current_dose_path_to_ct_transform_by_path),
                 plan_phases=list(self.plan_phases),
                 patient_plan_lines=self.patient_plan_lines,
             ),
@@ -3835,6 +3845,7 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             ct_paths=self.current_ct_paths,
             rtstruct_path=self.rtstruct_path,
             rtdose_paths=self.latest_timing_rtdose_paths,
+            registration_paths=self.current_registration_paths,
             array_cache_signature=self.get_derived_array_cache_signature(),
         )
         if loaded_cache is None:
@@ -3850,6 +3861,11 @@ class RTPlanReviewWindow(QtWidgets.QMainWindow):
             self.rtstruct = loaded_cache.rtstruct
             self.sort_rtstruct_structures_for_display()
             loaded_any = True
+        if loaded_cache.patient_discovery is not None:
+            self.current_registration_paths = list(loaded_cache.patient_discovery.registration_paths)
+            self.current_dose_path_to_ct_transform_by_path = dict(
+                loaded_cache.patient_discovery.dose_path_to_ct_transform_by_path
+            )
         if loaded_cache.sampled_dose_volume_ct is not None:
             self.sampled_dose_volume_ct = loaded_cache.sampled_dose_volume_ct
             loaded_any = True
@@ -5411,6 +5427,27 @@ h2 {{
         if dose_volume is not None:
             return dose_volume
         dose_volume = load_rtdose(dose_path)
+        ct_to_dose_transform = self.current_dose_path_to_ct_transform_by_path.get(dose_path)
+        if (
+            self.ct is not None
+            and ct_to_dose_transform is None
+            and dose_volume.frame_of_reference_uid not in {"", self.ct.frame_of_reference_uid}
+        ):
+            raise ValueError(
+                "Phase dose frame of reference does not match the active CT and no REG transform was available "
+                f"for '{Path(dose_path).name}'."
+            )
+        if self.ct is not None and ct_to_dose_transform is not None:
+            dose_volume_ct = resample_dose_to_ct_grid(
+                self.ct,
+                dose_volume,
+                ct_to_dose_transform=ct_to_dose_transform,
+            )
+            dose_volume = build_ct_aligned_dose_volume(
+                self.ct,
+                dose_volume_ct,
+                dose_units=dose_volume.dose_units,
+            )
         self.phase_dose_volumes_by_path[dose_path] = dose_volume
         return dose_volume
 
@@ -5425,7 +5462,15 @@ h2 {{
         if dose_volume is None:
             return None
 
-        dose_plane = sample_dose_to_ct_slice(self.ct, dose_volume, slice_index)
+        if (
+            dose_volume.dose_gy.shape == self.ct.volume_hu.shape
+            and dose_volume.slice_origins_xyz_mm.shape == self.ct.slice_origins_xyz_mm.shape
+            and np.allclose(dose_volume.slice_origins_xyz_mm, self.ct.slice_origins_xyz_mm, atol=1e-3)
+            and np.allclose(dose_volume.image_orientation_patient, self.ct.image_orientation_patient, atol=1e-6)
+        ):
+            dose_plane = np.asarray(dose_volume.dose_gy[slice_index], dtype=np.float32)
+        else:
+            dose_plane = sample_dose_to_ct_slice(self.ct, dose_volume, slice_index)
         self.phase_dose_plane_cache[cache_key] = dose_plane
         return dose_plane
 

@@ -349,6 +349,14 @@ def _serialize_patient_discovery(
         "rtstruct_path": _serialize_path(patient_discovery.rtstruct_path),
         "rtdose_paths": [serialized for path in patient_discovery.rtdose_paths if (serialized := _serialize_path(path))],
         "rtplan_paths": [serialized for path in patient_discovery.rtplan_paths if (serialized := _serialize_path(path))],
+        "registration_paths": [
+            serialized for path in patient_discovery.registration_paths if (serialized := _serialize_path(path))
+        ],
+        "dose_path_to_ct_transform_by_path": {
+            serialized_path: np.asarray(transform, dtype=np.float64).reshape(4, 4).tolist()
+            for path, transform in patient_discovery.dose_path_to_ct_transform_by_path.items()
+            if (serialized_path := _serialize_path(path))
+        },
         "plan_phases": [
             {
                 "sop_instance_uid": phase.sop_instance_uid,
@@ -379,7 +387,15 @@ def _deserialize_patient_discovery(
     ct_payload = payload.get("ct_paths")
     rtdose_payload = payload.get("rtdose_paths")
     rtplan_payload = payload.get("rtplan_paths")
-    if not isinstance(ct_payload, list) or not isinstance(rtdose_payload, list) or not isinstance(rtplan_payload, list):
+    registration_payload = payload.get("registration_paths", [])
+    transforms_payload = payload.get("dose_path_to_ct_transform_by_path", {})
+    if (
+        not isinstance(ct_payload, list)
+        or not isinstance(rtdose_payload, list)
+        or not isinstance(rtplan_payload, list)
+        or not isinstance(registration_payload, list)
+        or not isinstance(transforms_payload, dict)
+    ):
         return None
 
     plan_phases_payload = payload.get("plan_phases", [])
@@ -401,6 +417,17 @@ def _deserialize_patient_discovery(
             )
         )
 
+    dose_path_to_ct_transform_by_path: Dict[str, np.ndarray] = {}
+    for dose_path_value, transform_payload in transforms_payload.items():
+        dose_path = _deserialize_path(dose_path_value)
+        if not dose_path:
+            continue
+        try:
+            transform = np.asarray(transform_payload, dtype=np.float64).reshape(4, 4)
+        except (TypeError, ValueError):
+            return None
+        dose_path_to_ct_transform_by_path[dose_path] = transform
+
     patient_plan_lines_payload = payload.get("patient_plan_lines")
     patient_plan_lines: Optional[Tuple[str, ...]]
     if isinstance(patient_plan_lines_payload, list):
@@ -413,6 +440,8 @@ def _deserialize_patient_discovery(
         rtstruct_path=_deserialize_path(payload.get("rtstruct_path")),
         rtdose_paths=[path for item in rtdose_payload if (path := _deserialize_path(item))],
         rtplan_paths=[path for item in rtplan_payload if (path := _deserialize_path(item))],
+        registration_paths=[path for item in registration_payload if (path := _deserialize_path(item))],
+        dose_path_to_ct_transform_by_path=dose_path_to_ct_transform_by_path,
         plan_phases=plan_phases,
         patient_plan_lines=patient_plan_lines,
     )
@@ -503,6 +532,8 @@ def load_cached_patient_discovery(path: Path, *, folder: str) -> Optional[Patien
     if not file_fingerprint_list_matches(metadata.get("rtdose_fingerprints"), list(patient_discovery.rtdose_paths)):
         return None
     if not file_fingerprint_list_matches(metadata.get("rtplan_fingerprints"), list(patient_discovery.rtplan_paths)):
+        return None
+    if not file_fingerprint_list_matches(metadata.get("registration_fingerprints"), list(patient_discovery.registration_paths)):
         return None
     return patient_discovery
 
@@ -1196,6 +1227,9 @@ def build_derived_array_archive(
         "rtplan_fingerprints": build_file_fingerprints(
             list(patient_discovery.rtplan_paths if patient_discovery is not None else [])
         ),
+        "registration_fingerprints": build_file_fingerprints(
+            list(patient_discovery.registration_paths if patient_discovery is not None else [])
+        ),
         "array_cache_signature": array_cache_signature,
         "structures": [],
         "ct_geometry": {},
@@ -1343,6 +1377,7 @@ def load_derived_array_cache(
     ct_paths: Sequence[str],
     rtstruct_path: Optional[str],
     rtdose_paths: Sequence[str],
+    registration_paths: Sequence[str],
     array_cache_signature: Dict[str, str],
 ) -> Optional[DerivedArrayCacheData]:
     try:
@@ -1375,6 +1410,9 @@ def load_derived_array_cache(
         payload.close()
         return None
     if not file_fingerprint_list_matches(metadata.get("rtdose_fingerprints"), list(rtdose_paths)):
+        payload.close()
+        return None
+    if not file_fingerprint_list_matches(metadata.get("registration_fingerprints"), list(registration_paths)):
         payload.close()
         return None
 

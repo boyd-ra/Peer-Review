@@ -65,6 +65,8 @@ class PatientFileDiscovery:
     rtstruct_path: Optional[str]
     rtdose_paths: List[str]
     rtplan_paths: List[str]
+    registration_paths: List[str] = field(default_factory=list)
+    dose_path_to_ct_transform_by_path: Dict[str, np.ndarray] = field(default_factory=dict)
     plan_phases: List[RTPlanPhase] = field(default_factory=list)
     patient_plan_lines: Optional[Tuple[str, ...]] = None
 

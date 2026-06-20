@@ -1,4 +1,5 @@
 from __future__ import annotations
+from datetime import datetime
 import logging
 from pathlib import Path
 import re
@@ -15,6 +16,7 @@ from peer_helpers import (
     get_iop,
     normalize_structure_name,
     safe_get,
+    sample_dose_to_ct_slice,
 )
 from peer_models import (
     CTVolume,
@@ -31,9 +33,119 @@ try:
 except ImportError:
     from pydicom.pixel_data_handlers.util import apply_modality_lut as apply_rescale
 
+try:
+    from scipy.ndimage import affine_transform as scipy_affine_transform  # type: ignore
+except Exception:  # pragma: no cover - optional runtime dependency
+    scipy_affine_transform = None
+
 
 logger = logging.getLogger(__name__)
 _CONSTRAINT_WORKBOOK_SHEETS_CACHE: Dict[Tuple[str, int, int], List[str]] = {}
+
+
+def _parse_dicom_datetime(date_value: object, time_value: object) -> Optional[datetime]:
+    date_text = str(date_value or "").strip()
+    if not date_text:
+        return None
+
+    time_text = str(time_value or "").strip()
+    time_text = time_text.split(".")[0]
+    time_text = "".join(ch for ch in time_text if ch.isdigit())
+    while len(time_text) < 6:
+        time_text += "0"
+    time_text = time_text[:6]
+
+    for format_string in ("%Y%m%d%H%M%S", "%Y%m%d"):
+        try:
+            candidate_text = f"{date_text}{time_text}" if format_string == "%Y%m%d%H%M%S" else date_text
+            return datetime.strptime(candidate_text, format_string)
+        except ValueError:
+            continue
+    return None
+
+
+def _get_dataset_datetime(ds) -> Optional[datetime]:
+    for date_field, time_field in (
+        ("SeriesDate", "SeriesTime"),
+        ("StudyDate", "StudyTime"),
+        ("InstanceCreationDate", "InstanceCreationTime"),
+        ("ContentDate", "ContentTime"),
+    ):
+        value = _parse_dicom_datetime(safe_get(ds, date_field, ""), safe_get(ds, time_field, ""))
+        if value is not None:
+            return value
+    return None
+
+
+def _datetime_sort_key(value: Optional[datetime]) -> Tuple[bool, object]:
+    return (value is not None, value or "")
+
+
+def _extract_referenced_ct_series_uid(ds) -> str:
+    for frame_ref in safe_get(ds, "ReferencedFrameOfReferenceSequence", []):
+        for study_ref in safe_get(frame_ref, "RTReferencedStudySequence", []):
+            for series_ref in safe_get(study_ref, "RTReferencedSeriesSequence", []):
+                series_uid = str(safe_get(series_ref, "SeriesInstanceUID", "")).strip()
+                if series_uid:
+                    return series_uid
+    return ""
+
+
+def _extract_referenced_rtstruct_uid(ds) -> str:
+    for item in safe_get(ds, "ReferencedStructureSetSequence", []):
+        referenced_uid = str(safe_get(item, "ReferencedSOPInstanceUID", "")).strip()
+        if referenced_uid:
+            return referenced_uid
+    return ""
+
+
+def _load_registration_transforms(path: str) -> Dict[Tuple[str, str], np.ndarray]:
+    try:
+        ds = pydicom.dcmread(path, stop_before_pixels=True, force=True)
+    except Exception as exc:
+        logger.warning("Skipping unreadable REG during folder scan: %s (%s)", path, exc)
+        return {}
+
+    frame_to_registered_space: Dict[str, np.ndarray] = {}
+    for registration_item in safe_get(ds, "RegistrationSequence", []):
+        frame_uid = str(safe_get(registration_item, "FrameOfReferenceUID", "")).strip()
+        if not frame_uid:
+            continue
+
+        transform_matrix = np.eye(4, dtype=np.float64)
+        matrix_found = False
+        for matrix_registration_item in safe_get(registration_item, "MatrixRegistrationSequence", []):
+            for matrix_item in safe_get(matrix_registration_item, "MatrixSequence", []):
+                matrix_payload = safe_get(matrix_item, "FrameOfReferenceTransformationMatrix", None)
+                try:
+                    transform_matrix = np.asarray(matrix_payload, dtype=np.float64).reshape(4, 4)
+                except (TypeError, ValueError):
+                    continue
+                matrix_found = True
+                break
+            if matrix_found:
+                break
+
+        frame_to_registered_space[frame_uid] = transform_matrix
+
+    pairwise_transforms: Dict[Tuple[str, str], np.ndarray] = {}
+    for source_frame_uid, source_to_registered in frame_to_registered_space.items():
+        for target_frame_uid, target_to_registered in frame_to_registered_space.items():
+            if source_frame_uid == target_frame_uid:
+                pairwise_transforms[(source_frame_uid, target_frame_uid)] = np.eye(4, dtype=np.float64)
+                continue
+            try:
+                pairwise_transforms[(source_frame_uid, target_frame_uid)] = (
+                    np.linalg.inv(target_to_registered) @ source_to_registered
+                )
+            except np.linalg.LinAlgError:
+                logger.warning(
+                    "Skipping singular REG transform in %s between %s and %s",
+                    path,
+                    source_frame_uid,
+                    target_frame_uid,
+                )
+    return pairwise_transforms
 
 
 def get_constraints_workbook_path() -> Optional[str]:
@@ -548,12 +660,13 @@ def _summarize_rtplan_phase_records(
 def scan_patient_folder(
     folder: str,
 ) -> PatientFileDiscovery:
-    rtstruct_paths: List[str] = []
-    rtdose_paths: List[str] = []
-    rtplan_paths: List[str] = []
-    ct_paths: List[str] = []
-    dose_path_by_plan_uid: Dict[str, str] = {}
+    ct_series_by_uid: Dict[str, Dict[str, object]] = {}
+    rtstruct_records: List[Dict[str, object]] = []
+    rtdose_records: List[Dict[str, object]] = []
     rtplan_phase_records: List[Dict[str, object]] = []
+    registration_paths: List[str] = []
+    registration_transforms: Dict[Tuple[str, str], np.ndarray] = {}
+    dose_record_by_plan_uid: Dict[str, Dict[str, object]] = {}
 
     for path in sorted(Path(folder).rglob("*")):
         if not path.is_file():
@@ -562,22 +675,55 @@ def scan_patient_folder(
         try:
             ds = pydicom.dcmread(str(path), stop_before_pixels=True, force=True)
             modality = str(safe_get(ds, "Modality", "")).upper()
+            dataset_datetime = _get_dataset_datetime(ds)
         except Exception as exc:
             logger.warning("Skipping unreadable DICOM during folder scan: %s (%s)", path, exc)
             continue
 
         if modality == "CT":
-            ct_paths.append(str(path))
+            series_uid = str(safe_get(ds, "SeriesInstanceUID", "")).strip() or str(path)
+            ct_record = ct_series_by_uid.setdefault(
+                series_uid,
+                {
+                    "series_uid": series_uid,
+                    "paths": [],
+                    "frame_of_reference_uid": str(safe_get(ds, "FrameOfReferenceUID", "")).strip(),
+                    "study_uid": str(safe_get(ds, "StudyInstanceUID", "")).strip(),
+                    "datetime": dataset_datetime,
+                },
+            )
+            cast_paths = ct_record.setdefault("paths", [])
+            if isinstance(cast_paths, list):
+                cast_paths.append(str(path))
+            if ct_record.get("datetime") is None and dataset_datetime is not None:
+                ct_record["datetime"] = dataset_datetime
         elif modality == "RTSTRUCT":
-            rtstruct_paths.append(str(path))
+            rtstruct_records.append(
+                {
+                    "path": str(path),
+                    "sop_instance_uid": str(safe_get(ds, "SOPInstanceUID", "")).strip(),
+                    "frame_of_reference_uid": str(safe_get(ds, "FrameOfReferenceUID", "")).strip(),
+                    "referenced_ct_series_uid": _extract_referenced_ct_series_uid(ds),
+                    "datetime": dataset_datetime,
+                }
+            )
         elif modality == "RTDOSE":
-            rtdose_paths.append(str(path))
+            record = {
+                "path": str(path),
+                "frame_of_reference_uid": str(safe_get(ds, "FrameOfReferenceUID", "")).strip(),
+                "datetime": dataset_datetime,
+                "referenced_rtplan_uid": "",
+            }
             for item in safe_get(ds, "ReferencedRTPlanSequence", []):
                 referenced_uid = str(safe_get(item, "ReferencedSOPInstanceUID", "")).strip()
-                if referenced_uid and referenced_uid not in dose_path_by_plan_uid:
-                    dose_path_by_plan_uid[referenced_uid] = str(path)
+                if referenced_uid:
+                    record["referenced_rtplan_uid"] = referenced_uid
+                    existing_record = dose_record_by_plan_uid.get(referenced_uid)
+                    if existing_record is None or _datetime_sort_key(existing_record.get("datetime")) < _datetime_sort_key(dataset_datetime):
+                        dose_record_by_plan_uid[referenced_uid] = record
+                    break
+            rtdose_records.append(record)
         elif modality == "RTPLAN":
-            rtplan_paths.append(str(path))
             sop_instance_uid = str(safe_get(ds, "SOPInstanceUID", "")).strip()
             prescription_doses_gy = _extract_rtplan_prescription_doses_gy(ds)
             rtplan_phase_records.append(
@@ -591,29 +737,111 @@ def scan_patient_folder(
                     "plan_name": str(safe_get(ds, "RTPlanName", "")).strip(),
                     "patient_name": _format_patient_name(safe_get(ds, "PatientName", "")),
                     "patient_id": str(safe_get(ds, "PatientID", "")).strip(),
+                    "referenced_rtstruct_uid": _extract_referenced_rtstruct_uid(ds),
+                    "datetime": dataset_datetime,
                 }
             )
+        elif modality == "REG":
+            registration_paths.append(str(path))
+            for transform_key, transform in _load_registration_transforms(str(path)).items():
+                registration_transforms[transform_key] = transform
 
-    rtstruct_path = rtstruct_paths[0] if rtstruct_paths else None
+    sorted_ct_records = sorted(
+        ct_series_by_uid.values(),
+        key=lambda record: (_datetime_sort_key(record.get("datetime")), str(record.get("series_uid", ""))),
+    )
+    sorted_rtstruct_records = sorted(
+        rtstruct_records,
+        key=lambda record: (_datetime_sort_key(record.get("datetime")), str(record.get("path", ""))),
+    )
+    sorted_rtplan_records = sorted(
+        rtplan_phase_records,
+        key=lambda record: (_datetime_sort_key(record.get("datetime")), str(record.get("path", ""))),
+    )
+    sorted_rtdose_records = sorted(
+        rtdose_records,
+        key=lambda record: (_datetime_sort_key(record.get("datetime")), str(record.get("path", ""))),
+    )
+
+    primary_rtstruct_record: Optional[Dict[str, object]] = None
+    primary_ct_record: Optional[Dict[str, object]] = None
+    for rtstruct_record in reversed(sorted_rtstruct_records):
+        referenced_ct_series_uid = str(rtstruct_record.get("referenced_ct_series_uid", "")).strip()
+        if referenced_ct_series_uid and referenced_ct_series_uid in ct_series_by_uid:
+            primary_rtstruct_record = rtstruct_record
+            primary_ct_record = ct_series_by_uid[referenced_ct_series_uid]
+            break
+        frame_of_reference_uid = str(rtstruct_record.get("frame_of_reference_uid", "")).strip()
+        if frame_of_reference_uid:
+            matching_ct_records = [
+                record
+                for record in sorted_ct_records
+                if str(record.get("frame_of_reference_uid", "")).strip() == frame_of_reference_uid
+            ]
+            if matching_ct_records:
+                primary_rtstruct_record = rtstruct_record
+                primary_ct_record = matching_ct_records[-1]
+                break
+
+    if primary_ct_record is None and sorted_ct_records:
+        primary_ct_record = sorted_ct_records[-1]
+
+    if primary_rtstruct_record is None and primary_ct_record is not None:
+        primary_frame_of_reference_uid = str(primary_ct_record.get("frame_of_reference_uid", "")).strip()
+        matching_rtstruct_records = [
+            record
+            for record in sorted_rtstruct_records
+            if str(record.get("frame_of_reference_uid", "")).strip() == primary_frame_of_reference_uid
+        ]
+        if matching_rtstruct_records:
+            primary_rtstruct_record = matching_rtstruct_records[-1]
+
+    primary_ct_paths = list(primary_ct_record.get("paths", [])) if primary_ct_record is not None else []
+    primary_rtstruct_path = str(primary_rtstruct_record.get("path", "")).strip() or None
+    primary_ct_frame_of_reference_uid = (
+        str(primary_ct_record.get("frame_of_reference_uid", "")).strip() if primary_ct_record is not None else ""
+    )
+
     plan_phases = [
         RTPlanPhase(
             sop_instance_uid=str(record.get("sop_instance_uid", "")),
             prescription_dose_gy=float(record.get("prescription_dose_gy", 0.0) or 0.0),
             fractions_planned=int(record.get("fractions_planned", 0) or 0),
-            dose_path=dose_path_by_plan_uid.get(str(record.get("sop_instance_uid", "")), ""),
+            dose_path=str(
+                (dose_record_by_plan_uid.get(str(record.get("sop_instance_uid", "")), {}) or {}).get("path", "")
+            ),
             target_structure_name=str(record.get("target_structure_name", "")),
             plan_label=str(record.get("plan_label", "")),
             plan_name=str(record.get("plan_name", "")),
         )
-        for record in rtplan_phase_records
+        for record in sorted_rtplan_records
     ]
+    rtdose_paths = [str(record.get("path", "")) for record in sorted_rtdose_records if str(record.get("path", ""))]
+    rtplan_paths = [str(record.get("path", "")) for record in sorted_rtplan_records if str(record.get("path", ""))]
+    dose_path_to_ct_transform_by_path: Dict[str, np.ndarray] = {}
+    if primary_ct_frame_of_reference_uid:
+        for dose_record in sorted_rtdose_records:
+            dose_path = str(dose_record.get("path", "")).strip()
+            dose_frame_of_reference_uid = str(dose_record.get("frame_of_reference_uid", "")).strip()
+            if not dose_path or not dose_frame_of_reference_uid or dose_frame_of_reference_uid == primary_ct_frame_of_reference_uid:
+                continue
+            transform = registration_transforms.get((primary_ct_frame_of_reference_uid, dose_frame_of_reference_uid))
+            if transform is None:
+                raise ValueError(
+                    "RTDOSE frame of reference does not match the primary CT and no REG transform was found "
+                    f"for dose '{Path(dose_path).name}'."
+                )
+            dose_path_to_ct_transform_by_path[dose_path] = np.asarray(transform, dtype=np.float64)
+
     return PatientFileDiscovery(
-        ct_paths=ct_paths,
-        rtstruct_path=rtstruct_path,
+        ct_paths=primary_ct_paths,
+        rtstruct_path=primary_rtstruct_path,
         rtdose_paths=rtdose_paths,
         rtplan_paths=rtplan_paths,
+        registration_paths=sorted(registration_paths),
+        dose_path_to_ct_transform_by_path=dose_path_to_ct_transform_by_path,
         plan_phases=plan_phases,
-        patient_plan_lines=_summarize_rtplan_phase_records(rtplan_phase_records),
+        patient_plan_lines=_summarize_rtplan_phase_records(sorted_rtplan_records),
     )
 
 def load_ct_series_from_paths(ct_paths: List[str]) -> CTVolume:
@@ -777,6 +1005,114 @@ def load_rtdose(path: str) -> DoseVolume:
     )
 
 
+def build_ct_aligned_dose_volume(
+    ct: CTVolume,
+    dose_gy: np.ndarray,
+    *,
+    dose_units: str = "",
+) -> DoseVolume:
+    dose_array = np.asarray(dose_gy, dtype=np.float32)
+    if dose_array.shape != ct.volume_hu.shape:
+        raise ValueError("CT-aligned dose array shape does not match the CT volume geometry.")
+    return DoseVolume(
+        dose_gy=dose_array.copy(),
+        slice_origins_xyz_mm=np.asarray(ct.slice_origins_xyz_mm, dtype=np.float32).copy(),
+        z_positions_mm=np.asarray(ct.z_positions_mm, dtype=np.float32).copy(),
+        origin_xyz_mm=np.asarray(ct.slice_origins_xyz_mm[0], dtype=np.float32).copy(),
+        spacing_xyz_mm=np.asarray(ct.spacing_xyz_mm, dtype=np.float32).copy(),
+        image_orientation_patient=np.asarray(ct.image_orientation_patient, dtype=np.float32).copy(),
+        frame_of_reference_uid=ct.frame_of_reference_uid,
+        dose_units=str(dose_units or ""),
+    )
+
+
+def _grid_axis_step_vectors(
+    slice_origins_xyz_mm: np.ndarray,
+    image_orientation_patient: np.ndarray,
+    spacing_xyz_mm: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    row_cos, col_cos, normal = get_ct_row_col_normal(image_orientation_patient)
+    if slice_origins_xyz_mm.shape[0] > 1:
+        slice_step_vector = np.median(np.diff(slice_origins_xyz_mm, axis=0), axis=0).astype(np.float64, copy=False)
+    else:
+        slice_step_vector = normal.astype(np.float64, copy=False) * float(spacing_xyz_mm[2])
+    row_step_vector = col_cos.astype(np.float64, copy=False) * float(spacing_xyz_mm[1])
+    col_step_vector = row_cos.astype(np.float64, copy=False) * float(spacing_xyz_mm[0])
+    return slice_step_vector, row_step_vector, col_step_vector
+
+
+def resample_dose_to_ct_grid(
+    ct: CTVolume,
+    dose: DoseVolume,
+    *,
+    ct_to_dose_transform: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if (
+        ct_to_dose_transform is None
+        and dose.dose_gy.shape == ct.volume_hu.shape
+        and dose.slice_origins_xyz_mm.shape == ct.slice_origins_xyz_mm.shape
+        and np.allclose(dose.slice_origins_xyz_mm, ct.slice_origins_xyz_mm, atol=1e-3)
+        and np.allclose(dose.spacing_xyz_mm, ct.spacing_xyz_mm, atol=1e-6)
+        and np.allclose(dose.image_orientation_patient, ct.image_orientation_patient, atol=1e-6)
+    ):
+        return np.asarray(dose.dose_gy, dtype=np.float32).copy()
+
+    if scipy_affine_transform is not None:
+        dose_sort_indices = np.argsort(np.asarray(dose.z_positions_mm, dtype=np.float64))
+        dose_volume = np.asarray(dose.dose_gy, dtype=np.float32)[dose_sort_indices]
+        dose_slice_origins = np.asarray(dose.slice_origins_xyz_mm, dtype=np.float64)[dose_sort_indices]
+        ct_slice_origins = np.asarray(ct.slice_origins_xyz_mm, dtype=np.float64)
+
+        ct_slice_step, ct_row_step, ct_col_step = _grid_axis_step_vectors(
+            ct_slice_origins,
+            np.asarray(ct.image_orientation_patient, dtype=np.float64),
+            np.asarray(ct.spacing_xyz_mm, dtype=np.float64),
+        )
+        dose_slice_step, dose_row_step, dose_col_step = _grid_axis_step_vectors(
+            dose_slice_origins,
+            np.asarray(dose.image_orientation_patient, dtype=np.float64),
+            np.asarray(dose.spacing_xyz_mm, dtype=np.float64),
+        )
+
+        ct_basis = np.column_stack([ct_slice_step, ct_row_step, ct_col_step])
+        dose_basis = np.column_stack([dose_slice_step, dose_row_step, dose_col_step])
+        dose_basis_inverse = np.linalg.inv(dose_basis)
+
+        transform = np.eye(4, dtype=np.float64) if ct_to_dose_transform is None else np.asarray(
+            ct_to_dose_transform,
+            dtype=np.float64,
+        ).reshape(4, 4)
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+
+        matrix = dose_basis_inverse @ rotation @ ct_basis
+        offset = dose_basis_inverse @ (rotation @ ct_slice_origins[0] + translation - dose_slice_origins[0])
+        resampled = scipy_affine_transform(
+            dose_volume,
+            matrix=matrix,
+            offset=offset,
+            output_shape=ct.volume_hu.shape,
+            order=1,
+            mode="constant",
+            cval=0.0,
+            prefilter=False,
+        )
+        return np.asarray(resampled, dtype=np.float32)
+
+    return np.stack(
+        [
+            sample_dose_to_ct_slice(
+                ct,
+                dose,
+                slice_index,
+                ct_to_dose_transform=ct_to_dose_transform,
+            )
+            for slice_index in range(ct.volume_hu.shape[0])
+        ],
+        axis=0,
+    ).astype(np.float32, copy=False)
+
+
 def validate_dose_geometry(reference: DoseVolume, candidate: DoseVolume, path: str):
     if reference.dose_gy.shape != candidate.dose_gy.shape:
         raise ValueError(
@@ -802,15 +1138,43 @@ def validate_dose_geometry(reference: DoseVolume, candidate: DoseVolume, path: s
             raise ValueError(f"RTDOSE file '{path}' does not match the reference {label}.")
 
 
-def load_combined_rtdose(paths: List[str]) -> DoseVolume:
+def load_combined_rtdose(
+    paths: List[str],
+    *,
+    reference_ct: Optional[CTVolume] = None,
+    ct_to_dose_transforms: Optional[Dict[str, np.ndarray]] = None,
+) -> DoseVolume:
     if not paths:
         raise ValueError("No RTDOSE files were provided.")
 
-    loaded = [load_rtdose(path) for path in sorted(paths)]
+    sorted_paths = sorted(paths)
+    loaded = [load_rtdose(path) for path in sorted_paths]
+
+    if reference_ct is not None:
+        combined_dose_ct = np.zeros(reference_ct.volume_hu.shape, dtype=np.float32)
+        dose_units = ""
+        for path, dose in zip(sorted_paths, loaded):
+            ct_to_dose_transform = None
+            if ct_to_dose_transforms is not None:
+                ct_to_dose_transform = ct_to_dose_transforms.get(path)
+            if ct_to_dose_transform is None and dose.frame_of_reference_uid not in {"", reference_ct.frame_of_reference_uid}:
+                raise ValueError(
+                    "RTDOSE frame of reference does not match the reference CT and no REG transform was supplied "
+                    f"for dose '{Path(path).name}'."
+                )
+            combined_dose_ct += resample_dose_to_ct_grid(
+                reference_ct,
+                dose,
+                ct_to_dose_transform=ct_to_dose_transform,
+            )
+            if not dose_units:
+                dose_units = dose.dose_units
+        return build_ct_aligned_dose_volume(reference_ct, combined_dose_ct, dose_units=dose_units)
+
     reference = loaded[0]
     combined_dose = reference.dose_gy.copy()
 
-    for path, dose in zip(sorted(paths)[1:], loaded[1:]):
+    for path, dose in zip(sorted_paths[1:], loaded[1:]):
         validate_dose_geometry(reference, dose, path)
         combined_dose += dose.dose_gy
 
