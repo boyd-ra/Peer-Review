@@ -1,5 +1,6 @@
 from __future__ import annotations
 from datetime import datetime
+import json
 import logging
 from pathlib import Path
 import re
@@ -460,9 +461,33 @@ def find_constraint_script_xml_file(folder: Optional[str]) -> Optional[str]:
     if not folder:
         return None
     try:
-        entries = [path for path in Path(folder).iterdir() if path.is_file() and path.suffix.lower() == ".xml"]
+        entries = [path for path in Path(folder).iterdir() if path.is_file()]
     except OSError:
         return None
+    if not entries:
+        return None
+
+    json_entries = [
+        path
+        for path in entries
+        if path.suffix.lower() == ".json"
+        and path.name.lower() in {"constraints.json", "contraints.json"}
+    ]
+    if json_entries:
+        json_entries.sort(key=lambda candidate: (candidate.name.lower() != "contraints.json", candidate.name.lower()))
+        return str(json_entries[0])
+
+    fuzzy_json_entries = [
+        path
+        for path in entries
+        if path.suffix.lower() == ".json"
+        and ("constraint" in path.name.lower() or "contraint" in path.name.lower())
+    ]
+    if fuzzy_json_entries:
+        fuzzy_json_entries.sort(key=lambda candidate: candidate.name.lower())
+        return str(fuzzy_json_entries[0])
+
+    entries = [path for path in entries if path.suffix.lower() == ".xml"]
     if not entries:
         return None
     entries.sort(
@@ -552,10 +577,13 @@ def _build_script_constraint_note_key(
 def load_structure_constraints_script(
     path: str,
 ) -> Tuple[set[str], dict[str, List[StructureGoal]], List[str], dict[str, str]]:
+    if Path(path).suffix.lower() == ".json":
+        return load_structure_constraints_json(path)
+
     try:
         root = ET.parse(path).getroot()
     except (ET.ParseError, OSError) as exc:
-        raise ValueError(f"Failed to read script XML constraints from {Path(path).name}: {exc}") from exc
+        raise ValueError(f"Failed to read script constraints from {Path(path).name}: {exc}") from exc
 
     allowed_names: set[str] = set()
     goals_by_structure: dict[str, List[StructureGoal]] = {}
@@ -587,6 +615,75 @@ def load_structure_constraints_script(
         for constraint_field, goal_field in (('constraint', 'cGoal'), ('constraint2', 'cGoal2')):
             parsed_constraint = _parse_script_constraint_clause(item.findtext(constraint_field, ''))
             value_text = _normalize_script_goal_value(item.findtext(goal_field, ''))
+            if parsed_constraint is None or not value_text:
+                continue
+            metric, comparator = parsed_constraint
+            goal_key = (normalized_name, metric.upper(), comparator, value_text.upper())
+            if goal_key in seen_goals:
+                continue
+            seen_goals.add(goal_key)
+            goal = StructureGoal(
+                structure_name=structure_name,
+                metric=metric,
+                comparator=comparator,
+                value_text=value_text,
+            )
+            goals_by_structure.setdefault(normalized_name, []).append(goal)
+            if note_text:
+                note_text_by_goal_key[_build_script_constraint_note_key(
+                    normalized_name,
+                    goal.metric,
+                    goal.comparator,
+                    goal.value_text,
+                )] = note_text
+
+    return allowed_names, goals_by_structure, structure_order, note_text_by_goal_key
+
+
+def load_structure_constraints_json(
+    path: str,
+) -> Tuple[set[str], dict[str, List[StructureGoal]], List[str], dict[str, str]]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Failed to read script JSON constraints from {Path(path).name}: {exc}") from exc
+
+    if not isinstance(payload, list):
+        raise ValueError(f"Script JSON constraints in {Path(path).name} must contain a top-level list.")
+
+    allowed_names: set[str] = set()
+    goals_by_structure: dict[str, List[StructureGoal]] = {}
+    structure_order: List[str] = []
+    note_text_by_goal_key: dict[str, str] = {}
+    seen_goals: set[Tuple[str, str, str, str]] = set()
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        display_name = str(item.get("strTemp", "") or "").strip()
+        plan_name = str(item.get("strPlan", "") or "").strip()
+        normalized_display_name = normalize_structure_name(display_name)
+        normalized_plan_name = normalize_structure_name(plan_name)
+        if normalized_display_name.startswith("PTV") or normalized_plan_name.startswith("PTV"):
+            continue
+
+        normalized_name = normalized_plan_name or normalized_display_name
+        structure_name = plan_name or display_name
+        if not normalized_name or not structure_name:
+            continue
+
+        if normalized_name not in allowed_names:
+            structure_order.append(normalized_name)
+        allowed_names.add(normalized_name)
+
+        note_text = _build_script_constraint_note_text(
+            item.get("cPlan", ""),
+            item.get("cComment", ""),
+        )
+        for constraint_field, goal_field in (("constraint", "cGoal"), ("constraint2", "cGoal2")):
+            parsed_constraint = _parse_script_constraint_clause(str(item.get(constraint_field, "") or ""))
+            value_text = _normalize_script_goal_value(str(item.get(goal_field, "") or ""))
             if parsed_constraint is None or not value_text:
                 continue
             metric, comparator = parsed_constraint
